@@ -85,11 +85,14 @@ async function placeOrder(symbol, action, price) {
   return data.result;
 }
 
-async function setTrailingStop(symbol) {
-  // fetch current price to calculate trailing distance
+async function fetchCurrentPrice(symbol) {
   const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
   const data = await res.json();
-  const price = parseFloat(data.result?.list?.[0]?.lastPrice || "0");
+  return parseFloat(data.result?.list?.[0]?.lastPrice || "0");
+}
+
+async function setTrailingStop(symbol) {
+  const price = await fetchCurrentPrice(symbol);
   if (!price) return;
 
   const trailingDistance = (price * 0.03).toFixed(2);
@@ -128,9 +131,9 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Validate required fields
-  if (!action || !symbol || !price) {
-    console.log("  ❌ Missing fields — need action, symbol, price");
-    return res.status(400).json({ error: "Missing required fields: action, symbol, price" });
+  if (!action) {
+    console.log("  ❌ Missing field: action");
+    return res.status(400).json({ error: "Missing required field: action (buy or sell)" });
   }
 
   if (!["buy", "sell"].includes(action.toLowerCase())) {
@@ -139,39 +142,46 @@ app.post("/webhook", async (req, res) => {
   }
 
   const actionLower = action.toLowerCase();
-  const priceNum    = parseFloat(price);
+  const sym         = symbol || process.env.SYMBOL || "BTCUSDT";
 
-  console.log(`  Signal: ${actionLower.toUpperCase()} ${symbol} @ $${priceNum}`);
+  // Use price from payload, or fetch live price if not provided
+  let priceNum = parseFloat(price);
+  if (!priceNum || isNaN(priceNum)) {
+    console.log("  ℹ️  No price in payload — fetching live price from Bybit...");
+    priceNum = await fetchCurrentPrice(sym);
+  }
+
+  console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x`);
 
   if (CONFIG.paperTrading) {
     const paperId = `PAPER-${Date.now()}`;
-    console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${symbol}`);
-    logTrade(symbol, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
-    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol, price: priceNum });
+    console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
+    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
   }
 
   // Live execution
   try {
     if (CONFIG.tradeMode === "futures") {
-      await setLeverage(symbol);
+      await setLeverage(sym);
       console.log(`  Leverage set to ${CONFIG.leverage}x`);
     }
 
-    const order = await placeOrder(symbol, actionLower, priceNum);
+    const order = await placeOrder(sym, actionLower, priceNum);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
-      await setTrailingStop(symbol);
+      await setTrailingStop(sym);
       console.log(`  Trailing stop set (3%)`);
     }
 
-    logTrade(symbol, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
-    return res.json({ status: "ok", orderId: order.orderId, action: actionLower, symbol, price: priceNum });
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
+    return res.json({ status: "ok", orderId: order.orderId, action: actionLower, symbol: sym, price: priceNum });
 
   } catch (err) {
     console.log(`  ❌ ERROR — ${err.message}`);
-    logTrade(symbol, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
