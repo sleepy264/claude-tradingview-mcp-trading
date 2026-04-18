@@ -121,6 +121,11 @@ app.get("/", (req, res) => {
 app.post("/webhook", async (req, res) => {
   const ts = new Date().toISOString();
   console.log(`\n[${ts}] Webhook received:`, JSON.stringify(req.body));
+  try { return await handleWebhook(req, res); }
+  catch (err) { console.log("  ❌ Unhandled error:", err.message); return res.status(500).json({ error: err.message }); }
+});
+
+async function handleWebhook(req, res) {
 
   const { secret, action, symbol, price } = req.body;
 
@@ -184,7 +189,7 @@ app.post("/webhook", async (req, res) => {
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
     return res.status(500).json({ error: err.message });
   }
-});
+}
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
