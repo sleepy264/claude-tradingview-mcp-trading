@@ -58,12 +58,13 @@ async function setLeverage(symbol) {
   if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
 }
 
-async function placeOrder(symbol, action, price) {
+async function placeOrder(symbol, action, price, sl, tp1) {
   const side     = action === "buy" ? "Buy" : "Sell";
   const quantity = (CONFIG.tradeSize / price).toFixed(3);
 
-  const stopLoss   = action === "buy" ? (price * 0.998).toFixed(2) : (price * 1.002).toFixed(2);
-  const takeProfit = action === "buy" ? (price * 1.004).toFixed(2) : (price * 0.996).toFixed(2);
+  // Use SFX values if provided, otherwise fall back to percentage-based defaults
+  const stopLoss   = sl  ? parseFloat(sl).toFixed(2)  : (action === "buy" ? (price * 0.998).toFixed(2) : (price * 1.002).toFixed(2));
+  const takeProfit = tp1 ? parseFloat(tp1).toFixed(2) : (action === "buy" ? (price * 1.004).toFixed(2) : (price * 0.996).toFixed(2));
 
   const orderBody = CONFIG.tradeMode === "futures"
     ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
@@ -127,7 +128,7 @@ app.post("/webhook", async (req, res) => {
 
 async function handleWebhook(req, res) {
 
-  const { secret, action, symbol, price } = req.body;
+  const { secret, action, symbol, price, sl, tp1, tp2, tp3 } = req.body;
 
   // Validate secret token
   if (CONFIG.webhookSecret && secret !== CONFIG.webhookSecret) {
@@ -157,13 +158,16 @@ async function handleWebhook(req, res) {
   }
 
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
+  if (sl)  console.log(`  SL: $${sl}`);
+  if (tp1) console.log(`  TP1: $${tp1}${tp2 ? ` | TP2: $${tp2}` : ""}${tp3 ? ` | TP3: $${tp3}` : ""}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x`);
 
   if (CONFIG.paperTrading) {
     const paperId = `PAPER-${Date.now()}`;
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
-    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
-    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
+    const notes = `SL:${sl||"auto"} TP1:${tp1||"auto"} TP2:${tp2||"-"} TP3:${tp3||"-"}`;
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", notes);
+    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum, sl: sl||null, tp1: tp1||null, tp2: tp2||null, tp3: tp3||null });
   }
 
   // Live execution
@@ -173,7 +177,7 @@ async function handleWebhook(req, res) {
       console.log(`  Leverage set to ${CONFIG.leverage}x`);
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum);
+    const order = await placeOrder(sym, actionLower, priceNum, sl, tp1);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
