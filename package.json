@@ -4,11 +4,13 @@
   "description": "Automated trading bot — Claude + TradingView strategy + BitGet execution",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "node bot.js"
+    "start": "node webhook.js",
+    "dev": "node webhook.js",
+    "bot": "node bot.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "express": "^5.2.1",
     "node-fetch": "^3.3.2"
   },
   "engines": {
