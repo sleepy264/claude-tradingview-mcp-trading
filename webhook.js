@@ -14,11 +14,14 @@ const CONFIG = {
     secretKey: process.env.BYBIT_SECRET_KEY,
     baseUrl:   process.env.BYBIT_BASE_URL || "https://api.bybit.com",
   },
-  webhookSecret: process.env.WEBHOOK_SECRET || "",
-  paperTrading:  process.env.PAPER_TRADING !== "false",
-  tradeMode:     process.env.TRADE_MODE    || "futures",
-  tradeSize:     parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
-  leverage:      parseInt(process.env.LEVERAGE || "100"),
+  webhookSecret:    process.env.WEBHOOK_SECRET     || "",
+  paperTrading:     process.env.PAPER_TRADING      !== "false",
+  tradeMode:        process.env.TRADE_MODE         || "futures",
+  tradeSize:        parseFloat(process.env.MAX_TRADE_SIZE_USD  || "100"),
+  leverage:         parseInt(process.env.LEVERAGE              || "100"),
+  stopLossPct:      parseFloat(process.env.STOP_LOSS_PCT       || "0.002"),
+  takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
+  trailingStopPct:  parseFloat(process.env.TRAILING_STOP_PCT   || "0.03"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -58,13 +61,16 @@ async function setLeverage(symbol) {
   if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
 }
 
-async function placeOrder(symbol, action, price, sl, tp1) {
+async function placeOrder(symbol, action, price) {
   const side     = action === "buy" ? "Buy" : "Sell";
   const quantity = (CONFIG.tradeSize / price).toFixed(3);
 
-  // Use SFX values if provided, otherwise fall back to percentage-based defaults
-  const stopLoss   = sl  ? parseFloat(sl).toFixed(2)  : (action === "buy" ? (price * 0.998).toFixed(2) : (price * 1.002).toFixed(2));
-  const takeProfit = tp1 ? parseFloat(tp1).toFixed(2) : (action === "buy" ? (price * 1.004).toFixed(2) : (price * 0.996).toFixed(2));
+  const stopLoss   = action === "buy"
+    ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
+    : (price * (1 + CONFIG.stopLossPct)).toFixed(2);
+  const takeProfit = action === "buy"
+    ? (price * (1 + CONFIG.takeProfitPct)).toFixed(2)
+    : (price * (1 - CONFIG.takeProfitPct)).toFixed(2);
 
   const orderBody = CONFIG.tradeMode === "futures"
     ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
@@ -128,7 +134,7 @@ app.post("/webhook", async (req, res) => {
 
 async function handleWebhook(req, res) {
 
-  const { secret, action, symbol, price, sl, tp1, tp2, tp3 } = req.body;
+  const { secret, action, symbol, price } = req.body;
 
   // Validate secret token
   if (CONFIG.webhookSecret && secret !== CONFIG.webhookSecret) {
@@ -158,16 +164,13 @@ async function handleWebhook(req, res) {
   }
 
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
-  if (sl)  console.log(`  SL: $${sl}`);
-  if (tp1) console.log(`  TP1: $${tp1}${tp2 ? ` | TP2: $${tp2}` : ""}${tp3 ? ` | TP3: $${tp3}` : ""}`);
-  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x`);
+  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
 
   if (CONFIG.paperTrading) {
     const paperId = `PAPER-${Date.now()}`;
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
-    const notes = `SL:${sl||"auto"} TP1:${tp1||"auto"} TP2:${tp2||"-"} TP3:${tp3||"-"}`;
-    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", notes);
-    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum, sl: sl||null, tp1: tp1||null, tp2: tp2||null, tp3: tp3||null });
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
+    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
   }
 
   // Live execution
@@ -177,7 +180,7 @@ async function handleWebhook(req, res) {
       console.log(`  Leverage set to ${CONFIG.leverage}x`);
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum, sl, tp1);
+    const order = await placeOrder(sym, actionLower, priceNum);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
