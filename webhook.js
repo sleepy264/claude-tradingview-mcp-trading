@@ -40,6 +40,19 @@ function logTrade(symbol, action, price, sizeUSD, orderId, mode, notes) {
   appendFileSync(LOG_FILE, row + "\n");
 }
 
+// ─── Telegram Notifications ──────────────────────────────────────────────────
+
+async function sendTelegram(message) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+  }).catch((e) => console.log("Telegram error:", e.message));
+}
+
 // ─── Bybit helpers ───────────────────────────────────────────────────────────
 
 function sign(timestamp, recvWindow, body) {
@@ -218,6 +231,7 @@ async function handleWebhook(req, res) {
     const paperId = `PAPER-${Date.now()}`;
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
+    await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
     return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
   }
 
@@ -233,6 +247,7 @@ async function handleWebhook(req, res) {
         if (openSideLower === actionLower) {
           console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
           logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
+          await sendTelegram(`⏭ <b>Bot v2 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
           return res.json({ status: "skipped", reason: `Already ${openPos.side}`, symbol: sym });
         }
         console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size}) before opening ${actionLower.toUpperCase()}...`);
@@ -251,11 +266,13 @@ async function handleWebhook(req, res) {
     }
 
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
+    await sendTelegram(`✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%\nOrder: ${order.orderId}`);
     return res.json({ status: "ok", orderId: order.orderId, action: actionLower, symbol: sym, price: priceNum });
 
   } catch (err) {
     console.log(`  ❌ ERROR — ${err.message}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
+    await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro na ordem\n${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 }
