@@ -17,8 +17,11 @@ import { execSync } from "child_process";
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["BYBIT_API_KEY", "BYBIT_SECRET_KEY"];
   const missing = required.filter((k) => !process.env[k]);
+
+  // Skip file-based onboarding if credentials are already in the environment (e.g. Railway)
+  if (missing.length === 0) return;
 
   if (!existsSync(".env")) {
     console.log(
@@ -27,10 +30,9 @@ function checkOnboarding() {
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# Bybit credentials",
+        "BYBIT_API_KEY=",
+        "BYBIT_SECRET_KEY=",
         "",
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
@@ -39,13 +41,14 @@ function checkOnboarding() {
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=4H",
+        "TRADE_MODE=spot",
       ].join("\n") + "\n",
     );
     try {
       execSync("open .env");
     } catch {}
     console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
+      "Fill in your Bybit credentials in .env then re-run: node bot.js\n",
     );
     process.exit(0);
   }
@@ -79,11 +82,10 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  bybit: {
+    apiKey: process.env.BYBIT_API_KEY,
+    secretKey: process.env.BYBIT_SECRET_KEY,
+    baseUrl: process.env.BYBIT_BASE_URL || "https://api.bybit.com",
   },
 };
 
@@ -151,19 +153,35 @@ function calcEMA(closes, period) {
 }
 
 function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
+  const valid = closes.filter(c => Number.isFinite(c));
+  if (valid.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = valid.length - period; i < valid.length; i++) {
+    const diff = valid[i] - valid[i - 1];
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
+  if (gains === 0 && losses === 0) return 50;
+  if (losses === 0) return 100;
+  if (gains === 0) return 0;
+  const rs = (gains / period) / (losses / period);
   return 100 - 100 / (1 + rs);
+}
+
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    ));
+  }
+  const recent = trs.slice(-period);
+  const avg50  = trs.slice(-50).reduce((a, b) => a + b) / Math.min(trs.length, 50);
+  const atr    = recent.reduce((a, b) => a + b) / period;
+  return { atr, avg50, volatile: atr > avg50 };
 }
 
 // VWAP — session-based, resets at midnight UTC
@@ -219,10 +237,10 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
     // 3. RSI(3) pullback
     check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
+      "RSI(3) below 25 (pullback in uptrend)",
+      "< 25",
       rsi3.toFixed(2),
-      rsi3 < 30,
+      rsi3 < 25,
     );
 
     // 4. Not overextended from VWAP
@@ -251,10 +269,10 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     );
 
     check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
+      "RSI(3) above 75 (reversal in downtrend)",
+      "> 75",
       rsi3.toFixed(2),
-      rsi3 > 70,
+      rsi3 > 75,
     );
 
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
@@ -315,72 +333,141 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Bybit Execution ─────────────────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
+function signBybit(timestamp, recvWindow, body) {
+  const message = `${timestamp}${CONFIG.bybit.apiKey}${recvWindow}${body}`;
   return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
+    .createHmac("sha256", CONFIG.bybit.secretKey)
     .update(message)
-    .digest("base64");
+    .digest("hex");
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
+function isTimestampError(msg) {
+  return msg && (msg.includes("timestamp") || msg.includes("recv_window"));
+}
 
-  const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
-  });
-
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
-    },
-    body,
-  });
-
-  const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+async function withTimestampRetry(fn, maxRetries = 3) {
+  let offset = 1500;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn(offset);
+    } catch (err) {
+      if (isTimestampError(err.message) && attempt < maxRetries) {
+        offset += 1500;
+        console.log(`  ⚠️  Timestamp error — retrying (attempt ${attempt + 1}/${maxRetries}, offset ${offset}ms)...`);
+      } else {
+        throw err;
+      }
+    }
   }
+}
 
-  return data.data;
+async function getOpenPosition(symbol) {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = `category=linear&symbol=${symbol}`;
+  const sig        = signBybit(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  const position = data.result?.list?.[0];
+  if (!position) return null;
+  const size = parseFloat(position.size);
+  return size > 0 ? { side: position.side, size, unrealisedPnl: position.unrealisedPnl } : null;
+}
+
+async function getInstrumentInfo(symbol) {
+  const url = `${CONFIG.bybit.baseUrl}/v5/market/instruments-info?category=linear&symbol=${symbol}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Failed to get instrument info: ${data.retMsg}`);
+  const instrument = data.result?.list?.[0];
+  if (!instrument) throw new Error(`Symbol ${symbol} not found`);
+  const lot = instrument.lotSizeFilter;
+  return {
+    maxLeverage: parseFloat(instrument.leverageFilter.maxLeverage),
+    minQty:      parseFloat(lot.minOrderQty),
+    qtyStep:     parseFloat(lot.qtyStep),
+  };
+}
+
+function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
+  const raw   = (sizeUSD * leverage) / price;
+  const steps = Math.floor(raw / qtyStep);
+  const qty   = Math.max(steps * qtyStep, minQty);
+  const decimals = (qtyStep.toString().split(".")[1] || "").length;
+  return qty.toFixed(decimals);
+}
+
+async function setLeverage(symbol, leverage) {
+  return withTimestampRetry(async (offset) => {
+    const timestamp = (Date.now() - offset).toString();
+    const recvWindow = "10000";
+    const body = JSON.stringify({ category: "linear", symbol, buyLeverage: String(leverage), sellLeverage: String(leverage) });
+    const signature = signBybit(timestamp, recvWindow, body);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      body,
+    });
+    const data = await res.json();
+    if (data.retCode !== 0 && data.retCode !== 110043)
+      throw new Error(`Failed to set leverage: ${data.retMsg}`);
+  });
+}
+
+async function setTrailingStop(symbol, trailingDistance, positionIdx = 0) {
+  return withTimestampRetry(async (offset) => {
+    const timestamp = (Date.now() - offset).toString();
+    const recvWindow = "10000";
+    const body = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, positionIdx });
+    const signature = signBybit(timestamp, recvWindow, body);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      body,
+    });
+    const data = await res.json();
+    if (data.retCode !== 0)
+      throw new Error(`Failed to set trailing stop: ${data.retMsg}`);
+  });
+}
+
+async function placeBybitOrder(symbol, side, sizeUSD, price) {
+  const leverage = parseInt(process.env.LEVERAGE || "60");
+  const { minQty, qtyStep } = await getInstrumentInfo(symbol);
+  const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
+  console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+
+  return withTimestampRetry(async (offset) => {
+    const timestamp = (Date.now() - offset).toString();
+    const recvWindow = "10000";
+
+    const stopLossPrice = side === "buy" ? (price * 0.998).toFixed(2) : (price * 1.002).toFixed(2);
+    const orderBody = CONFIG.tradeMode === "spot"
+      ? { category: "spot", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity }
+      : { category: "linear", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity,
+          positionIdx: 0, stopLoss: stopLossPrice, slTriggerBy: "LastPrice",
+          takeProfit: side === "buy" ? (price * 1.004).toFixed(2) : (price * 0.996).toFixed(2), tpTriggerBy: "LastPrice" };
+
+    const body = JSON.stringify(orderBody);
+    const signature = signBybit(timestamp, recvWindow, body);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      body,
+    });
+    const data = await res.json();
+    if (data.retCode !== 0) throw new Error(`Bybit order failed: ${data.retMsg}`);
+    return data.result;
+  });
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
-const CSV_FILE = "trades.csv";
-
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
-function initCsv() {
-  if (!existsSync(CSV_FILE)) {
-    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
-    console.log(
-      `📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`,
-    );
-  }
-}
+const CSV_FILE    = "trades.csv";
 const CSV_HEADERS = [
   "Date",
   "Time (UTC)",
@@ -397,8 +484,31 @@ const CSV_HEADERS = [
   "Notes",
 ].join(",");
 
+function logSkip(price, reason) {
+  if (!existsSync(CSV_FILE)) {
+    writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
+  }
+  const now  = new Date(Date.now() + 3600000); // UTC+1
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19);
+  const row  = [date, time, "Bybit", CONFIG.symbol, "", "", price.toFixed(2), "", "", "", "SKIPPED", "SKIPPED", `"${reason}"`].join(",");
+  appendFileSync(CSV_FILE, row + "\n");
+  console.log(`Tax record saved → ${CSV_FILE}`);
+}
+
+// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
+function initCsv() {
+  if (!existsSync(CSV_FILE)) {
+    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
+    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
+    console.log(
+      `📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`,
+    );
+  }
+}
+
 function writeTradeCsv(logEntry) {
-  const now = new Date(logEntry.timestamp);
+  const now  = new Date(new Date(logEntry.timestamp).getTime() + 3600000); // UTC+1
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
 
@@ -442,7 +552,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "Bybit",
     logEntry.symbol,
     side,
     quantity,
@@ -517,29 +627,77 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
+  // Fetch candle data — 15m for entry indicators, 1H for trend filter
   console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
-  const closes = candles.map((c) => c.close);
+  const [candles, candles1h] = await Promise.all([
+    fetchCandles(CONFIG.symbol, "15m", 500),
+    fetchCandles(CONFIG.symbol, "1h",  200),
+  ]);
+  const closes   = candles.map((c) => c.close);
+  const closes1h = candles1h.map((c) => c.close);
   const price = closes[closes.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
 
   // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
+  const ema8     = calcEMA(closes, 8);
+  const vwap     = calcVWAP(candles);
+  const rsi3     = calcRSI(closes, 3);
+  const ema50_1h = calcEMA(closes1h, 50);
 
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
+  const atrData  = calcATR(candles, 14);
+  const rsi14_1h = calcRSI(closes1h, 14);
+  const volAvg   = candles.slice(-20).reduce((s, c) => s + c.volume, 0) / 20;
+  const lastVol  = candles[candles.length - 1].volume;
+  const volLow   = lastVol < volAvg;
 
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
+  const rsi3Valid    = rsi3 !== null && !isNaN(rsi3);
+  const rsi14_1hValid = rsi14_1h !== null && !isNaN(rsi14_1h);
+  console.log(`  EMA(8)  15m: $${ema8 != null ? ema8.toFixed(2) : "N/A"}`);
+  console.log(`  VWAP    15m: $${vwap != null ? vwap.toFixed(2) : "N/A"}`);
+  console.log(`  RSI(3)  15m: ${rsi3Valid ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  RSI(14) 1H:  ${rsi14_1hValid ? rsi14_1h.toFixed(2) : "N/A"} (1H RSI filter)`);
+  console.log(`  EMA(50) 1H:  $${ema50_1h != null ? ema50_1h.toFixed(2) : "N/A"} (trend filter)`);
+  console.log(`  ATR(14) 15m: ${atrData ? `$${atrData.atr.toFixed(2)} — ${atrData.volatile ? "✅ volatile" : "🚫 choppy"}` : "N/A"}`);
+  console.log(`  Volume  15m: ${volLow ? "✅ low (weak pullback)" : "🚫 high (strong move, skip)"}`);
+
+  const missing = [
+    vwap == null          && "VWAP",
+    !rsi3Valid            && "RSI(3) 15m",
+    ema50_1h == null      && "EMA(50) 1H",
+    atrData == null       && "ATR(14) 15m",
+    !rsi14_1hValid        && "RSI(14) 1H",
+  ].filter(Boolean);
+  if (missing.length) {
+    console.log(`\n⚠️  Missing indicators: ${missing.join(", ")} — not enough candle history.`);
+    logSkip(price, `Missing: ${missing.join(", ")}`);
     return;
   }
 
+  if (!atrData.volatile) {
+    console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
+    logSkip(price, "Choppy market (ATR below average)");
+    return;
+  }
+
+  if (!volLow) {
+    console.log("\n🚫 Volume above average — pullback is strong, not a snap-back setup.");
+    logSkip(price, "Volume above average — strong pullback");
+    return;
+  }
+
+  // Trend filter: only trade in direction of 1H EMA(50)
+  const trendBullish = price > ema50_1h;
+  const trendBearish = price < ema50_1h;
+  console.log(`  1H Trend: ${trendBullish ? "BULLISH (longs only)" : trendBearish ? "BEARISH (shorts only)" : "NEUTRAL"}`);
+
   // Run safety check
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+
+  // Determine direction from 1H bias — must align with 4H trend
+  const h1Side = price > vwap && price > ema8 ? "buy" : "sell";
+  const trendAligned = (h1Side === "buy" && trendBullish) || (h1Side === "sell" && trendBearish);
+
+  const tradeSide = h1Side;
 
   // Calculate position size
   const tradeSize = Math.min(
@@ -569,35 +727,65 @@ async function run() {
     },
   };
 
-  if (!allPass) {
+  const rsi1hOk = rsi14_1hValid && (h1Side === "buy" ? rsi14_1h < 70 : rsi14_1h > 30);
+
+  if (!trendAligned) results.push({ label: `15m bias (${h1Side}) conflicts with 1H trend`, pass: false });
+  if (!rsi1hOk)      results.push({ label: `1H RSI(14) at ${rsi14_1h.toFixed(1)} — market extended`, pass: false });
+  logEntry.conditions = results;
+  logEntry.allPass    = results.every(r => r.pass);
+
+  if (!logEntry.allPass) {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
     console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
+    const direction = tradeSide === "buy" ? "LONG" : "SHORT";
+    const stopPrice = tradeSide === "buy"
+      ? (price * 0.998).toFixed(2)
+      : (price * 1.002).toFixed(2);
+    const tpPrice = tradeSide === "buy"
+      ? (price * 1.004).toFixed(2)
+      : (price * 0.996).toFixed(2);
+
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
+      console.log(`   SL: $${stopPrice} (0.2%) | TP: $${tpPrice} (0.4%) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+      logEntry.side = tradeSide;
+      logEntry.stopLoss = stopPrice;
+      logEntry.takeProfit = tpPrice;
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
+        `\n🔴 PLACING LIVE ORDER — ${direction} $${tradeSize.toFixed(2)} ${CONFIG.symbol}`,
       );
       try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
+        if (CONFIG.tradeMode === "futures") {
+          const openPos = await getOpenPosition(CONFIG.symbol);
+          if (openPos) {
+            console.log(`⚠️  Posição já aberta (${openPos.side} qty=${openPos.size}) — a saltar nova ordem.`);
+            logEntry.error = `Position already open: ${openPos.side} qty=${openPos.size}`;
+            throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
+          }
+          const leverage = parseInt(process.env.LEVERAGE || "60");
+          await setLeverage(CONFIG.symbol, leverage);
+          console.log(`  Leverage set to ${leverage}x`);
+        }
+        console.log(`  SL: $${stopPrice} (0.2%) | TP: $${tpPrice} (0.4%) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
+        const order = await placeBybitOrder(CONFIG.symbol, tradeSide, tradeSize, price);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        logEntry.side = tradeSide;
+        logEntry.stopLoss = stopPrice;
+        const trailingDistance = (price * 0.03).toFixed(2);
+        await setTrailingStop(CONFIG.symbol, trailingDistance);
+        logEntry.trailingStop = trailingDistance;
+        console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | Trailing: $${trailingDistance}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
