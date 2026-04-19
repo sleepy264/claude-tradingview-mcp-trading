@@ -115,6 +115,37 @@ async function fetchCurrentPrice(symbol) {
   return parseFloat(data.result?.list?.[0]?.lastPrice || "0");
 }
 
+async function getOpenPosition(symbol) {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = `category=linear&symbol=${symbol}`;
+  const sig        = sign(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  const position = data.result?.list?.[0];
+  if (!position) return null;
+  const size = parseFloat(position.size);
+  return size > 0 ? { side: position.side, size } : null;
+}
+
+async function closePosition(symbol, position) {
+  const closeSide  = position.side === "Buy" ? "Sell" : "Buy";
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const body       = JSON.stringify({ category: "linear", symbol, side: closeSide, orderType: "Market", qty: String(position.size), positionIdx: 0, reduceOnly: true });
+  const sig        = sign(timestamp, recvWindow, body);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Close position failed: ${data.retMsg}`);
+  return data.result;
+}
+
 async function setTrailingStop(symbol) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
@@ -195,6 +226,20 @@ async function handleWebhook(req, res) {
     if (CONFIG.tradeMode === "futures") {
       await setLeverage(sym);
       console.log(`  Leverage set to ${CONFIG.leverage}x`);
+
+      const openPos = await getOpenPosition(sym);
+      if (openPos) {
+        const openSideLower = openPos.side.toLowerCase();
+        if (openSideLower === actionLower) {
+          console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
+          logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
+          return res.json({ status: "skipped", reason: `Already ${openPos.side}`, symbol: sym });
+        }
+        console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size}) before opening ${actionLower.toUpperCase()}...`);
+        const closeResult = await closePosition(sym, openPos);
+        console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
+        logTrade(sym, openSideLower === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${openPos.side} — reversing to ${actionLower}`);
+      }
     }
 
     const order = await placeOrder(sym, actionLower, priceNum);
