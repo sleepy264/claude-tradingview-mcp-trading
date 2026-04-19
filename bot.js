@@ -112,27 +112,19 @@ function countTodaysTrades(log) {
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
   const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1H": "60", "4H": "240", "1D": "D", "1W": "W",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
-
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const bybitInterval = intervalMap[interval] || "15";
+  const url = `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+  if (!res.ok) throw new Error(`Bybit kline API error: ${res.status}`);
   const data = await res.json();
-
-  return data.map((k) => ({
-    time: k[0],
+  if (data.retCode !== 0) throw new Error(`Bybit kline error: ${data.retMsg}`);
+  // Bybit returns newest first — reverse to chronological order
+  return data.result.list.reverse().map((k) => ({
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
