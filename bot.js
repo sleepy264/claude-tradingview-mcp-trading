@@ -113,17 +113,20 @@ function countTodaysTrades(log) {
 
 async function fetchCandles(symbol, interval, limit = 100) {
   const intervalMap = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1H": "60", "4H": "240", "1D": "D", "1W": "W",
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W",
   };
-  const bybitInterval = intervalMap[interval] || "15";
-  const url = `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
+  const okxInterval = intervalMap[interval] || "15m";
+  // Convert Bybit symbol format (SOLUSDT) to OKX format (SOL-USDT)
+  const okxSymbol = symbol.replace(/^([A-Z]+)(USDT|USDC|BTC|ETH)$/, "$1-$2");
+  // OKX max is 300 candles per request
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${okxInterval}&limit=${Math.min(limit, 300)}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Bybit kline API error: ${res.status}`);
+  if (!res.ok) throw new Error(`OKX kline API error: ${res.status}`);
   const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Bybit kline error: ${data.retMsg}`);
-  // Bybit returns newest first — reverse to chronological order
-  return data.result.list.reverse().map((k) => ({
+  if (data.code !== "0") throw new Error(`OKX kline error: ${data.msg}`);
+  // OKX returns newest first — reverse to chronological order
+  return data.data.reverse().map((k) => ({
     time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
