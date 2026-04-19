@@ -48,8 +48,8 @@ function sign(timestamp, recvWindow, body) {
 }
 
 async function setLeverage(symbol) {
-  const timestamp  = Date.now().toString();
-  const recvWindow = "5000";
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
   const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(CONFIG.leverage), sellLeverage: String(CONFIG.leverage) });
   const sig        = sign(timestamp, recvWindow, body);
   const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
@@ -61,9 +61,26 @@ async function setLeverage(symbol) {
   if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
 }
 
+async function getInstrumentLotSize(symbol) {
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/instruments-info?category=linear&symbol=${symbol}`);
+  const data = await res.json();
+  const lot  = data.result?.list?.[0]?.lotSizeFilter;
+  return { minQty: parseFloat(lot?.minOrderQty || "0.001"), qtyStep: parseFloat(lot?.qtyStep || "0.001") };
+}
+
+function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
+  const raw      = (sizeUSD * leverage) / price;
+  const steps    = Math.floor(raw / qtyStep);
+  const qty      = Math.max(steps * qtyStep, minQty);
+  const decimals = (qtyStep.toString().split(".")[1] || "").length;
+  return qty.toFixed(decimals);
+}
+
 async function placeOrder(symbol, action, price) {
-  const side     = action === "buy" ? "Buy" : "Sell";
-  const quantity = (CONFIG.tradeSize / price).toFixed(3);
+  const side = action === "buy" ? "Buy" : "Sell";
+  const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
+  const quantity = calcQty(CONFIG.tradeSize, CONFIG.leverage, price, minQty, qtyStep);
+  console.log(`  Qty: ${quantity} ($${CONFIG.tradeSize} × ${CONFIG.leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
   const stopLoss   = action === "buy"
     ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
@@ -77,8 +94,8 @@ async function placeOrder(symbol, action, price) {
         stopLoss, slTriggerBy: "LastPrice", takeProfit, tpTriggerBy: "LastPrice" }
     : { category: "spot", symbol, side, orderType: "Market", qty: quantity };
 
-  const timestamp  = Date.now().toString();
-  const recvWindow = "5000";
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
   const body       = JSON.stringify(orderBody);
   const sig        = sign(timestamp, recvWindow, body);
 
