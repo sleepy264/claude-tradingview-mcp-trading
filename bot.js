@@ -460,6 +460,19 @@ async function placeBybitOrder(symbol, side, sizeUSD, price) {
   });
 }
 
+// ─── Telegram Notifications ──────────────────────────────────────────────────
+
+async function sendTelegram(message) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+  }).catch((e) => console.log("Telegram error:", e.message));
+}
+
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
 const CSV_FILE    = "trades.csv";
@@ -665,18 +678,21 @@ async function run() {
   if (missing.length) {
     console.log(`\n⚠️  Missing indicators: ${missing.join(", ")} — not enough candle history.`);
     logSkip(price, `Missing: ${missing.join(", ")}`);
+    await sendTelegram(`⚠️ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nMissing indicators: ${missing.join(", ")}`);
     return;
   }
 
   if (!atrData.volatile) {
     console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
     logSkip(price, "Choppy market (ATR below average)");
+    await sendTelegram(`⏭ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nMercado choppy (ATR abaixo da média)`);
     return;
   }
 
   if (!volLow) {
     console.log("\n🚫 Volume above average — pullback is strong, not a snap-back setup.");
     logSkip(price, "Volume above average — strong pullback");
+    await sendTelegram(`⏭ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nVolume acima da média — pullback forte`);
     return;
   }
 
@@ -733,6 +749,7 @@ async function run() {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
     console.log(`🚫 TRADE BLOCKED`);
     failed.forEach((f) => console.log(`   - ${f}`));
+    await sendTelegram(`🚫 <b>Bot v1 ${CONFIG.symbol}</b> — Trade bloqueado @ $${price.toFixed(2)}\n${failed.map(f => `• ${f}`).join("\n")}`);
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
@@ -755,6 +772,7 @@ async function run() {
       logEntry.side = tradeSide;
       logEntry.stopLoss = stopPrice;
       logEntry.takeProfit = tpPrice;
+      await sendTelegram(`📋 <b>Bot v1 ${CONFIG.symbol}</b> — PAPER ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP: $${tpPrice}`);
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — ${direction} $${tradeSize.toFixed(2)} ${CONFIG.symbol}`,
@@ -781,9 +799,11 @@ async function run() {
         await setTrailingStop(CONFIG.symbol, trailingDistance);
         logEntry.trailingStop = trailingDistance;
         console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | Trailing: $${trailingDistance}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP: $${tpPrice}\nOrder: ${order.orderId}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
+        await sendTelegram(`❌ <b>Bot v1 ${CONFIG.symbol}</b> — Erro na ordem\n${err.message}`);
       }
     }
   }
