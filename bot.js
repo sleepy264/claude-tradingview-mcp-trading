@@ -232,10 +232,10 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
     // 3. RSI(3) pullback
     check(
-      "RSI(3) below 25 (pullback in uptrend)",
-      "< 25",
+      "RSI(3) below 40 (pullback in uptrend)",
+      "< 40",
       rsi3.toFixed(2),
-      rsi3 < 25,
+      rsi3 < 40,
     );
 
     // 4. Not overextended from VWAP
@@ -264,10 +264,10 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     );
 
     check(
-      "RSI(3) above 75 (reversal in downtrend)",
-      "> 75",
+      "RSI(3) above 60 (reversal in downtrend)",
+      "> 60",
       rsi3.toFixed(2),
-      rsi3 > 75,
+      rsi3 > 60,
     );
 
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
