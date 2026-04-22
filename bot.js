@@ -176,7 +176,7 @@ function calcATR(candles, period = 14) {
   const recent = trs.slice(-period);
   const avg50  = trs.slice(-50).reduce((a, b) => a + b) / Math.min(trs.length, 50);
   const atr    = recent.reduce((a, b) => a + b) / period;
-  return { atr, avg50, volatile: atr > avg50 };
+  return { atr, avg50, volatile: atr > avg50 * 0.7 };
 }
 
 // VWAP — session-based, resets at midnight UTC
@@ -207,9 +207,9 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  // Determine bias from VWAP only
+  const bullishBias = price > vwap;
+  const bearishBias = price < vwap;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
@@ -277,14 +277,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       `${distFromVWAP.toFixed(2)}%`,
       distFromVWAP < 1.5,
     );
-  } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
-    results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
-      pass: false,
-    });
   }
 
   const allPass = results.every((r) => r.pass);
@@ -704,8 +696,8 @@ async function run() {
   // Run safety check
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
-  // Determine direction from 1H bias — must align with 4H trend
-  const h1Side = price > vwap && price > ema8 ? "buy" : "sell";
+  // Determine direction from VWAP — must align with 1H trend
+  const h1Side = price > vwap ? "buy" : "sell";
   const trendAligned = (h1Side === "buy" && trendBullish) || (h1Side === "sell" && trendBearish);
 
   const tradeSide = h1Side;
