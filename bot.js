@@ -427,6 +427,10 @@ async function placeBybitOrder(symbol, side, sizeUSD, price) {
   const { minQty, qtyStep } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
   console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+  if (CONFIG.tradeMode !== "spot") {
+    await setLeverage(symbol, leverage);
+    console.log(`  Leverage set to ${leverage}x`);
+  }
 
   return withTimestampRetry(async (offset) => {
     const timestamp = (Date.now() - offset).toString();
