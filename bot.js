@@ -422,7 +422,7 @@ async function setTrailingStop(symbol, trailingDistance, positionIdx = 0) {
   });
 }
 
-async function placeBybitOrder(symbol, side, sizeUSD, price) {
+async function placeBybitOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
   const leverage = parseInt(process.env.LEVERAGE || "60");
   const { minQty, qtyStep } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
@@ -436,12 +436,11 @@ async function placeBybitOrder(symbol, side, sizeUSD, price) {
     const timestamp = (Date.now() - offset).toString();
     const recvWindow = "10000";
 
-    const stopLossPrice = side === "buy" ? (price * 0.998).toFixed(2) : (price * 1.002).toFixed(2);
     const orderBody = CONFIG.tradeMode === "spot"
       ? { category: "spot", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity }
       : { category: "linear", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity,
-          positionIdx: 0, stopLoss: stopLossPrice, slTriggerBy: "LastPrice",
-          takeProfit: side === "buy" ? (price * 1.004).toFixed(2) : (price * 0.996).toFixed(2), tpTriggerBy: "LastPrice" };
+          positionIdx: 0, stopLoss, slTriggerBy: "LastPrice",
+          takeProfit, tpTriggerBy: "LastPrice" };
 
     const body = JSON.stringify(orderBody);
     const signature = signBybit(timestamp, recvWindow, body);
@@ -750,18 +749,19 @@ async function run() {
     console.log(`✅ ALL CONDITIONS MET`);
 
     const direction = tradeSide === "buy" ? "LONG" : "SHORT";
+    const atr = atrData.atr;
     const stopPrice = tradeSide === "buy"
-      ? (price * 0.998).toFixed(2)
-      : (price * 1.002).toFixed(2);
+      ? (price - atr).toFixed(2)
+      : (price + atr).toFixed(2);
     const tpPrice = tradeSide === "buy"
-      ? (price * 1.004).toFixed(2)
-      : (price * 0.996).toFixed(2);
+      ? (price + atr * 3).toFixed(2)
+      : (price - atr * 3).toFixed(2);
 
     if (CONFIG.paperTrading) {
       console.log(
         `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   SL: $${stopPrice} (0.2%) | TP: $${tpPrice} (0.4%) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
+      console.log(`   SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
@@ -785,8 +785,8 @@ async function run() {
           await setLeverage(CONFIG.symbol, leverage);
           console.log(`  Leverage set to ${leverage}x`);
         }
-        console.log(`  SL: $${stopPrice} (0.2%) | TP: $${tpPrice} (0.4%) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
-        const order = await placeBybitOrder(CONFIG.symbol, tradeSide, tradeSize, price);
+        console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
+        const order = await placeBybitOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
