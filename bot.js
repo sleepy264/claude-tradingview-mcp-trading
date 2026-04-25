@@ -741,9 +741,6 @@ async function run() {
             logEntry.error = `Position already open: ${openPos.side} qty=${openPos.size}`;
             throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
           }
-          const leverage = parseInt(process.env.LEVERAGE || "60");
-          await setLeverage(CONFIG.symbol, leverage);
-          console.log(`  Leverage set to ${leverage}x`);
         }
         console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
         const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
