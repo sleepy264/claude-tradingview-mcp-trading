@@ -117,8 +117,8 @@ async function fetchCandles(symbol, interval, limit = 100) {
     "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W",
   };
   const okxInterval = intervalMap[interval] || "15m";
-  // Convert Bybit symbol format (SOLUSDT) to OKX format (SOL-USDT)
-  const okxSymbol = symbol.replace(/^([A-Z]+)(USDT|USDC|BTC|ETH)$/, "$1-$2");
+  // Convert symbol format (SOLUSDT or SOL_USDT) to OKX format (SOL-USDT)
+  const okxSymbol = symbol.replace(/_/g, "-").replace(/^([A-Z]+)(USDT|USDC|BTC|ETH)$/, "$1-$2");
   // OKX max is 300 candles per request
   const url = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${okxInterval}&limit=${Math.min(limit, 300)}`;
   const res = await fetch(url);
