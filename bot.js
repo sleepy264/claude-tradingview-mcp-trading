@@ -380,10 +380,31 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize = 1) {
   return qty.toFixed(decimals);
 }
 
-async function setTrailingStop(symbol) {
-  // MEXC não suporta trailing stop direto via API de posição.
-  // O SL/TP dinâmico é definido na ordem — trailing stop ignorado.
-  console.log(`  ⚠️  Trailing stop não suportado na MEXC — ignorado.`);
+// Place a trigger (plan) order to close a position at SL or TP price.
+// triggerType: 1 = fires when price >= triggerPrice  (use for TP on longs / SL on shorts)
+//              2 = fires when price <= triggerPrice  (use for SL on longs / TP on shorts)
+async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, triggerType, leverage) {
+  const timestamp = Date.now().toString();
+  const body = JSON.stringify({
+    symbol,
+    side:          closeSide,
+    vol:           parseFloat(vol),
+    leverage,
+    openType:      2,              // cross margin
+    triggerPrice:  String(triggerPrice),
+    triggerType,                   // 1 = >=, 2 = <=
+    executedPrice: "0",            // 0 = market on trigger
+    orderType:     2,              // 2 = market-triggered
+  });
+  const sig = signMexc(timestamp, body);
+  const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/planorder/place`, {
+    method: "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body,
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC plan order failed: ${data.message}`);
+  return data.data; // planOrderId
 }
 
 async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
@@ -391,7 +412,6 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   const { minQty, qtyStep, contractSize } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize);
   console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ ($${price.toFixed(2)} × contractSize=${contractSize}), min=${minQty}, step=${qtyStep})`);
-  // Leverage é passado diretamente na ordem — não precisa de chamada separada na MEXC
 
   // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
   const mexcSide = side === "buy" ? 1 : 3;
@@ -414,7 +434,40 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   });
   const data = await res.json();
   if (!data.success) throw new Error(`MEXC order failed: ${data.message}`);
-  return { orderId: data.data };
+  const orderId = data.data;
+
+  // ── Place SL / TP plan orders after the market order fills ──────────────
+  // Wait briefly for the position to open before querying it
+  await new Promise((r) => setTimeout(r, 1500));
+  const pos = await getOpenPosition(symbol);
+  if (!pos) {
+    console.log(`  ⚠️  Posição não encontrada após ordem — SL/TP não colocados.`);
+    return { orderId };
+  }
+
+  // closeSide: 4=Close Long (for buys), 2=Close Short (for sells)
+  const closeSide   = side === "buy" ? 4 : 2;
+  // For LONG:  SL fires when price drops (<=), TP fires when price rises (>=)
+  // For SHORT: SL fires when price rises (>=), TP fires when price drops (<=)
+  const slTrigger   = side === "buy" ? 2 : 1;
+  const tpTrigger   = side === "buy" ? 1 : 2;
+  const filledVol   = pos.size;
+
+  try {
+    const slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss,   slTrigger, leverage);
+    console.log(`  ✅ SL plan order placed — id=${slId} @ $${stopLoss}`);
+  } catch (e) {
+    console.log(`  ⚠️  SL plan order falhou: ${e.message}`);
+  }
+
+  try {
+    const tpId = await placeMexcPlanOrder(symbol, closeSide, filledVol, takeProfit, tpTrigger, leverage);
+    console.log(`  ✅ TP plan order placed — id=${tpId} @ $${takeProfit}`);
+  } catch (e) {
+    console.log(`  ⚠️  TP plan order falhou: ${e.message}`);
+  }
+
+  return { orderId };
 }
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
@@ -723,7 +776,7 @@ async function run() {
       console.log(
         `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
+      console.log(`   SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
@@ -744,17 +797,15 @@ async function run() {
             throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
           }
         }
-        console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
+        console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)`);
         const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
         logEntry.stopLoss = stopPrice;
-        const trailingDistance = (price * 0.03).toFixed(2);
-        await setTrailingStop(CONFIG.symbol, trailingDistance);
-        logEntry.trailingStop = trailingDistance;
-        console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | Trailing: $${trailingDistance}`);
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP: $${tpPrice}\nOrder: ${order.orderId}`);
+        logEntry.takeProfit = tpPrice;
+        console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP: $${tpPrice}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)\nOrder: ${order.orderId}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
