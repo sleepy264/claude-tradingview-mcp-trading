@@ -481,14 +481,13 @@ async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage
   const timestamp = Date.now().toString();
   const body = JSON.stringify({
     symbol,
-    side:          closeSide,
-    vol:           parseFloat(vol),
+    side:         closeSide,
+    vol:          parseFloat(vol),
     leverage,
-    openType:      2,              // cross margin
-    triggerPrice:  String(triggerPrice),
-    triggerType:   2,              // 2 = last price
-    executedPrice: "0",            // 0 = market on trigger
-    orderType:     2,              // 2 = market-triggered
+    openType:     2,                    // cross margin
+    triggerPrice: parseFloat(triggerPrice), // number — string causes "Order price error"
+    triggerType:  2,                    // 2 = last price (direction inferred by MEXC)
+    orderType:    2,                    // 2 = market on trigger (no executedPrice needed)
   });
   const sig = signMexc(timestamp, body);
   const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/planorder/place`, {
