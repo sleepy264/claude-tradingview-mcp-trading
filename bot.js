@@ -395,14 +395,12 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   const timestamp = Date.now().toString();
   const orderBody = JSON.stringify({
     symbol,
-    price:          0,
-    vol:            parseFloat(quantity),
+    price:    0,
+    vol:      parseFloat(quantity),
     leverage,
-    side:           mexcSide,
-    type:           5,       // 5 = Market
-    openType:       2,       // 2 = Cross margin
-    stopLossPrice:  parseFloat(stopLoss),
-    takeProfitPrice: parseFloat(takeProfit),
+    side:     mexcSide,
+    type:     5,   // 5 = Market
+    openType: 2,   // 2 = Cross margin
   });
   const sig = signMexc(timestamp, orderBody);
   const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
