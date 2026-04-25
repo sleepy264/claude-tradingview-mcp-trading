@@ -361,15 +361,19 @@ async function getInstrumentInfo(symbol) {
   const data = await res.json();
   if (!data.success) throw new Error(`MEXC instrument info failed: ${data.message}`);
   const d = data.data;
-  const qtyStep = Math.pow(10, -(d.volDecimalPlaces || 0));
+  const qtyStep    = Math.pow(10, -(d.volDecimalPlaces || 0));
+  const contractSize = parseFloat(d.contractSize) || 1;
   return {
-    minQty:   parseFloat(d.minVol) || 1,
+    minQty: parseFloat(d.minVol) || 1,
     qtyStep,
+    contractSize,
   };
 }
 
-function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
-  const raw   = (sizeUSD * leverage) / price;
+function calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize = 1) {
+  // vol (lots) = notional / (price * contractSize)
+  // notional   = sizeUSD * leverage
+  const raw   = (sizeUSD * leverage) / (price * contractSize);
   const steps = Math.floor(raw / qtyStep);
   const qty   = Math.max(steps * qtyStep, minQty);
   const decimals = (qtyStep.toString().split(".")[1] || "").length;
@@ -384,9 +388,9 @@ async function setTrailingStop(symbol) {
 
 async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
   const leverage = parseInt(process.env.LEVERAGE || "60");
-  const { minQty, qtyStep } = await getInstrumentInfo(symbol);
-  const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
-  console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+  const { minQty, qtyStep, contractSize } = await getInstrumentInfo(symbol);
+  const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize);
+  console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ ($${price.toFixed(2)} × contractSize=${contractSize}), min=${minQty}, step=${qtyStep})`);
   // Leverage é passado diretamente na ordem — não precisa de chamada separada na MEXC
 
   // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
