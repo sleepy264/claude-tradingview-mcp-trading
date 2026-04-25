@@ -376,21 +376,6 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
   return qty.toFixed(decimals);
 }
 
-async function setLeverage(symbol, leverage) {
-  const timestamp = Date.now().toString();
-  const body      = JSON.stringify({ symbol, leverage, openType: 2 });
-  const sig       = signMexc(timestamp, body);
-  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/position/change_leverage`, {
-    method: "POST",
-    headers: mexcHeaders(timestamp, sig),
-    body,
-  });
-  const data = await res.json();
-  // code 2019 = leverage already set
-  if (!data.success && data.code !== 2019)
-    throw new Error(`Failed to set leverage: ${data.message}`);
-}
-
 async function setTrailingStop(symbol) {
   // MEXC não suporta trailing stop direto via API de posição.
   // O SL/TP dinâmico é definido na ordem — trailing stop ignorado.
@@ -402,9 +387,7 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   const { minQty, qtyStep } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
   console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
-
-  await setLeverage(symbol, leverage);
-  console.log(`  Leverage set to ${leverage}x`);
+  // Leverage é passado diretamente na ordem — não precisa de chamada separada na MEXC
 
   // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
   const mexcSide = side === "buy" ? 1 : 3;
