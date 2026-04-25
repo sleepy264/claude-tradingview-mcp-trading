@@ -81,11 +81,11 @@ const CONFIG = {
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
-  tradeMode: process.env.TRADE_MODE || "spot",
-  bybit: {
-    apiKey: process.env.BYBIT_API_KEY,
-    secretKey: process.env.BYBIT_SECRET_KEY,
-    baseUrl: process.env.BYBIT_BASE_URL || "https://api.bybit.com",
+  tradeMode: process.env.TRADE_MODE || "futures",
+  mexc: {
+    apiKey: process.env.MEXC_API_KEY,
+    secretKey: process.env.MEXC_SECRET_KEY,
+    baseUrl: "https://contract.mexc.com",
   },
 };
 
@@ -322,61 +322,49 @@ function checkTradeLimits(log) {
 
 // ─── Bybit Execution ─────────────────────────────────────────────────────────
 
-function signBybit(timestamp, recvWindow, body) {
-  const message = `${timestamp}${CONFIG.bybit.apiKey}${recvWindow}${body}`;
+function signMexc(timestamp, params) {
+  const message = `${CONFIG.mexc.apiKey}${timestamp}${params}`;
   return crypto
-    .createHmac("sha256", CONFIG.bybit.secretKey)
+    .createHmac("sha256", CONFIG.mexc.secretKey)
     .update(message)
     .digest("hex");
 }
 
-function isTimestampError(msg) {
-  return msg && (msg.includes("timestamp") || msg.includes("recv_window"));
-}
-
-async function withTimestampRetry(fn, maxRetries = 3) {
-  let offset = 1500;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn(offset);
-    } catch (err) {
-      if (isTimestampError(err.message) && attempt < maxRetries) {
-        offset += 1500;
-        console.log(`  ⚠️  Timestamp error — retrying (attempt ${attempt + 1}/${maxRetries}, offset ${offset}ms)...`);
-      } else {
-        throw err;
-      }
-    }
-  }
+function mexcHeaders(timestamp, signature) {
+  return {
+    "Content-Type":  "application/json",
+    "ApiKey":        CONFIG.mexc.apiKey,
+    "Request-Time":  timestamp,
+    "Signature":     signature,
+  };
 }
 
 async function getOpenPosition(symbol) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = `category=linear&symbol=${symbol}`;
-  const sig        = signBybit(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  const timestamp = Date.now().toString();
+  const params    = `symbol=${symbol}`;
+  const sig       = signMexc(timestamp, params);
+  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/position/open_positions?${params}`, {
+    headers: mexcHeaders(timestamp, sig),
   });
   const data = await res.json();
-  const position = data.result?.list?.[0];
-  if (!position) return null;
-  const size = parseFloat(position.size);
-  return size > 0 ? { side: position.side, size, unrealisedPnl: position.unrealisedPnl } : null;
+  if (!data.success) throw new Error(`MEXC getOpenPosition failed: ${data.message}`);
+  const list = data.data || [];
+  if (list.length === 0) return null;
+  const pos  = list[0];
+  const size = parseFloat(pos.holdVol);
+  if (size <= 0) return null;
+  return { side: pos.positionType === 1 ? "Buy" : "Sell", size };
 }
 
 async function getInstrumentInfo(symbol) {
-  const url = `${CONFIG.bybit.baseUrl}/v5/market/instruments-info?category=linear&symbol=${symbol}`;
-  const res = await fetch(url);
+  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/contract/detail?symbol=${symbol}`);
   const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Failed to get instrument info: ${data.retMsg}`);
-  const instrument = data.result?.list?.[0];
-  if (!instrument) throw new Error(`Symbol ${symbol} not found`);
-  const lot = instrument.lotSizeFilter;
+  if (!data.success) throw new Error(`MEXC instrument info failed: ${data.message}`);
+  const d = data.data;
+  const qtyStep = Math.pow(10, -(d.volDecimalPlaces || 0));
   return {
-    maxLeverage: parseFloat(instrument.leverageFilter.maxLeverage),
-    minQty:      parseFloat(lot.minOrderQty),
-    qtyStep:     parseFloat(lot.qtyStep),
+    minQty:   parseFloat(d.minVol) || 1,
+    qtyStep,
   };
 }
 
@@ -389,70 +377,59 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
 }
 
 async function setLeverage(symbol, leverage) {
-  return withTimestampRetry(async (offset) => {
-    const timestamp = (Date.now() - offset).toString();
-    const recvWindow = "10000";
-    const body = JSON.stringify({ category: "linear", symbol, buyLeverage: String(leverage), sellLeverage: String(leverage) });
-    const signature = signBybit(timestamp, recvWindow, body);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      body,
-    });
-    const data = await res.json();
-    if (data.retCode !== 0 && data.retCode !== 110043)
-      throw new Error(`Failed to set leverage: ${data.retMsg}`);
+  const timestamp = Date.now().toString();
+  const body      = JSON.stringify({ symbol, leverage, openType: 2 });
+  const sig       = signMexc(timestamp, body);
+  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/position/change_leverage`, {
+    method: "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body,
   });
+  const data = await res.json();
+  // code 2019 = leverage already set
+  if (!data.success && data.code !== 2019)
+    throw new Error(`Failed to set leverage: ${data.message}`);
 }
 
-async function setTrailingStop(symbol, trailingDistance, positionIdx = 0) {
-  return withTimestampRetry(async (offset) => {
-    const timestamp = (Date.now() - offset).toString();
-    const recvWindow = "10000";
-    const body = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, positionIdx });
-    const signature = signBybit(timestamp, recvWindow, body);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      body,
-    });
-    const data = await res.json();
-    if (data.retCode !== 0)
-      throw new Error(`Failed to set trailing stop: ${data.retMsg}`);
-  });
+async function setTrailingStop(symbol) {
+  // MEXC não suporta trailing stop direto via API de posição.
+  // O SL/TP dinâmico é definido na ordem — trailing stop ignorado.
+  console.log(`  ⚠️  Trailing stop não suportado na MEXC — ignorado.`);
 }
 
-async function placeBybitOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
+async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
   const leverage = parseInt(process.env.LEVERAGE || "60");
   const { minQty, qtyStep } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep);
   console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
-  if (CONFIG.tradeMode !== "spot") {
-    await setLeverage(symbol, leverage);
-    console.log(`  Leverage set to ${leverage}x`);
-  }
 
-  return withTimestampRetry(async (offset) => {
-    const timestamp = (Date.now() - offset).toString();
-    const recvWindow = "10000";
+  await setLeverage(symbol, leverage);
+  console.log(`  Leverage set to ${leverage}x`);
 
-    const orderBody = CONFIG.tradeMode === "spot"
-      ? { category: "spot", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity }
-      : { category: "linear", symbol, side: side === "buy" ? "Buy" : "Sell", orderType: "Market", qty: quantity,
-          positionIdx: 0, stopLoss, slTriggerBy: "LastPrice",
-          takeProfit, tpTriggerBy: "LastPrice" };
+  // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
+  const mexcSide = side === "buy" ? 1 : 3;
 
-    const body = JSON.stringify(orderBody);
-    const signature = signBybit(timestamp, recvWindow, body);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": signature, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      body,
-    });
-    const data = await res.json();
-    if (data.retCode !== 0) throw new Error(`Bybit order failed: ${data.retMsg}`);
-    return data.result;
+  const timestamp = Date.now().toString();
+  const orderBody = JSON.stringify({
+    symbol,
+    price:          0,
+    vol:            parseFloat(quantity),
+    leverage,
+    side:           mexcSide,
+    type:           5,       // 5 = Market
+    openType:       2,       // 2 = Cross margin
+    stopLossPrice:  parseFloat(stopLoss),
+    takeProfitPrice: parseFloat(takeProfit),
   });
+  const sig = signMexc(timestamp, orderBody);
+  const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
+    method: "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body: orderBody,
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC order failed: ${data.message}`);
+  return { orderId: data.data };
 }
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
@@ -786,7 +763,7 @@ async function run() {
           console.log(`  Leverage set to ${leverage}x`);
         }
         console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR) | Trailing: $${(price * 0.03).toFixed(2)} (3%)`);
-        const order = await placeBybitOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
+        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
