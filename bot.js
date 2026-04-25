@@ -10,7 +10,7 @@
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, unlinkSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
 
@@ -380,6 +380,101 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize = 1) {
   return qty.toFixed(decimals);
 }
 
+// ─── Position State (for break-even tracking) ────────────────────────────────
+
+const STATE_FILE = "position_state.json";
+
+function loadPositionState() {
+  try {
+    if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+  } catch (e) {}
+  return null;
+}
+
+function savePositionState(state) {
+  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function clearPositionState() {
+  try { if (existsSync(STATE_FILE)) unlinkSync(STATE_FILE); } catch (e) {}
+}
+
+// ─── Cancel a MEXC plan order ─────────────────────────────────────────────────
+
+async function cancelMexcPlanOrder(symbol, planOrderId) {
+  const timestamp = Date.now().toString();
+  const body = JSON.stringify({ symbol, planOrderId });
+  const sig  = signMexc(timestamp, body);
+  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/planorder/cancel`, {
+    method:  "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body,
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC cancel plan order failed: ${data.message}`);
+}
+
+// ─── Break-even check ─────────────────────────────────────────────────────────
+// Called every cycle. If an open position has moved ≥ 1×ATR in our favour and
+// break-even hasn't been set yet, cancels the original SL plan order and places
+// a new one at the entry price — ensuring we can't lose money on the trade.
+
+async function checkBreakEven(symbol, currentPrice, atr) {
+  const state = loadPositionState();
+  if (!state || state.breakEvenSet) return; // nothing to do
+
+  // Confirm position is still open
+  const pos = await getOpenPosition(symbol).catch(() => null);
+  if (!pos) {
+    console.log(`  ℹ️  Posição fechada — a limpar estado.`);
+    clearPositionState();
+    return;
+  }
+
+  const { side, entryPrice, slOrderId } = state;
+  const movedFavorably = side === "buy"
+    ? currentPrice >= entryPrice + atr
+    : currentPrice <= entryPrice - atr;
+
+  if (!movedFavorably) {
+    const dist = side === "buy"
+      ? (currentPrice - entryPrice).toFixed(2)
+      : (entryPrice - currentPrice).toFixed(2);
+    console.log(`  ⏳ Break-even ainda não atingido — posição ${side} @ $${entryPrice} | ganho atual: $${dist} | necessário: $${atr.toFixed(2)} (1×ATR)`);
+    return;
+  }
+
+  console.log(`  🎯 Break-even ativado! Preço moveu ≥ 1×ATR. A mover SL para entrada @ $${entryPrice}...`);
+
+  // Cancel old SL plan order
+  try {
+    await cancelMexcPlanOrder(symbol, slOrderId);
+    console.log(`  ✅ SL antigo cancelado (id=${slOrderId})`);
+  } catch (e) {
+    console.log(`  ⚠️  Erro a cancelar SL antigo (${e.message}) — a tentar colocar novo SL na mesma`);
+  }
+
+  // Place new SL at entry price
+  const leverage    = parseInt(process.env.LEVERAGE || "60");
+  const closeSide   = side === "buy" ? 4 : 2;
+  const slTrigger   = side === "buy" ? 2 : 1;   // long: fire when price <=, short: fire when price >=
+
+  try {
+    const newSlId = await placeMexcPlanOrder(symbol, closeSide, pos.size, entryPrice.toFixed(2), slTrigger, leverage);
+    state.slOrderId    = newSlId;
+    state.breakEvenSet = true;
+    savePositionState(state);
+    console.log(`  ✅ Break-even SL colocado @ $${entryPrice} (id=${newSlId})`);
+    await sendTelegram(
+      `🎯 <b>Break-even ativado</b> — ${symbol}\n` +
+      `Preço atual: $${currentPrice.toFixed(2)}\n` +
+      `SL movido para entrada @ $${entryPrice}`
+    );
+  } catch (e) {
+    console.log(`  ⚠️  Erro a colocar break-even SL: ${e.message}`);
+  }
+}
+
 // Place a trigger (plan) order to close a position at SL or TP price.
 // triggerType: 1 = fires when price >= triggerPrice  (use for TP on longs / SL on shorts)
 //              2 = fires when price <= triggerPrice  (use for SL on longs / TP on shorts)
@@ -453,9 +548,18 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   const tpTrigger   = side === "buy" ? 1 : 2;
   const filledVol   = pos.size;
 
+  let slId = null;
   try {
-    const slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss,   slTrigger, leverage);
+    slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss, slTrigger, leverage);
     console.log(`  ✅ SL plan order placed — id=${slId} @ $${stopLoss}`);
+    // Persist state so break-even logic can find and replace this order later
+    savePositionState({
+      symbol,
+      side,
+      entryPrice:   price,
+      slOrderId:    slId,
+      breakEvenSet: false,
+    });
   } catch (e) {
     console.log(`  ⚠️  SL plan order falhou: ${e.message}`);
   }
@@ -691,6 +795,10 @@ async function run() {
     await sendTelegram(`⚠️ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nMissing indicators: ${missing.join(", ")}`);
     return;
   }
+
+  // ── Break-even check — runs every cycle, independent of new trade logic ──
+  console.log("\n── Break-even check ─────────────────────────────────────\n");
+  await checkBreakEven(CONFIG.symbol, price, atrData.atr);
 
   if (!atrData.volatile) {
     console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
