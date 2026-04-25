@@ -455,12 +455,11 @@ async function checkBreakEven(symbol, currentPrice, atr) {
   }
 
   // Place new SL at entry price
-  const leverage    = parseInt(process.env.LEVERAGE || "60");
-  const closeSide   = side === "buy" ? 4 : 2;
-  const slTrigger   = side === "buy" ? 2 : 1;   // long: fire when price <=, short: fire when price >=
+  const leverage  = parseInt(process.env.LEVERAGE || "60");
+  const closeSide = side === "buy" ? 4 : 2;
 
   try {
-    const newSlId = await placeMexcPlanOrder(symbol, closeSide, pos.size, entryPrice.toFixed(2), slTrigger, leverage);
+    const newSlId = await placeMexcPlanOrder(symbol, closeSide, pos.size, entryPrice.toFixed(2), leverage);
     state.slOrderId    = newSlId;
     state.breakEvenSet = true;
     savePositionState(state);
@@ -476,9 +475,9 @@ async function checkBreakEven(symbol, currentPrice, atr) {
 }
 
 // Place a trigger (plan) order to close a position at SL or TP price.
-// triggerType: 1 = fires when price >= triggerPrice  (use for TP on longs / SL on shorts)
-//              2 = fires when price <= triggerPrice  (use for SL on longs / TP on shorts)
-async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, triggerType, leverage) {
+// triggerType: 1 = mark price, 2 = last price (direction inferred by MEXC:
+//   triggerPrice < current → fires on drop; triggerPrice > current → fires on rise)
+async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage) {
   const timestamp = Date.now().toString();
   const body = JSON.stringify({
     symbol,
@@ -487,7 +486,7 @@ async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, triggerT
     leverage,
     openType:      2,              // cross margin
     triggerPrice:  String(triggerPrice),
-    triggerType,                   // 1 = >=, 2 = <=
+    triggerType:   2,              // 2 = last price
     executedPrice: "0",            // 0 = market on trigger
     orderType:     2,              // 2 = market-triggered
   });
@@ -541,16 +540,13 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   }
 
   // closeSide: 4=Close Long (for buys), 2=Close Short (for sells)
-  const closeSide   = side === "buy" ? 4 : 2;
-  // For LONG:  SL fires when price drops (<=), TP fires when price rises (>=)
-  // For SHORT: SL fires when price rises (>=), TP fires when price drops (<=)
-  const slTrigger   = side === "buy" ? 2 : 1;
-  const tpTrigger   = side === "buy" ? 1 : 2;
-  const filledVol   = pos.size;
+  // MEXC infers trigger direction from triggerPrice vs current price automatically
+  const closeSide = side === "buy" ? 4 : 2;
+  const filledVol = pos.size;
 
   let slId = null;
   try {
-    slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss, slTrigger, leverage);
+    slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss, leverage);
     console.log(`  ✅ SL plan order placed — id=${slId} @ $${stopLoss}`);
     // Persist state so break-even logic can find and replace this order later
     savePositionState({
@@ -565,7 +561,7 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   }
 
   try {
-    const tpId = await placeMexcPlanOrder(symbol, closeSide, filledVol, takeProfit, tpTrigger, leverage);
+    const tpId = await placeMexcPlanOrder(symbol, closeSide, filledVol, takeProfit, leverage);
     console.log(`  ✅ TP plan order placed — id=${tpId} @ $${takeProfit}`);
   } catch (e) {
     console.log(`  ⚠️  TP plan order falhou: ${e.message}`);
