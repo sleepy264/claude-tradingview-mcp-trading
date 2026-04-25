@@ -479,15 +479,16 @@ async function checkBreakEven(symbol, currentPrice, atr) {
 //   triggerPrice < current → fires on drop; triggerPrice > current → fires on rise)
 async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage) {
   const timestamp = Date.now().toString();
+  // Close orders don't need leverage/openType (those are for opening positions).
+  // executedPrice "0" is required by MEXC even for market-triggered orders.
   const body = JSON.stringify({
     symbol,
-    side:         closeSide,
-    vol:          parseFloat(vol),
-    leverage,
-    openType:     2,                    // cross margin
-    triggerPrice: parseFloat(triggerPrice), // number — string causes "Order price error"
-    triggerType:  2,                    // 2 = last price (direction inferred by MEXC)
-    orderType:    2,                    // 2 = market on trigger (no executedPrice needed)
+    side:          closeSide,
+    vol:           parseFloat(vol),
+    triggerPrice:  parseFloat(triggerPrice),
+    triggerType:   2,   // 2 = last price
+    executedPrice: "0", // required even for market orders (orderType=2)
+    orderType:     2,   // 2 = market on trigger
   });
   const sig = signMexc(timestamp, body);
   const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/planorder/place`, {
@@ -496,7 +497,11 @@ async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage
     body,
   });
   const data = await res.json();
-  if (!data.success) throw new Error(`MEXC plan order failed: ${data.message}`);
+  // Log full response to help diagnose any remaining errors
+  if (!data.success) {
+    console.log(`  ⚠️  Plan order full response: ${JSON.stringify(data)}`);
+    throw new Error(`MEXC plan order failed: ${data.message}`);
+  }
   return data.data; // planOrderId
 }
 
