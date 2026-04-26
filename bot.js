@@ -514,15 +514,22 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
   const mexcSide = side === "buy" ? 1 : 3;
 
+  // ── Try inline SL/TP first (native MEXC support in the order body) ────────
+  // stopLossPrice and takeProfitPrice must be numbers (not strings).
+  const slPrice = parseFloat(stopLoss);
+  const tpPrice = parseFloat(takeProfit);
+
   const timestamp = Date.now().toString();
   const orderBody = JSON.stringify({
     symbol,
-    price:    0,
-    vol:      parseFloat(quantity),
+    price:          0,
+    vol:            parseFloat(quantity),
     leverage,
-    side:     mexcSide,
-    type:     5,   // 5 = Market
-    openType: 2,   // 2 = Cross margin
+    side:           mexcSide,
+    type:           5,         // 5 = Market
+    openType:       2,         // 2 = Cross margin
+    stopLossPrice:  slPrice,
+    takeProfitPrice: tpPrice,
   });
   const sig = signMexc(timestamp, orderBody);
   const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
@@ -531,45 +538,44 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
     body: orderBody,
   });
   const data = await res.json();
-  if (!data.success) throw new Error(`MEXC order failed: ${data.message}`);
-  const orderId = data.data;
 
-  // ── Place SL / TP plan orders after the market order fills ──────────────
-  // Wait briefly for the position to open before querying it
-  await new Promise((r) => setTimeout(r, 1500));
-  const pos = await getOpenPosition(symbol);
-  if (!pos) {
-    console.log(`  ⚠️  Posição não encontrada após ordem — SL/TP não colocados.`);
+  // If inline SL/TP fails, retry the order without them and fall back to plan orders
+  if (!data.success && data.code === 2007) {
+    console.log(`  ⚠️  Inline SL/TP rejeitado (code 2007) — a tentar sem SL/TP inline...`);
+    const bodyNoSlTp = JSON.stringify({
+      symbol,
+      price:    0,
+      vol:      parseFloat(quantity),
+      leverage,
+      side:     mexcSide,
+      type:     5,
+      openType: 2,
+    });
+    const sig2 = signMexc(timestamp, bodyNoSlTp);
+    const res2  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
+      method: "POST",
+      headers: mexcHeaders(timestamp, sig2),
+      body: bodyNoSlTp,
+    });
+    const data2 = await res2.json();
+    if (!data2.success) throw new Error(`MEXC order failed: ${data2.message}`);
+    const orderId = data2.data;
+    console.log(`  ⚠️  Ordem aberta sem SL/TP (plan orders também falharam com code 2007 — investigar endpoint correto)`);
     return { orderId };
   }
 
-  // closeSide: 4=Close Long (for buys), 2=Close Short (for sells)
-  // MEXC infers trigger direction from triggerPrice vs current price automatically
-  const closeSide = side === "buy" ? 4 : 2;
-  const filledVol = pos.size;
+  if (!data.success) throw new Error(`MEXC order failed: ${data.message} (code ${data.code})`);
+  const orderId = data.data;
+  console.log(`  ✅ Ordem com SL/TP inline — SL: $${slPrice} | TP: $${tpPrice}`);
 
-  let slId = null;
-  try {
-    slId = await placeMexcPlanOrder(symbol, closeSide, filledVol, stopLoss, leverage);
-    console.log(`  ✅ SL plan order placed — id=${slId} @ $${stopLoss}`);
-    // Persist state so break-even logic can find and replace this order later
-    savePositionState({
-      symbol,
-      side,
-      entryPrice:   price,
-      slOrderId:    slId,
-      breakEvenSet: false,
-    });
-  } catch (e) {
-    console.log(`  ⚠️  SL plan order falhou: ${e.message}`);
-  }
-
-  try {
-    const tpId = await placeMexcPlanOrder(symbol, closeSide, filledVol, takeProfit, leverage);
-    console.log(`  ✅ TP plan order placed — id=${tpId} @ $${takeProfit}`);
-  } catch (e) {
-    console.log(`  ⚠️  TP plan order falhou: ${e.message}`);
-  }
+  // Persist state for break-even tracking
+  savePositionState({
+    symbol,
+    side,
+    entryPrice:   price,
+    slOrderId:    null, // inline SL — no plan order ID to track
+    breakEvenSet: false,
+  });
 
   return { orderId };
 }
