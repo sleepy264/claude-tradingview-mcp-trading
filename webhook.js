@@ -183,6 +183,9 @@ app.use(express.json());
 app.get("/", (req, res) => {
   res.json({ status: "ok", mode: CONFIG.paperTrading ? "paper" : "live", leverage: CONFIG.leverage });
 });
+app.get("/api/status", (req, res) => {
+  res.json({ status: "ok", mode: CONFIG.paperTrading ? "paper" : "live", leverage: CONFIG.leverage });
+});
 
 // TradingView alert endpoint
 // Expected payload: { "secret": "...", "action": "buy"|"sell", "symbol": "BTCUSDT", "price": 75000 }
