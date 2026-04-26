@@ -416,8 +416,8 @@ async function cancelMexcPlanOrder(symbol, planOrderId) {
 
 // ─── Break-even check ─────────────────────────────────────────────────────────
 // Called every cycle. If an open position has moved ≥ 1×ATR in our favour and
-// break-even hasn't been set yet, cancels the original SL plan order and places
-// a new one at the entry price — ensuring we can't lose money on the trade.
+// break-even hasn't been set yet, moves slPrice in position_state.json to the
+// entry price. checkSlTp() will then use that updated value in subsequent cycles.
 
 async function checkBreakEven(symbol, currentPrice, atr) {
   const state = loadPositionState();
@@ -431,7 +431,7 @@ async function checkBreakEven(symbol, currentPrice, atr) {
     return;
   }
 
-  const { side, entryPrice, slOrderId } = state;
+  const { side, entryPrice } = state;
   const movedFavorably = side === "buy"
     ? currentPrice >= entryPrice + atr
     : currentPrice <= entryPrice - atr;
@@ -444,34 +444,17 @@ async function checkBreakEven(symbol, currentPrice, atr) {
     return;
   }
 
+  // Move soft SL to entry price — no API call needed, just update the state file
   console.log(`  🎯 Break-even ativado! Preço moveu ≥ 1×ATR. A mover SL para entrada @ $${entryPrice}...`);
-
-  // Cancel old SL plan order
-  try {
-    await cancelMexcPlanOrder(symbol, slOrderId);
-    console.log(`  ✅ SL antigo cancelado (id=${slOrderId})`);
-  } catch (e) {
-    console.log(`  ⚠️  Erro a cancelar SL antigo (${e.message}) — a tentar colocar novo SL na mesma`);
-  }
-
-  // Place new SL at entry price
-  const leverage  = parseInt(process.env.LEVERAGE || "60");
-  const closeSide = side === "buy" ? 4 : 2;
-
-  try {
-    const newSlId = await placeMexcPlanOrder(symbol, closeSide, pos.size, entryPrice.toFixed(2), leverage);
-    state.slOrderId    = newSlId;
-    state.breakEvenSet = true;
-    savePositionState(state);
-    console.log(`  ✅ Break-even SL colocado @ $${entryPrice} (id=${newSlId})`);
-    await sendTelegram(
-      `🎯 <b>Break-even ativado</b> — ${symbol}\n` +
-      `Preço atual: $${currentPrice.toFixed(2)}\n` +
-      `SL movido para entrada @ $${entryPrice}`
-    );
-  } catch (e) {
-    console.log(`  ⚠️  Erro a colocar break-even SL: ${e.message}`);
-  }
+  state.slPrice      = entryPrice;
+  state.breakEvenSet = true;
+  savePositionState(state);
+  console.log(`  ✅ SL movido para $${entryPrice} (break-even) — checkSlTp usará este valor nos próximos ciclos`);
+  await sendTelegram(
+    `🎯 <b>Break-even ativado</b> — ${symbol}\n` +
+    `Preço atual: $${currentPrice.toFixed(2)}\n` +
+    `SL movido para entrada @ $${entryPrice}`
+  );
 }
 
 // Place a trigger (plan) order to close a position at SL or TP price.
