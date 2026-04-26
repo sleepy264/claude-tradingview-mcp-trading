@@ -514,22 +514,16 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
   // MEXC side: 1=Open Long, 2=Close Short, 3=Open Short, 4=Close Long
   const mexcSide = side === "buy" ? 1 : 3;
 
-  // ── Try inline SL/TP first (native MEXC support in the order body) ────────
-  // stopLossPrice and takeProfitPrice must be numbers (not strings).
-  const slPrice = parseFloat(stopLoss);
-  const tpPrice = parseFloat(takeProfit);
-
+  // Plain market order — SL/TP monitored by the bot each cycle (soft SL/TP)
   const timestamp = Date.now().toString();
   const orderBody = JSON.stringify({
     symbol,
-    price:          0,
-    vol:            parseFloat(quantity),
+    price:    0,
+    vol:      parseFloat(quantity),
     leverage,
-    side:           mexcSide,
-    type:           5,         // 5 = Market
-    openType:       2,         // 2 = Cross margin
-    stopLossPrice:  slPrice,
-    takeProfitPrice: tpPrice,
+    side:     mexcSide,
+    type:     5,   // 5 = Market
+    openType: 2,   // 2 = Cross margin
   });
   const sig = signMexc(timestamp, orderBody);
   const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
@@ -538,46 +532,96 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
     body: orderBody,
   });
   const data = await res.json();
-
-  // If inline SL/TP fails, retry the order without them and fall back to plan orders
-  if (!data.success && data.code === 2007) {
-    console.log(`  ⚠️  Inline SL/TP rejeitado (code 2007) — a tentar sem SL/TP inline...`);
-    const bodyNoSlTp = JSON.stringify({
-      symbol,
-      price:    0,
-      vol:      parseFloat(quantity),
-      leverage,
-      side:     mexcSide,
-      type:     5,
-      openType: 2,
-    });
-    const sig2 = signMexc(timestamp, bodyNoSlTp);
-    const res2  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
-      method: "POST",
-      headers: mexcHeaders(timestamp, sig2),
-      body: bodyNoSlTp,
-    });
-    const data2 = await res2.json();
-    if (!data2.success) throw new Error(`MEXC order failed: ${data2.message}`);
-    const orderId = data2.data;
-    console.log(`  ⚠️  Ordem aberta sem SL/TP (plan orders também falharam com code 2007 — investigar endpoint correto)`);
-    return { orderId };
-  }
-
   if (!data.success) throw new Error(`MEXC order failed: ${data.message} (code ${data.code})`);
   const orderId = data.data;
-  console.log(`  ✅ Ordem com SL/TP inline — SL: $${slPrice} | TP: $${tpPrice}`);
 
-  // Persist state for break-even tracking
+  // Persist SL/TP levels so the bot monitors and closes the position each cycle
   savePositionState({
     symbol,
     side,
     entryPrice:   price,
-    slOrderId:    null, // inline SL — no plan order ID to track
+    slPrice:      parseFloat(stopLoss),
+    tpPrice:      parseFloat(takeProfit),
     breakEvenSet: false,
   });
+  console.log(`  📌 SL/TP gravados para monitorização: SL=$${stopLoss} | TP=$${takeProfit}`);
 
   return { orderId };
+}
+
+// ─── Soft SL/TP: close position if price crosses SL or TP ────────────────────
+// Called every cycle. MEXC rejects exchange-native SL/TP orders (codes 2007/5003)
+// so we monitor the levels here and fire a market close order when hit.
+
+async function closePosition(symbol, side, reason) {
+  const pos = await getOpenPosition(symbol);
+  if (!pos) return; // already closed
+  const closeSide = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
+  const timestamp = Date.now().toString();
+  const body = JSON.stringify({
+    symbol,
+    price:    0,
+    vol:      pos.size,
+    leverage: parseInt(process.env.LEVERAGE || "60"),
+    side:     closeSide,
+    type:     5,   // Market
+    openType: 2,
+  });
+  const sig = signMexc(timestamp, body);
+  const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
+    method: "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body,
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC close failed: ${data.message}`);
+  console.log(`  ✅ Posição fechada — ${reason} (orderId=${data.data})`);
+  clearPositionState();
+  return data.data;
+}
+
+async function checkSlTp(symbol, currentPrice) {
+  const state = loadPositionState();
+  if (!state || !state.slPrice) return; // no active position state
+
+  const { side, slPrice, tpPrice, entryPrice } = state;
+  const hitSl = side === "buy" ? currentPrice <= slPrice : currentPrice >= slPrice;
+  const hitTp = side === "buy" ? currentPrice >= tpPrice : currentPrice <= tpPrice;
+
+  if (hitSl) {
+    console.log(`  🔴 SL atingido @ $${currentPrice.toFixed(2)} (SL=$${slPrice}) — a fechar posição...`);
+    try {
+      await closePosition(symbol, side, `SL @ $${slPrice}`);
+      await sendTelegram(
+        `🔴 <b>Stop-Loss</b> — ${symbol}\n` +
+        `Entrada: $${entryPrice} | SL: $${slPrice}\n` +
+        `Preço atual: $${currentPrice.toFixed(2)}`
+      );
+    } catch (e) {
+      console.log(`  ❌ Erro a fechar por SL: ${e.message}`);
+    }
+    return;
+  }
+
+  if (hitTp) {
+    console.log(`  🟢 TP atingido @ $${currentPrice.toFixed(2)} (TP=$${tpPrice}) — a fechar posição...`);
+    try {
+      await closePosition(symbol, side, `TP @ $${tpPrice}`);
+      await sendTelegram(
+        `🟢 <b>Take-Profit</b> — ${symbol}\n` +
+        `Entrada: $${entryPrice} | TP: $${tpPrice}\n` +
+        `Preço atual: $${currentPrice.toFixed(2)}`
+      );
+    } catch (e) {
+      console.log(`  ❌ Erro a fechar por TP: ${e.message}`);
+    }
+    return;
+  }
+
+  // Neither hit — log current distance
+  const slDist = side === "buy" ? currentPrice - slPrice : slPrice - currentPrice;
+  const tpDist = side === "buy" ? tpPrice - currentPrice : currentPrice - tpPrice;
+  console.log(`  📊 Posição ${side} @ $${entryPrice} | dist SL: $${slDist.toFixed(2)} | dist TP: $${tpDist.toFixed(2)}`);
 }
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
@@ -802,8 +846,9 @@ async function run() {
     return;
   }
 
-  // ── Break-even check — runs every cycle, independent of new trade logic ──
-  console.log("\n── Break-even check ─────────────────────────────────────\n");
+  // ── SL/TP monitoring — runs every cycle before any new trade logic ──────
+  console.log("\n── SL/TP & Break-even check ─────────────────────────────\n");
+  await checkSlTp(CONFIG.symbol, price);
   await checkBreakEven(CONFIG.symbol, price, atrData.atr);
 
   if (!atrData.volatile) {
