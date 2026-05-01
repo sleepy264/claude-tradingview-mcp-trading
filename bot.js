@@ -538,7 +538,13 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
 
 async function closePosition(symbol, side, reason) {
   const pos = await getOpenPosition(symbol);
-  if (!pos) return; // already closed
+  if (!pos) {
+    // Position no longer exists on the exchange (closed externally or already filled).
+    // Must clear state here — otherwise checkSlTp will loop forever on the stale entry.
+    console.log(`  ℹ️  Posição já fechada na exchange — a limpar estado.`);
+    clearPositionState();
+    return;
+  }
   const closeSide = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
   const timestamp = Date.now().toString();
   const body = JSON.stringify({
