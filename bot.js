@@ -914,17 +914,17 @@ async function run() {
     const direction = tradeSide === "buy" ? "LONG" : "SHORT";
     const atr = atrData.atr;
     const stopPrice = tradeSide === "buy"
-      ? (price - atr).toFixed(2)
-      : (price + atr).toFixed(2);
+      ? (price - atr * 1.5).toFixed(2)
+      : (price + atr * 1.5).toFixed(2);
     const tpPrice = tradeSide === "buy"
-      ? (price + atr * 3).toFixed(2)
-      : (price - atr * 3).toFixed(2);
+      ? (price + atr * 5).toFixed(2)
+      : (price - atr * 5).toFixed(2);
 
     if (CONFIG.paperTrading) {
       console.log(
         `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)`);
+      console.log(`   SL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
@@ -945,7 +945,7 @@ async function run() {
             throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
           }
         }
-        console.log(`  SL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)`);
+        console.log(`  SL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)`);
         const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
@@ -953,7 +953,7 @@ async function run() {
         logEntry.stopLoss = stopPrice;
         logEntry.takeProfit = tpPrice;
         console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP: $${tpPrice}`);
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1×ATR) | TP: $${tpPrice} (3×ATR)\nOrder: ${order.orderId}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)\nOrder: ${order.orderId}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
