@@ -301,10 +301,7 @@ function checkTradeLimits(log) {
     `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
   );
 
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  const tradeSize = CONFIG.maxTradeSizeUSD;
 
   if (tradeSize > CONFIG.maxTradeSizeUSD) {
     console.log(
@@ -869,10 +866,7 @@ async function run() {
   const tradeSide = h1Side;
 
   // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  const tradeSize = CONFIG.maxTradeSizeUSD;
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
