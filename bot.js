@@ -109,31 +109,67 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// ─── Market Data ─────────────────────────────────────────────────────────────
+// Primary source: OKX public API (good for most crypto pairs)
+// Fallback: MEXC contract public API (used for pairs OKX doesn't carry, e.g. WTIUSDT)
 
-async function fetchCandles(symbol, interval, limit = 100) {
+async function fetchCandlesOkx(symbol, interval, limit) {
   const intervalMap = {
     "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W",
+    "1h": "1H", "1H": "1H", "4h": "4H", "4H": "4H", "1D": "1D", "1W": "1W",
   };
   const okxInterval = intervalMap[interval] || "15m";
-  // Convert symbol format (SOLUSDT or SOL_USDT) to OKX format (SOL-USDT)
-  const okxSymbol = symbol.replace(/_/g, "-").replace(/^([A-Z]+)(USDT|USDC|BTC|ETH)$/, "$1-$2");
-  // OKX max is 300 candles per request
-  const url = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${okxInterval}&limit=${Math.min(limit, 300)}`;
-  const res = await fetch(url);
+  const okxSymbol   = symbol.replace(/_/g, "-").replace(/^([A-Z]+)(USDT|USDC|BTC|ETH)$/, "$1-$2");
+  const url  = `https://www.okx.com/api/v5/market/candles?instId=${okxSymbol}&bar=${okxInterval}&limit=${Math.min(limit, 300)}`;
+  const res  = await fetch(url);
   if (!res.ok) throw new Error(`OKX kline API error: ${res.status}`);
   const data = await res.json();
   if (data.code !== "0") throw new Error(`OKX kline error: ${data.msg}`);
-  // OKX returns newest first — reverse to chronological order
   return data.data.reverse().map((k) => ({
-    time: parseInt(k[0]),
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
+    time: parseInt(k[0]), open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
   }));
+}
+
+async function fetchCandlesMexc(symbol, interval, limit) {
+  const intervalMap = {
+    "1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30",
+    "1h": "Min60", "1H": "Min60", "4h": "Hour4", "4H": "Hour4",
+    "1D": "Day1", "1W": "Week1",
+  };
+  const mexcInterval = intervalMap[interval] || "Min15";
+  // Fetch enough history: each candle = interval duration
+  const intervalMs = { Min1:60,Min5:300,Min15:900,Min30:1800,Min60:3600,Hour4:14400,Day1:86400,Week1:604800 };
+  const seconds    = intervalMs[mexcInterval] || 900;
+  const end        = Math.floor(Date.now() / 1000);
+  const start      = end - seconds * limit;
+  const url  = `${CONFIG.mexc.baseUrl}/api/v1/contract/kline/${symbol}?interval=${mexcInterval}&start=${start}&end=${end}`;
+  const res  = await fetch(url);
+  if (!res.ok) throw new Error(`MEXC kline API error: ${res.status}`);
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC kline error: ${data.message}`);
+  const d = data.data;
+  // MEXC returns parallel arrays: time[], open[], high[], low[], close[], vol[]
+  return d.time.map((t, i) => ({
+    time:   t * 1000,
+    open:   parseFloat(d.open[i]),
+    high:   parseFloat(d.high[i]),
+    low:    parseFloat(d.low[i]),
+    close:  parseFloat(d.close[i]),
+    volume: parseFloat(d.vol[i]),
+  }));
+}
+
+async function fetchCandles(symbol, interval, limit = 100) {
+  try {
+    return await fetchCandlesOkx(symbol, interval, limit);
+  } catch (e) {
+    if (e.message.includes("doesn't exist") || e.message.includes("does not exist")) {
+      console.log(`  ℹ️  OKX não tem ${symbol} — a usar MEXC como fonte de dados`);
+      return await fetchCandlesMexc(symbol, interval, limit);
+    }
+    throw e;
+  }
 }
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
