@@ -60,10 +60,10 @@ function sign(timestamp, recvWindow, body) {
   return crypto.createHmac("sha256", CONFIG.bybit.secretKey).update(msg).digest("hex");
 }
 
-async function setLeverage(symbol) {
+async function setLeverage(symbol, lev) {
   const timestamp  = (Date.now() - 1500).toString();
   const recvWindow = "10000";
-  const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(CONFIG.leverage), sellLeverage: String(CONFIG.leverage) });
+  const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(lev), sellLeverage: String(lev) });
   const sig        = sign(timestamp, recvWindow, body);
   const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
     method: "POST",
@@ -89,11 +89,11 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
   return qty.toFixed(decimals);
 }
 
-async function placeOrder(symbol, action, price) {
+async function placeOrder(symbol, action, price, lev) {
   const side = action === "buy" ? "Buy" : "Sell";
   const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
-  const quantity = calcQty(CONFIG.tradeSize, CONFIG.leverage, price, minQty, qtyStep);
-  console.log(`  Qty: ${quantity} ($${CONFIG.tradeSize} × ${CONFIG.leverage}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+  const quantity = calcQty(CONFIG.tradeSize, lev, price, minQty, qtyStep);
+  console.log(`  Qty: ${quantity} ($${CONFIG.tradeSize} × ${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
   const stopLoss   = action === "buy"
     ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
@@ -221,7 +221,7 @@ app.post("/webhook", async (req, res) => {
 
 async function handleWebhook(req, res) {
 
-  const { secret, action, symbol, price } = req.body;
+  const { secret, action, symbol, price, leverage } = req.body;
 
   // Validate secret token
   if (CONFIG.webhookSecret && secret !== CONFIG.webhookSecret) {
@@ -240,8 +240,9 @@ async function handleWebhook(req, res) {
     return res.status(400).json({ error: "action must be 'buy', 'sell' or 'tp'" });
   }
 
-  const actionLower = action.toLowerCase();
-  const sym         = symbol || process.env.SYMBOL || "BTCUSDT";
+  const actionLower   = action.toLowerCase();
+  const sym           = symbol || process.env.SYMBOL || "BTCUSDT";
+  const effectiveLev  = leverage ? parseInt(leverage) : CONFIG.leverage;
 
   // Use price from payload, or fetch live price if not provided
   let priceNum = parseFloat(price);
@@ -251,7 +252,7 @@ async function handleWebhook(req, res) {
   }
 
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
-  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
+  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${effectiveLev}x${leverage ? " (payload)" : " (default)"} | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
 
   // ── Take-profit: close half the active position ───────────────────────────
   if (actionLower === "tp") {
@@ -296,8 +297,8 @@ async function handleWebhook(req, res) {
   // Live execution
   try {
     if (CONFIG.tradeMode === "futures") {
-      await setLeverage(sym);
-      console.log(`  Leverage set to ${CONFIG.leverage}x`);
+      await setLeverage(sym, effectiveLev);
+      console.log(`  Leverage set to ${effectiveLev}x`);
 
       const openPos = await getOpenPosition(sym);
       if (openPos) {
@@ -315,7 +316,7 @@ async function handleWebhook(req, res) {
       }
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum);
+    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
