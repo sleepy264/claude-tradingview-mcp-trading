@@ -159,6 +159,29 @@ async function closePosition(symbol, position) {
   return data.result;
 }
 
+async function closeHalfPosition(symbol, position) {
+  const { qtyStep } = await getInstrumentLotSize(symbol);
+  const decimals    = (qtyStep.toString().split(".")[1] || "").length;
+  // Round half down to nearest qtyStep to avoid over-reducing
+  const halfRaw  = position.size / 2;
+  const halfQty  = (Math.floor(halfRaw / qtyStep) * qtyStep).toFixed(decimals);
+  if (parseFloat(halfQty) <= 0) throw new Error(`Half qty (${halfQty}) is zero — position too small to split`);
+
+  const closeSide  = position.side === "Buy" ? "Sell" : "Buy";
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const body       = JSON.stringify({ category: "linear", symbol, side: closeSide, orderType: "Market", qty: halfQty, positionIdx: 0, reduceOnly: true });
+  const sig        = sign(timestamp, recvWindow, body);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Close half position failed: ${data.retMsg}`);
+  return { ...data.result, closedQty: halfQty, remainingQty: (position.size - parseFloat(halfQty)).toFixed(decimals) };
+}
+
 async function setTrailingStop(symbol) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
@@ -212,9 +235,9 @@ async function handleWebhook(req, res) {
     return res.status(400).json({ error: "Missing required field: action (buy or sell)" });
   }
 
-  if (!["buy", "sell"].includes(action.toLowerCase())) {
+  if (!["buy", "sell", "tp"].includes(action.toLowerCase())) {
     console.log("  ❌ Invalid action:", action);
-    return res.status(400).json({ error: "action must be 'buy' or 'sell'" });
+    return res.status(400).json({ error: "action must be 'buy', 'sell' or 'tp'" });
   }
 
   const actionLower = action.toLowerCase();
@@ -229,6 +252,38 @@ async function handleWebhook(req, res) {
 
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${CONFIG.leverage}x | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
+
+  // ── Take-profit: close half the active position ───────────────────────────
+  if (actionLower === "tp") {
+    console.log(`  🎯 TP signal — a fechar metade da posição em ${sym}...`);
+    if (CONFIG.paperTrading) {
+      console.log(`  📋 PAPER TP — nenhuma ordem enviada`);
+      await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER TP\nFecharia metade da posição`);
+      return res.json({ status: "paper", action: "tp", symbol: sym });
+    }
+    try {
+      const openPos = await getOpenPosition(sym);
+      if (!openPos) {
+        console.log(`  ⚠️  Nenhuma posição aberta em ${sym} — TP ignorado`);
+        await sendTelegram(`⚠️ <b>Bot v2 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
+        return res.json({ status: "skipped", reason: "No open position", symbol: sym });
+      }
+      console.log(`  Posição: ${openPos.side} qty=${openPos.size} — a fechar metade...`);
+      const result = await closeHalfPosition(sym, openPos);
+      console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
+      logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
+      await sendTelegram(
+        `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
+        `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
+        `Order: ${result.orderId}`
+      );
+      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId });
+    } catch (err) {
+      console.log(`  ❌ TP ERROR — ${err.message}`);
+      await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro no TP\n${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  }
 
   if (CONFIG.paperTrading) {
     const paperId = `PAPER-${Date.now()}`;
