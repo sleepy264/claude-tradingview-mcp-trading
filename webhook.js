@@ -186,7 +186,7 @@ async function setTrailingStop(symbol) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
 
-  const trailingDistance = (price * 0.03).toFixed(2);
+  const trailingDistance = (price * CONFIG.trailingStopPct).toFixed(2);
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
   const body       = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 });
