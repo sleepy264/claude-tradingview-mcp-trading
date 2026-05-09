@@ -230,6 +230,10 @@ app.get("/api/status", (req, res) => {
 app.post("/webhook", async (req, res) => {
   const ts = new Date().toISOString();
   console.log(`\n[${ts}] Webhook received:`, JSON.stringify(req.body));
+  if (!req.body || typeof req.body !== "object") {
+    console.log("  ❌ Empty or non-JSON body — set Content-Type: application/json in TradingView alert");
+    return res.status(400).json({ error: "Invalid body — must be JSON with Content-Type: application/json" });
+  }
   try { return await handleWebhook(req, res); }
   catch (err) { console.log("  ❌ Unhandled error:", err.message); return res.status(500).json({ error: err.message }); }
 });
@@ -259,11 +263,21 @@ async function handleWebhook(req, res) {
   const sym           = symbol || process.env.SYMBOL || "BTCUSDT";
   const effectiveLev  = leverage ? parseInt(leverage) : CONFIG.leverage;
 
-  // Use price from payload, or fetch live price if not provided
+  // Use price from payload — but validate against live price.
+  // If payload price differs by >10% from market, it's stale/wrong → use live price.
   let priceNum = parseFloat(price);
   if (!priceNum || isNaN(priceNum)) {
     console.log("  ℹ️  No price in payload — fetching live price from Bybit...");
     priceNum = await fetchCurrentPrice(sym);
+  } else {
+    const livePrice = await fetchCurrentPrice(sym);
+    if (livePrice) {
+      const diff = Math.abs(priceNum - livePrice) / livePrice;
+      if (diff > 0.10) {
+        console.log(`  ⚠️  Payload price $${priceNum} difere ${(diff*100).toFixed(1)}% do preço live $${livePrice} — a usar preço live`);
+        priceNum = livePrice;
+      }
+    }
   }
 
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
