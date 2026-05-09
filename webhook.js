@@ -23,6 +23,8 @@ const CONFIG = {
   takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
   trailingStopPct:        parseFloat(process.env.TRAILING_STOP_PCT        || "0.03"),
   trailingActivationPct:  parseFloat(process.env.TRAILING_ACTIVATION_PCT  || "0.003"),
+  maxDailyLossPerSymbol:  parseFloat(process.env.MAX_DAILY_LOSS_PER_SYMBOL || "0"),  // 0 = disabled
+  maxDailyLossTotal:      parseFloat(process.env.MAX_DAILY_LOSS_TOTAL      || "0"),  // 0 = disabled
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -198,6 +200,24 @@ async function setBreakEvenStop(symbol, entryPrice) {
   if (data.retCode !== 0) throw new Error(`Set break-even SL failed: ${data.retMsg}`);
 }
 
+// Returns today's total realised PnL (negative = loss).
+// Pass symbol to get per-pair PnL; omit for all symbols combined.
+async function getDailyClosedPnl(symbol = null) {
+  const todayMidnight = new Date();
+  todayMidnight.setHours(0, 0, 0, 0);
+  const startTime  = todayMidnight.getTime().toString();
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = `category=linear${symbol ? `&symbol=${symbol}` : ""}&startTime=${startTime}&limit=200`;
+  const sig        = sign(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  const list = data.result?.list || [];
+  return list.reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
+}
+
 async function setTrailingStop(symbol, action, entryPrice) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
@@ -347,6 +367,34 @@ async function handleWebhook(req, res) {
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
     await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
     return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
+  }
+
+  // ── Daily loss limit check ────────────────────────────────────────────────
+  if (CONFIG.maxDailyLossPerSymbol > 0 || CONFIG.maxDailyLossTotal > 0) {
+    try {
+      const [symbolPnl, totalPnl] = await Promise.all([
+        CONFIG.maxDailyLossPerSymbol > 0 ? getDailyClosedPnl(sym) : Promise.resolve(0),
+        CONFIG.maxDailyLossTotal      > 0 ? getDailyClosedPnl()   : Promise.resolve(0),
+      ]);
+
+      if (CONFIG.maxDailyLossPerSymbol > 0 && symbolPnl < -CONFIG.maxDailyLossPerSymbol) {
+        const msg = `🛑 Limite de perda diária por par atingido em ${sym}: $${symbolPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossPerSymbol})`;
+        console.log(`  ${msg}`);
+        await sendTelegram(`🛑 <b>Bot v2 ${sym}</b> — Bloqueado\n${msg}`);
+        return res.json({ status: "blocked", reason: "daily_loss_per_symbol", symbol: sym, pnl: symbolPnl });
+      }
+
+      if (CONFIG.maxDailyLossTotal > 0 && totalPnl < -CONFIG.maxDailyLossTotal) {
+        const msg = `🛑 Limite de perda diária global atingido: $${totalPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossTotal})`;
+        console.log(`  ${msg}`);
+        await sendTelegram(`🛑 <b>Bot v2</b> — Bloqueado (todos os pares)\n${msg}`);
+        return res.json({ status: "blocked", reason: "daily_loss_total", pnl: totalPnl });
+      }
+
+      console.log(`  📊 PnL hoje — ${sym}: $${symbolPnl.toFixed(2)} | Total: $${totalPnl.toFixed(2)}`);
+    } catch (e) {
+      console.log(`  ⚠️  Não foi possível verificar PnL diário: ${e.message} — a continuar`);
+    }
   }
 
   // Live execution
