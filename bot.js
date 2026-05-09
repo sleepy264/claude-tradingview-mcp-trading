@@ -78,7 +78,8 @@ const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
   timeframe: process.env.TIMEFRAME || "4H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "100"),
+  riskPerTradeUSD: parseFloat(process.env.RISK_PER_TRADE_USD  || "0"),   // 0 = fixed size
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "futures",
@@ -456,6 +457,18 @@ async function getInstrumentInfo(symbol) {
 //   ATR <= avg50        → full leverage
 //   ATR 1.0–1.5 × avg50 → 75%
 //   ATR > 1.5 × avg50   → 50%
+// Risk-based position sizing: calculates the margin (tradeSize) needed so that
+// if SL (1.5×ATR) is hit, the dollar loss equals exactly riskUSD.
+// Formula: loss = (tradeSize × leverage) × (1.5×ATR / price) = riskUSD
+//          tradeSize = riskUSD × price / (leverage × 1.5 × ATR)
+// Result is capped at maxTradeSize.
+function calcRiskBasedTradeSize(riskUSD, price, atr, leverage, maxTradeSize) {
+  const slDistance = atr * 1.5;
+  const sized = (riskUSD * price) / (leverage * slDistance);
+  const capped = Math.min(sized, maxTradeSize);
+  return parseFloat(capped.toFixed(2));
+}
+
 function calcEffectiveLeverage(atr, avg50) {
   const base  = parseInt(process.env.LEVERAGE || "60");
   const ratio = atr / avg50;
@@ -1086,8 +1099,14 @@ async function run() {
 
   const tradeSide = h1Side;
 
-  // Calculate position size
-  const tradeSize = CONFIG.maxTradeSizeUSD;
+  // Calculate position size — risk-based if RISK_PER_TRADE_USD is set, otherwise fixed
+  const tradeSize = CONFIG.riskPerTradeUSD > 0
+    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, price, atrData.atr, effectiveLeverage, CONFIG.maxTradeSizeUSD)
+    : CONFIG.maxTradeSizeUSD;
+  const tradeSizeMode = CONFIG.riskPerTradeUSD > 0
+    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem)`
+    : `fixo ($${tradeSize})`;
+  console.log(`  Trade size: $${tradeSize} — ${tradeSizeMode}`);
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
