@@ -172,9 +172,15 @@ async function fetchCandles(symbol, interval, limit = 100) {
   }
 }
 
-// Returns "bullish", "bearish", or null (if unavailable / BTC pair itself)
+// Returns "bullish", "bearish", or null (if unavailable / non-crypto pair)
+// BTC correlation is only meaningful for crypto assets — skip for commodities,
+// forex, indices, etc.
+const CRYPTO_QUOTE = /^[A-Z0-9]+(USDT|USDC|BTC|ETH|BUSD)$/i;
+const NON_CRYPTO   = /^(USOIL|OIL|WTI|GOLD|XAU|SILVER|XAG|GAS|NATGAS|SPX|NDX|DJI|EUR|GBP|JPY)/i;
+
 async function fetchBtcTrend() {
-  if (CONFIG.symbol.startsWith("BTC")) return null; // skip for BTC pairs
+  const sym = CONFIG.symbol.replace("_", "");
+  if (sym.startsWith("BTC") || NON_CRYPTO.test(CONFIG.symbol)) return null;
   try {
     const candles = await fetchCandlesOkx("BTCUSDT", "1h", 100);
     const closes  = candles.map(c => c.close);
