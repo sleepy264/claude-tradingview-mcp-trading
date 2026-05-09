@@ -864,7 +864,6 @@ async function run() {
   if (missing.length) {
     console.log(`\n⚠️  Missing indicators: ${missing.join(", ")} — not enough candle history.`);
     logSkip(price, `Missing: ${missing.join(", ")}`);
-    await sendTelegram(`⚠️ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nMissing indicators: ${missing.join(", ")}`);
     return;
   }
 
@@ -876,14 +875,12 @@ async function run() {
   if (!atrData.volatile) {
     console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
     logSkip(price, "Choppy market (ATR below average)");
-    await sendTelegram(`⏭ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nMercado choppy (ATR abaixo da média)`);
     return;
   }
 
   if (!volLow) {
     console.log("\n🚫 Volume above average — pullback is strong, not a snap-back setup.");
     logSkip(price, "Volume above average — strong pullback");
-    await sendTelegram(`⏭ <b>Bot v1 ${CONFIG.symbol}</b> — Skipped\nVolume acima da média — pullback forte`);
     return;
   }
 
@@ -937,7 +934,6 @@ async function run() {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
     console.log(`🚫 TRADE BLOCKED`);
     failed.forEach((f) => console.log(`   - ${f}`));
-    await sendTelegram(`🚫 <b>Bot v1 ${CONFIG.symbol}</b> — Trade bloqueado @ $${price.toFixed(2)}\n${failed.map(f => `• ${f}`).join("\n")}`);
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
