@@ -548,7 +548,7 @@ async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage
   return data.data; // planOrderId
 }
 
-async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit) {
+async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, tp1Price, tp2Price) {
   const leverage = parseInt(process.env.LEVERAGE || "60");
   const { minQty, qtyStep, contractSize } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize);
@@ -584,12 +584,48 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, takeProfit
     side,
     entryPrice:   price,
     slPrice:      parseFloat(stopLoss),
-    tpPrice:      parseFloat(takeProfit),
+    tp1Price:     parseFloat(tp1Price),
+    tp2Price:     parseFloat(tp2Price),
+    halfClosed:   false,
     breakEvenSet: false,
   });
-  console.log(`  📌 SL/TP gravados para monitorização: SL=$${stopLoss} | TP=$${takeProfit}`);
+  console.log(`  📌 Estado gravado: SL=$${stopLoss} | TP1=$${tp1Price} (3×ATR) | TP2=$${tp2Price} (5×ATR)`);
 
   return { orderId };
+}
+
+async function closeHalfPosition(symbol, side) {
+  const pos = await getOpenPosition(symbol);
+  if (!pos) { clearPositionState(); return null; }
+
+  const { minQty, qtyStep } = await getInstrumentInfo(symbol);
+  const decimals = (qtyStep.toString().split(".")[1] || "").length;
+  const halfRaw  = pos.size / 2;
+  const halfQty  = Math.max(Math.floor(halfRaw / qtyStep) * qtyStep, minQty);
+  if (halfQty <= 0) throw new Error(`Half qty (${halfQty}) é zero — posição demasiado pequena para dividir`);
+
+  const closeSide = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
+  const leverage  = parseInt(process.env.LEVERAGE || "60");
+  const timestamp = Date.now().toString();
+  const body = JSON.stringify({
+    symbol,
+    price:    0,
+    vol:      halfQty,
+    leverage,
+    side:     closeSide,
+    type:     5,
+    openType: 2,
+  });
+  const sig = signMexc(timestamp, body);
+  const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/order/submit`, {
+    method: "POST",
+    headers: mexcHeaders(timestamp, sig),
+    body,
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC half-close failed: ${data.message}`);
+  console.log(`  ✅ Metade fechada — qty=${halfQty.toFixed(decimals)} (orderId=${data.data})`);
+  return { orderId: data.data, closedQty: halfQty.toFixed(decimals) };
 }
 
 // ─── Soft SL/TP: close position if price crosses SL or TP ────────────────────
@@ -631,11 +667,19 @@ async function closePosition(symbol, side, reason) {
 
 async function checkSlTp(symbol, currentPrice) {
   const state = loadPositionState();
-  if (!state || !state.slPrice) return; // no active position state
+  if (!state || !state.slPrice) return;
 
-  const { side, slPrice, tpPrice, entryPrice } = state;
-  const hitSl = side === "buy" ? currentPrice <= slPrice : currentPrice >= slPrice;
-  const hitTp = side === "buy" ? currentPrice >= tpPrice : currentPrice <= tpPrice;
+  const { side, slPrice, entryPrice, halfClosed, tp1Price, tp2Price } = state;
+  // Support old state files that only have tpPrice
+  const tp1 = tp1Price ?? state.tpPrice;
+  const tp2 = tp2Price ?? null;
+
+  const hitSl  = side === "buy" ? currentPrice <= slPrice  : currentPrice >= slPrice;
+  const hitTp1 = !halfClosed && tp1 && (side === "buy" ? currentPrice >= tp1 : currentPrice <= tp1);
+  const hitTp2 = halfClosed  && tp2 && (side === "buy" ? currentPrice >= tp2 : currentPrice <= tp2);
+  // Fallback: old state with only tpPrice and no tp2
+  const hitTpFull = !tp1Price && !halfClosed && state.tpPrice &&
+    (side === "buy" ? currentPrice >= state.tpPrice : currentPrice <= state.tpPrice);
 
   if (hitSl) {
     console.log(`  🔴 SL atingido @ $${currentPrice.toFixed(2)} (SL=$${slPrice}) — a fechar posição...`);
@@ -654,27 +698,55 @@ async function checkSlTp(symbol, currentPrice) {
     return;
   }
 
-  if (hitTp) {
-    console.log(`  🟢 TP atingido @ $${currentPrice.toFixed(2)} (TP=$${tpPrice}) — a fechar posição...`);
+  if (hitTp1) {
+    console.log(`  🎯 TP1 atingido @ $${currentPrice.toFixed(2)} (TP1=$${tp1}) — a fechar metade...`);
     try {
-      await closePosition(symbol, side, `TP @ $${tpPrice}`);
+      const result = await closeHalfPosition(symbol, side);
+      if (!result) return;
+      // Move SL to break-even and mark half closed
+      state.halfClosed   = true;
+      state.breakEvenSet = true;
+      state.slPrice      = entryPrice;
+      savePositionState(state);
+      console.log(`  ✅ Metade fechada | SL movido para break-even @ $${entryPrice}`);
       const pnl = await getDailyClosedPnl();
       const pnlLine = pnl !== null ? `\n📊 PnL hoje: $${pnl.toFixed(2)}` : "";
       await sendTelegram(
-        `🟢 <b>Take-Profit</b> — ${symbol}\n` +
-        `Entrada: $${entryPrice} | TP: $${tpPrice}\n` +
-        `Preço atual: $${currentPrice.toFixed(2)}${pnlLine}`
+        `🎯 <b>TP1 atingido</b> — ${symbol}\n` +
+        `Fechou metade (qty=${result.closedQty}) @ $${currentPrice.toFixed(2)}\n` +
+        `SL movido para break-even @ $${entryPrice}\n` +
+        `Aguarda TP2 @ $${tp2}${pnlLine}`
       );
     } catch (e) {
-      console.log(`  ❌ Erro a fechar por TP: ${e.message}`);
+      console.log(`  ❌ Erro no TP1: ${e.message}`);
     }
     return;
   }
 
-  // Neither hit — log current distance
-  const slDist = side === "buy" ? currentPrice - slPrice : slPrice - currentPrice;
-  const tpDist = side === "buy" ? tpPrice - currentPrice : currentPrice - tpPrice;
-  console.log(`  📊 Posição ${side} @ $${entryPrice} | dist SL: $${slDist.toFixed(2)} | dist TP: $${tpDist.toFixed(2)}`);
+  if (hitTp2 || hitTpFull) {
+    const tpHit = hitTp2 ? tp2 : state.tpPrice;
+    console.log(`  🟢 TP2 atingido @ $${currentPrice.toFixed(2)} (TP2=$${tpHit}) — a fechar posição restante...`);
+    try {
+      await closePosition(symbol, side, `TP2 @ $${tpHit}`);
+      const pnl = await getDailyClosedPnl();
+      const pnlLine = pnl !== null ? `\n📊 PnL hoje: $${pnl.toFixed(2)}` : "";
+      await sendTelegram(
+        `🟢 <b>TP2 atingido</b> — ${symbol}\n` +
+        `Entrada: $${entryPrice} | TP2: $${tpHit}\n` +
+        `Preço atual: $${currentPrice.toFixed(2)}${pnlLine}`
+      );
+    } catch (e) {
+      console.log(`  ❌ Erro no TP2: ${e.message}`);
+    }
+    return;
+  }
+
+  // Neither hit — log current distances
+  const slDist  = side === "buy" ? currentPrice - slPrice : slPrice - currentPrice;
+  const tp1Dist = tp1 && !halfClosed ? (side === "buy" ? tp1 - currentPrice : currentPrice - tp1) : null;
+  const tp2Dist = tp2 && halfClosed  ? (side === "buy" ? tp2 - currentPrice : currentPrice - tp2) : null;
+  const tpLabel = halfClosed ? `dist TP2: $${tp2Dist?.toFixed(2)}` : `dist TP1: $${tp1Dist?.toFixed(2)}`;
+  console.log(`  📊 Posição ${side} @ $${entryPrice}${halfClosed ? " [metade aberta]" : ""} | dist SL: $${slDist.toFixed(2)} | ${tpLabel}`);
 }
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
@@ -973,7 +1045,10 @@ async function run() {
     const stopPrice = tradeSide === "buy"
       ? (price - atr * 1.5).toFixed(2)
       : (price + atr * 1.5).toFixed(2);
-    const tpPrice = tradeSide === "buy"
+    const tp1Price = tradeSide === "buy"
+      ? (price + atr * 3).toFixed(2)
+      : (price - atr * 3).toFixed(2);
+    const tp2Price = tradeSide === "buy"
       ? (price + atr * 5).toFixed(2)
       : (price - atr * 5).toFixed(2);
 
@@ -981,16 +1056,16 @@ async function run() {
       console.log(
         `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   SL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)`);
+      console.log(`   SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
       logEntry.side = tradeSide;
       logEntry.stopLoss = stopPrice;
-      logEntry.takeProfit = tpPrice;
+      logEntry.takeProfit = tp2Price;
       const pnlPaper = await getDailyClosedPnl();
       const pnlLinePaper = pnlPaper !== null ? `\n📊 PnL hoje: $${pnlPaper.toFixed(2)}` : "";
-      await sendTelegram(`📋 <b>Bot v1 ${CONFIG.symbol}</b> — PAPER ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP: $${tpPrice}${pnlLinePaper}`);
+      await sendTelegram(`📋 <b>Bot v1 ${CONFIG.symbol}</b> — PAPER ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)${pnlLinePaper}`);
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — ${direction} $${tradeSize.toFixed(2)} ${CONFIG.symbol}`,
@@ -1004,17 +1079,17 @@ async function run() {
             throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
           }
         }
-        console.log(`  SL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)`);
-        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tpPrice);
+        console.log(`  SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
+        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
         logEntry.stopLoss = stopPrice;
-        logEntry.takeProfit = tpPrice;
-        console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP: $${tpPrice}`);
+        logEntry.takeProfit = tp2Price;
+        console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP1: $${tp1Price} | TP2: $${tp2Price}`);
         const pnlLive = await getDailyClosedPnl();
         const pnlLineLive = pnlLive !== null ? `\n📊 PnL hoje: $${pnlLive.toFixed(2)}` : "";
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1.5×ATR) | TP: $${tpPrice} (5×ATR)\nOrder: ${order.orderId}${pnlLineLive}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}${pnlLineLive}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
