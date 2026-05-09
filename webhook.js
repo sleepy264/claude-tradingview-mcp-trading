@@ -21,7 +21,8 @@ const CONFIG = {
   leverage:         parseInt(process.env.LEVERAGE              || "100"),
   stopLossPct:      parseFloat(process.env.STOP_LOSS_PCT       || "0.002"),
   takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
-  trailingStopPct:  parseFloat(process.env.TRAILING_STOP_PCT   || "0.03"),
+  trailingStopPct:        parseFloat(process.env.TRAILING_STOP_PCT        || "0.03"),
+  trailingActivationPct:  parseFloat(process.env.TRAILING_ACTIVATION_PCT  || "0.003"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -197,14 +198,22 @@ async function setBreakEvenStop(symbol, entryPrice) {
   if (data.retCode !== 0) throw new Error(`Set break-even SL failed: ${data.retMsg}`);
 }
 
-async function setTrailingStop(symbol) {
+async function setTrailingStop(symbol, action, entryPrice) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
 
   const trailingDistance = (price * CONFIG.trailingStopPct).toFixed(2);
+
+  // Only start trailing once price moves TRAILING_ACTIVATION_PCT in our favour
+  const activePrice = action === "buy"
+    ? (entryPrice * (1 + CONFIG.trailingActivationPct)).toFixed(2)
+    : (entryPrice * (1 - CONFIG.trailingActivationPct)).toFixed(2);
+
+  console.log(`  Trailing stop: distance=$${trailingDistance} | activates @ $${activePrice} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% from entry)`);
+
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
-  const body       = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 });
+  const body       = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, activePrice, positionIdx: 0 });
   const sig        = sign(timestamp, recvWindow, body);
   await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
     method: "POST",
@@ -366,8 +375,7 @@ async function handleWebhook(req, res) {
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
-      await setTrailingStop(sym);
-      console.log(`  Trailing stop set (3%)`);
+      await setTrailingStop(sym, actionLower, priceNum);
     }
 
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
