@@ -98,16 +98,15 @@ async function placeOrder(symbol, action, price, lev) {
   const quantity = calcQty(CONFIG.tradeSize, lev, price, minQty, qtyStep);
   console.log(`  Qty: ${quantity} ($${CONFIG.tradeSize} × ${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
-  const stopLoss   = action === "buy"
+  const stopLoss = action === "buy"
     ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
     : (price * (1 + CONFIG.stopLossPct)).toFixed(2);
-  const takeProfit = action === "buy"
-    ? (price * (1 + CONFIG.takeProfitPct)).toFixed(2)
-    : (price * (1 - CONFIG.takeProfitPct)).toFixed(2);
+  // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
+  // to avoid conflict with the half-close + break-even logic
 
   const orderBody = CONFIG.tradeMode === "futures"
     ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
-        stopLoss, slTriggerBy: "LastPrice", takeProfit, tpTriggerBy: "LastPrice" }
+        stopLoss, slTriggerBy: "LastPrice" }
     : { category: "spot", symbol, side, orderType: "Market", qty: quantity };
 
   const timestamp  = (Date.now() - 1500).toString();
@@ -365,7 +364,7 @@ async function handleWebhook(req, res) {
     const paperId = `PAPER-${Date.now()}`;
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
-    await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
+    await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}%`);
     return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
   }
 
@@ -432,7 +431,7 @@ async function handleWebhook(req, res) {
     await sendTelegram(
       `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
       `Preço: $${priceNum} | Size: $${CONFIG.tradeSize}\n` +
-      `SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%\n` +
+      `SL: ${CONFIG.stopLossPct*100}% | TP: via TradingView\n` +
       (dailyPnlLine ? `${dailyPnlLine}\n` : "") +
       `Order: ${order.orderId}`
     );
