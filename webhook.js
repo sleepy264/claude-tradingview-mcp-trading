@@ -25,6 +25,7 @@ const CONFIG = {
   trailingActivationPct:  parseFloat(process.env.TRAILING_ACTIVATION_PCT  || "0.003"),
   maxDailyLossPerSymbol:  parseFloat(process.env.MAX_DAILY_LOSS_PER_SYMBOL || "0"),  // 0 = disabled
   maxDailyLossTotal:      parseFloat(process.env.MAX_DAILY_LOSS_TOTAL      || "0"),  // 0 = disabled
+  riskPerTradeUSD:        parseFloat(process.env.RISK_PER_TRADE_USD        || "0"),  // 0 = fixed size
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -84,6 +85,14 @@ async function getInstrumentLotSize(symbol) {
   return { minQty: parseFloat(lot?.minOrderQty || "0.001"), qtyStep: parseFloat(lot?.qtyStep || "0.001") };
 }
 
+// Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
+// Formula: loss = tradeSize × leverage × stopLossPct = riskUSD
+//          tradeSize = riskUSD / (leverage × stopLossPct), capped at maxTradeSize
+function calcRiskBasedTradeSize(riskUSD, leverage, stopLossPct, maxTradeSize) {
+  const sized  = riskUSD / (leverage * stopLossPct);
+  return parseFloat(Math.min(sized, maxTradeSize).toFixed(2));
+}
+
 function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
   const raw      = (sizeUSD * leverage) / price;
   const steps    = Math.floor(raw / qtyStep);
@@ -93,10 +102,17 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
 }
 
 async function placeOrder(symbol, action, price, lev) {
-  const side = action === "buy" ? "Buy" : "Sell";
+  const side      = action === "buy" ? "Buy" : "Sell";
+  const tradeSize = CONFIG.riskPerTradeUSD > 0
+    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, lev, CONFIG.stopLossPct, CONFIG.tradeSize)
+    : CONFIG.tradeSize;
+  const tradeSizeMode = CONFIG.riskPerTradeUSD > 0
+    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem)`
+    : `fixo ($${tradeSize})`;
+
   const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
-  const quantity = calcQty(CONFIG.tradeSize, lev, price, minQty, qtyStep);
-  console.log(`  Qty: ${quantity} ($${CONFIG.tradeSize} × ${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+  const quantity = calcQty(tradeSize, lev, price, minQty, qtyStep);
+  console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
   const stopLoss = action === "buy"
     ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
