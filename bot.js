@@ -172,6 +172,22 @@ async function fetchCandles(symbol, interval, limit = 100) {
   }
 }
 
+// Returns "bullish", "bearish", or null (if unavailable / BTC pair itself)
+async function fetchBtcTrend() {
+  if (CONFIG.symbol.startsWith("BTC")) return null; // skip for BTC pairs
+  try {
+    const candles = await fetchCandlesOkx("BTCUSDT", "1h", 100);
+    const closes  = candles.map(c => c.close);
+    const ema20   = calcEMA(closes, 20);
+    const btcPrice = closes[closes.length - 1];
+    if (ema20 == null) return null;
+    return btcPrice > ema20 ? "bullish" : "bearish";
+  } catch (e) {
+    console.log(`  ⚠️  BTC trend indisponível: ${e.message}`);
+    return null;
+  }
+}
+
 // ─── Indicator Calculations ──────────────────────────────────────────────────
 
 function calcEMA(closes, period) {
@@ -430,6 +446,18 @@ async function getInstrumentInfo(symbol) {
   };
 }
 
+// Reduce leverage automatically when ATR is elevated vs its 50-period average:
+//   ATR <= avg50        → full leverage
+//   ATR 1.0–1.5 × avg50 → 75%
+//   ATR > 1.5 × avg50   → 50%
+function calcEffectiveLeverage(atr, avg50) {
+  const base  = parseInt(process.env.LEVERAGE || "60");
+  const ratio = atr / avg50;
+  if (ratio > 1.5) return Math.floor(base * 0.5);
+  if (ratio > 1.0) return Math.floor(base * 0.75);
+  return base;
+}
+
 function calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize = 1) {
   // vol (lots) = notional / (price * contractSize)
   // notional   = sizeUSD * leverage
@@ -517,6 +545,51 @@ async function checkBreakEven(symbol, currentPrice, atr) {
   );
 }
 
+// Trailing stop after break-even: tracks highest/lowest price reached and
+// moves SL to (peak - 1×ATR) for longs or (trough + 1×ATR) for shorts.
+// Only activates once breakEvenSet=true. SL only ever moves in our favour.
+async function checkTrailingStop(symbol, currentPrice, atr) {
+  const state = loadPositionState();
+  if (!state || !state.breakEvenSet) return; // only after break-even
+
+  const { side, entryPrice, slPrice } = state;
+  const trailHigh = state.trailHigh ?? currentPrice;
+  const trailLow  = state.trailLow  ?? currentPrice;
+
+  let newSl = slPrice;
+  let updated = false;
+
+  if (side === "buy") {
+    const newHigh = Math.max(trailHigh, currentPrice);
+    const candidate = parseFloat((newHigh - atr).toFixed(2));
+    if (candidate > slPrice) {
+      newSl = candidate;
+      updated = true;
+      console.log(`  📈 Trailing SL atualizado: $${slPrice} → $${newSl} (high=$${newHigh.toFixed(2)} − 1×ATR)`);
+    }
+    state.trailHigh = newHigh;
+  } else {
+    const newLow = Math.min(trailLow, currentPrice);
+    const candidate = parseFloat((newLow + atr).toFixed(2));
+    if (candidate < slPrice) {
+      newSl = candidate;
+      updated = true;
+      console.log(`  📉 Trailing SL atualizado: $${slPrice} → $${newSl} (low=$${newLow.toFixed(2)} + 1×ATR)`);
+    }
+    state.trailLow = newLow;
+  }
+
+  if (updated) {
+    state.slPrice = newSl;
+    await sendTelegram(
+      `📈 <b>Trailing SL</b> — ${symbol}\n` +
+      `SL movido: $${slPrice} → $${newSl}\n` +
+      `Preço atual: $${currentPrice.toFixed(2)}`
+    );
+  }
+  savePositionState(state);
+}
+
 // Place a trigger (plan) order to close a position at SL or TP price.
 // triggerType: 1 = mark price, 2 = last price (direction inferred by MEXC:
 //   triggerPrice < current → fires on drop; triggerPrice > current → fires on rise)
@@ -548,8 +621,8 @@ async function placeMexcPlanOrder(symbol, closeSide, vol, triggerPrice, leverage
   return data.data; // planOrderId
 }
 
-async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, tp1Price, tp2Price) {
-  const leverage = parseInt(process.env.LEVERAGE || "60");
+async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, tp1Price, tp2Price, leverage) {
+  leverage = leverage ?? parseInt(process.env.LEVERAGE || "60");
   const { minQty, qtyStep, contractSize } = await getInstrumentInfo(symbol);
   const quantity = calcQty(sizeUSD, leverage, price, minQty, qtyStep, contractSize);
   console.log(`  Qty: ${quantity} (${sizeUSD}$ × ${leverage}x ÷ ($${price.toFixed(2)} × contractSize=${contractSize}), min=${minQty}, step=${qtyStep})`);
@@ -594,7 +667,8 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, tp1Price, 
   return { orderId };
 }
 
-async function closeHalfPosition(symbol, side) {
+async function closeHalfPosition(symbol, side, leverage) {
+  leverage = leverage ?? parseInt(process.env.LEVERAGE || "60");
   const pos = await getOpenPosition(symbol);
   if (!pos) { clearPositionState(); return null; }
 
@@ -605,7 +679,6 @@ async function closeHalfPosition(symbol, side) {
   if (halfQty <= 0) throw new Error(`Half qty (${halfQty}) é zero — posição demasiado pequena para dividir`);
 
   const closeSide = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
-  const leverage  = parseInt(process.env.LEVERAGE || "60");
   const timestamp = Date.now().toString();
   const body = JSON.stringify({
     symbol,
@@ -641,13 +714,14 @@ async function closePosition(symbol, side, reason) {
     clearPositionState();
     return;
   }
-  const closeSide = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
-  const timestamp = Date.now().toString();
+  const closeSide  = side === "buy" ? 4 : 2; // 4=Close Long, 2=Close Short
+  const closeLev   = parseInt(process.env.LEVERAGE || "60");
+  const timestamp  = Date.now().toString();
   const body = JSON.stringify({
     symbol,
     price:    0,
     vol:      pos.size,
-    leverage: parseInt(process.env.LEVERAGE || "60"),
+    leverage: closeLev,
     side:     closeSide,
     type:     5,   // Market
     openType: 2,
@@ -924,11 +998,12 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — 15m for entry indicators, 1H for trend filter
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const [candles, candles1h] = await Promise.all([
+  // Fetch candle data — 15m for entry indicators, 1H for trend filter, BTC for correlation
+  console.log("\n── Fetching market data ─────────────────────────────────\n");
+  const [candles, candles1h, btcTrend] = await Promise.all([
     fetchCandles(CONFIG.symbol, "15m", 500),
     fetchCandles(CONFIG.symbol, "1h",  200),
+    fetchBtcTrend(),
   ]);
   const closes   = candles.map((c) => c.close);
   const closes1h = candles1h.map((c) => c.close);
@@ -954,7 +1029,10 @@ async function run() {
   console.log(`  RSI(3)  15m: ${rsi3Valid ? rsi3.toFixed(2) : "N/A"}`);
   console.log(`  RSI(14) 1H:  ${rsi14_1hValid ? rsi14_1h.toFixed(2) : "N/A"} (1H RSI filter)`);
   console.log(`  EMA(50) 1H:  $${ema50_1h != null ? ema50_1h.toFixed(2) : "N/A"} (trend filter)`);
+  const effectiveLeverage = atrData ? calcEffectiveLeverage(atrData.atr, atrData.avg50) : parseInt(process.env.LEVERAGE || "60");
   console.log(`  ATR(14) 15m: ${atrData ? `$${atrData.atr.toFixed(2)} — ${atrData.volatile ? "✅ volatile" : "🚫 choppy"}` : "N/A"}`);
+  console.log(`  Leverage:    ${effectiveLeverage}x (dinâmica — base: ${process.env.LEVERAGE || "60"}x)`);
+  console.log(`  BTC trend:   ${btcTrend ?? "N/A (par BTC ou erro)"}`);
   console.log(`  Volume  15m: ${volLow ? "✅ low (weak pullback)" : "🚫 high (strong move, skip)"}`);
 
   const missing = [
@@ -974,6 +1052,7 @@ async function run() {
   console.log("\n── SL/TP & Break-even check ─────────────────────────────\n");
   await checkSlTp(CONFIG.symbol, price);
   await checkBreakEven(CONFIG.symbol, price, atrData.atr);
+  await checkTrailingStop(CONFIG.symbol, price, atrData.atr);
 
   if (!atrData.volatile) {
     console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
@@ -1030,6 +1109,10 @@ async function run() {
 
   if (!trendAligned) results.push({ label: `15m bias (${h1Side}) conflicts with 1H trend`, pass: false });
   if (!rsi1hOk)      results.push({ label: `1H RSI(14) at ${rsi14_1h.toFixed(1)} — market extended`, pass: false });
+  if (btcTrend) {
+    const btcAligned = (h1Side === "buy" && btcTrend === "bullish") || (h1Side === "sell" && btcTrend === "bearish");
+    if (!btcAligned) results.push({ label: `BTC trend (${btcTrend}) oposto ao sinal (${h1Side})`, pass: false });
+  }
   logEntry.conditions = results;
   logEntry.allPass    = results.every(r => r.pass);
 
@@ -1074,13 +1157,18 @@ async function run() {
         if (CONFIG.tradeMode === "futures") {
           const openPos = await getOpenPosition(CONFIG.symbol);
           if (openPos) {
-            console.log(`⚠️  Posição já aberta (${openPos.side} qty=${openPos.size}) — a saltar nova ordem.`);
-            logEntry.error = `Position already open: ${openPos.side} qty=${openPos.size}`;
-            throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
+            const currentState = loadPositionState();
+            const isReentry = currentState?.halfClosed && openPos.side.toLowerCase() === tradeSide;
+            if (!isReentry) {
+              console.log(`⚠️  Posição já aberta (${openPos.side} qty=${openPos.size}) — a saltar nova ordem.`);
+              logEntry.error = `Position already open: ${openPos.side} qty=${openPos.size}`;
+              throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
+            }
+            console.log(`🔁 Re-entrada após TP1 — posição ${tradeSide} já tem metade aberta, a adicionar...`);
           }
         }
-        console.log(`  SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
-        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price);
+        console.log(`  Leverage efetivo: ${effectiveLeverage}x | SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
+        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price, effectiveLeverage);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
@@ -1089,7 +1177,7 @@ async function run() {
         console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP1: $${tp1Price} | TP2: $${tp2Price}`);
         const pnlLive = await getDailyClosedPnl();
         const pnlLineLive = pnlLive !== null ? `\n📊 PnL hoje: $${pnlLive.toFixed(2)}` : "";
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}${pnlLineLive}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)} | Lev: ${effectiveLeverage}x\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}${pnlLineLive}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
