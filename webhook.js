@@ -370,6 +370,7 @@ async function handleWebhook(req, res) {
   }
 
   // ── Daily loss limit check ────────────────────────────────────────────────
+  let dailyPnlLine = "";  // included in trade Telegram message if limits are configured
   if (CONFIG.maxDailyLossPerSymbol > 0 || CONFIG.maxDailyLossTotal > 0) {
     try {
       const [symbolPnl, totalPnl] = await Promise.all([
@@ -391,7 +392,8 @@ async function handleWebhook(req, res) {
         return res.json({ status: "blocked", reason: "daily_loss_total", pnl: totalPnl });
       }
 
-      console.log(`  📊 PnL hoje — ${sym}: $${symbolPnl.toFixed(2)} | Total: $${totalPnl.toFixed(2)}`);
+      dailyPnlLine = `📊 PnL hoje — ${sym}: $${symbolPnl.toFixed(2)} | Total: $${totalPnl.toFixed(2)}`;
+      console.log(`  ${dailyPnlLine}`);
     } catch (e) {
       console.log(`  ⚠️  Não foi possível verificar PnL diário: ${e.message} — a continuar`);
     }
@@ -427,7 +429,13 @@ async function handleWebhook(req, res) {
     }
 
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
-    await sendTelegram(`✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%\nOrder: ${order.orderId}`);
+    await sendTelegram(
+      `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
+      `Preço: $${priceNum} | Size: $${CONFIG.tradeSize}\n` +
+      `SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%\n` +
+      (dailyPnlLine ? `${dailyPnlLine}\n` : "") +
+      `Order: ${order.orderId}`
+    );
     return res.json({ status: "ok", orderId: order.orderId, action: actionLower, symbol: sym, price: priceNum });
 
   } catch (err) {
