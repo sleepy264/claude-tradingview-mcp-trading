@@ -182,6 +182,21 @@ async function closeHalfPosition(symbol, position) {
   return { ...data.result, closedQty: halfQty, remainingQty: (position.size - parseFloat(halfQty)).toFixed(decimals) };
 }
 
+async function setBreakEvenStop(symbol, entryPrice) {
+  const slPrice    = parseFloat(entryPrice).toFixed(2);
+  const timestamp  = Date.now().toString();
+  const recvWindow = "5000";
+  const body       = JSON.stringify({ category: "linear", symbol, stopLoss: slPrice, slTriggerBy: "LastPrice", positionIdx: 0 });
+  const sig        = sign(timestamp, recvWindow, body);
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Set break-even SL failed: ${data.retMsg}`);
+}
+
 async function setTrailingStop(symbol) {
   const price = await fetchCurrentPrice(symbol);
   if (!price) return;
@@ -221,7 +236,7 @@ app.post("/webhook", async (req, res) => {
 
 async function handleWebhook(req, res) {
 
-  const { secret, action, symbol, price, leverage } = req.body;
+  const { secret, action, symbol, price, leverage, entry_price } = req.body;
 
   // Validate secret token
   if (CONFIG.webhookSecret && secret !== CONFIG.webhookSecret) {
@@ -273,12 +288,29 @@ async function handleWebhook(req, res) {
       const result = await closeHalfPosition(sym, openPos);
       console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
+
+      // Move SL to entry price (break-even) to eliminate remaining risk
+      let beSl = null;
+      const entryNum = parseFloat(entry_price);
+      if (entryNum && !isNaN(entryNum)) {
+        try {
+          await setBreakEvenStop(sym, entryNum);
+          beSl = entryNum;
+          console.log(`  ✅ SL movido para entrada @ $${entryNum} (break-even)`);
+        } catch (e) {
+          console.log(`  ⚠️  Break-even SL falhou: ${e.message}`);
+        }
+      } else {
+        console.log(`  ℹ️  entry_price não fornecido — SL não alterado`);
+      }
+
       await sendTelegram(
         `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
+        (beSl ? `🛡 SL movido para entrada @ $${beSl} (break-even)\n` : "") +
         `Order: ${result.orderId}`
       );
-      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId });
+      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId, breakEvenSl: beSl });
     } catch (err) {
       console.log(`  ❌ TP ERROR — ${err.message}`);
       await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro no TP\n${err.message}`);
