@@ -259,18 +259,19 @@ async function setTrailingStop(symbol, action, entryPrice) {
 
 // ─── Webhook endpoint ─────────────────────────────────────────────────────────
 
-// Parse JSON bodies (standard)
-app.use(express.json());
-// Fallback: read raw body for any Content-Type TradingView might send
-// (e.g. text/plain, application/x-www-form-urlencoded, or no Content-Type at all)
-app.use(express.raw({ type: "*/*", limit: "1mb" }));
+// Read raw body stream directly — works regardless of Content-Type.
+// TradingView strategy alerts sometimes send no Content-Type header,
+// which causes express.json() to silently skip parsing.
 app.use((req, _res, next) => {
-  if (Buffer.isBuffer(req.body)) {
-    const str = req.body.toString("utf8").trim();
-    try { req.body = JSON.parse(str); }
-    catch { req.body = undefined; }
-  }
-  next();
+  let raw = "";
+  req.on("data", chunk => { raw += chunk.toString("utf8"); });
+  req.on("end", () => {
+    if (raw) {
+      try { req.body = JSON.parse(raw); }
+      catch { req.body = undefined; }
+    }
+    next();
+  });
 });
 
 // Health check
