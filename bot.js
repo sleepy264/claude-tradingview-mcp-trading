@@ -409,12 +409,29 @@ async function getDailyClosedPnl() {
       headers: mexcHeaders(timestamp, sig),
     });
     const data = await res.json();
-    if (!data.success) return null;
+    if (!data.success) {
+      console.log(`  ⚠️  PnL API falhou: ${data.message} (code ${data.code})`);
+      return null;
+    }
 
     const list = data.data?.resultList || [];
+    if (list.length > 0) {
+      console.log(`  🔍 PnL debug — primeiro registo:`, JSON.stringify(list[0]));
+    } else {
+      console.log(`  🔍 PnL debug — lista vazia (sem posições fechadas hoje?)`);
+    }
+
     const todayPnl = list
-      .filter(p => p.updateTime >= startOfDay)
-      .reduce((sum, p) => sum + parseFloat(p.realised || 0), 0);
+      .filter(p => {
+        // updateTime pode ser em segundos ou milissegundos
+        const t = p.updateTime > 1e12 ? p.updateTime : p.updateTime * 1000;
+        return t >= startOfDay;
+      })
+      .reduce((sum, p) => {
+        // tentar vários nomes de campo possíveis
+        const val = parseFloat(p.realised ?? p.realizedPnl ?? p.profit ?? p.closedPnl ?? 0);
+        return sum + val;
+      }, 0);
     return todayPnl;
   } catch (e) {
     console.log(`  ⚠️  Não foi possível obter PnL diário: ${e.message}`);
