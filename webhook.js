@@ -268,7 +268,10 @@ app.use((req, _res, next) => {
   req.on("end", () => {
     if (raw) {
       try { req.body = JSON.parse(raw); }
-      catch { req.body = undefined; }
+      catch {
+        console.log(`  ⚠️  JSON parse falhou — raw body: ${raw.substring(0, 300)}`);
+        req.body = undefined;
+      }
     }
     next();
   });
