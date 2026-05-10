@@ -395,48 +395,29 @@ function mexcHeaders(timestamp, signature) {
   };
 }
 
-// Returns today's total realised PnL from MEXC closed positions (negative = loss).
-async function getDailyClosedPnl() {
-  try {
-    const todayMidnight = new Date();
-    todayMidnight.setHours(0, 0, 0, 0);
-    const startOfDay = todayMidnight.getTime();
+// ─── In-memory daily PnL tracker ─────────────────────────────────────────────
+// Calculated from entry/exit prices — no MEXC API call needed.
+// PnL = (exitPrice - entryPrice) / entryPrice × tradeSize × leverage  (long)
+// PnL = (entryPrice - exitPrice) / entryPrice × tradeSize × leverage  (short)
+// Resets at midnight UTC or on bot restart.
 
-    const timestamp = Date.now().toString();
-    const params    = "page_num=1&page_size=50";
-    const sig       = signMexc(timestamp, params);
-    const res = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/private/position/list/history?${params}`, {
-      headers: mexcHeaders(timestamp, sig),
-    });
-    const data = await res.json();
-    if (!data.success) {
-      console.log(`  ⚠️  PnL API falhou: ${data.message} (code ${data.code})`);
-      return null;
-    }
+let _dailyPnl = { date: "", total: 0 };
 
-    const list = data.data?.resultList || [];
-    if (list.length > 0) {
-      console.log(`  🔍 PnL debug — primeiro registo:`, JSON.stringify(list[0]));
-    } else {
-      console.log(`  🔍 PnL debug — lista vazia (sem posições fechadas hoje?)`);
-    }
+function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
-    const todayPnl = list
-      .filter(p => {
-        // updateTime pode ser em segundos ou milissegundos
-        const t = p.updateTime > 1e12 ? p.updateTime : p.updateTime * 1000;
-        return t >= startOfDay;
-      })
-      .reduce((sum, p) => {
-        // tentar vários nomes de campo possíveis
-        const val = parseFloat(p.realised ?? p.realizedPnl ?? p.profit ?? p.closedPnl ?? 0);
-        return sum + val;
-      }, 0);
-    return todayPnl;
-  } catch (e) {
-    console.log(`  ⚠️  Não foi possível obter PnL diário: ${e.message}`);
-    return null;
-  }
+function getDailyClosedPnl() {
+  if (_dailyPnl.date !== _todayUTC()) _dailyPnl = { date: _todayUTC(), total: 0 };
+  return _dailyPnl.total;
+}
+
+function addDailyPnl(entryPrice, exitPrice, side, tradeSize, leverage, fraction = 1) {
+  if (_dailyPnl.date !== _todayUTC()) _dailyPnl = { date: _todayUTC(), total: 0 };
+  const pct = side === "buy"
+    ? (exitPrice - entryPrice) / entryPrice
+    : (entryPrice - exitPrice) / entryPrice;
+  const pnl = pct * tradeSize * leverage * fraction;
+  _dailyPnl.total += pnl;
+  console.log(`  📊 PnL sessão: $${_dailyPnl.total.toFixed(2)} (este fecho: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)})`);
 }
 
 async function getOpenPosition(symbol) {
@@ -697,6 +678,8 @@ async function placeMexcOrder(symbol, side, sizeUSD, price, stopLoss, tp1Price, 
     tp2Price:     parseFloat(tp2Price),
     halfClosed:   false,
     breakEvenSet: false,
+    tradeSize:    parseFloat(sizeUSD),
+    leverage,
   });
   console.log(`  📌 Estado gravado: SL=$${stopLoss} | TP1=$${tp1Price} (3×ATR) | TP2=$${tp2Price} (5×ATR)`);
 
@@ -779,7 +762,9 @@ async function checkSlTp(symbol, currentPrice) {
   const state = loadPositionState();
   if (!state || !state.slPrice) return;
 
-  const { side, slPrice, entryPrice, halfClosed, tp1Price, tp2Price } = state;
+  const { side, slPrice, entryPrice, halfClosed, tp1Price, tp2Price,
+          tradeSize = CONFIG.maxTradeSizeUSD,
+          leverage  = parseInt(process.env.LEVERAGE || "60") } = state;
   // Support old state files that only have tpPrice
   const tp1 = tp1Price ?? state.tpPrice;
   const tp2 = tp2Price ?? null;
@@ -795,12 +780,13 @@ async function checkSlTp(symbol, currentPrice) {
     console.log(`  🔴 SL atingido @ $${currentPrice.toFixed(2)} (SL=$${slPrice}) — a fechar posição...`);
     try {
       await closePosition(symbol, side, `SL @ $${slPrice}`);
-      const pnl = await getDailyClosedPnl();
-      const pnlLine = pnl !== null ? `\n📊 PnL hoje: $${pnl.toFixed(2)}` : "";
+      addDailyPnl(entryPrice, currentPrice, side, tradeSize, leverage, 1);
+      const pnl = getDailyClosedPnl();
       await sendTelegram(
         `🔴 <b>Stop-Loss</b> — ${symbol}\n` +
         `Entrada: $${entryPrice} | SL: $${slPrice}\n` +
-        `Preço atual: $${currentPrice.toFixed(2)}${pnlLine}`
+        `Preço atual: $${currentPrice.toFixed(2)}\n` +
+        `📊 PnL hoje: $${pnl.toFixed(2)}`
       );
     } catch (e) {
       console.log(`  ❌ Erro a fechar por SL: ${e.message}`);
@@ -819,13 +805,14 @@ async function checkSlTp(symbol, currentPrice) {
       state.slPrice      = entryPrice;
       savePositionState(state);
       console.log(`  ✅ Metade fechada | SL movido para break-even @ $${entryPrice}`);
-      const pnl = await getDailyClosedPnl();
-      const pnlLine = pnl !== null ? `\n📊 PnL hoje: $${pnl.toFixed(2)}` : "";
+      addDailyPnl(entryPrice, currentPrice, side, tradeSize, leverage, 0.5);
+      const pnl = getDailyClosedPnl();
       await sendTelegram(
         `🎯 <b>TP1 atingido</b> — ${symbol}\n` +
         `Fechou metade (qty=${result.closedQty}) @ $${currentPrice.toFixed(2)}\n` +
         `SL movido para break-even @ $${entryPrice}\n` +
-        `Aguarda TP2 @ $${tp2}${pnlLine}`
+        `Aguarda TP2 @ $${tp2}\n` +
+        `📊 PnL hoje: $${pnl.toFixed(2)}`
       );
     } catch (e) {
       console.log(`  ❌ Erro no TP1: ${e.message}`);
@@ -838,12 +825,13 @@ async function checkSlTp(symbol, currentPrice) {
     console.log(`  🟢 TP2 atingido @ $${currentPrice.toFixed(2)} (TP2=$${tpHit}) — a fechar posição restante...`);
     try {
       await closePosition(symbol, side, `TP2 @ $${tpHit}`);
-      const pnl = await getDailyClosedPnl();
-      const pnlLine = pnl !== null ? `\n📊 PnL hoje: $${pnl.toFixed(2)}` : "";
+      addDailyPnl(entryPrice, currentPrice, side, tradeSize, leverage, 0.5);
+      const pnl = getDailyClosedPnl();
       await sendTelegram(
         `🟢 <b>TP2 atingido</b> — ${symbol}\n` +
         `Entrada: $${entryPrice} | TP2: $${tpHit}\n` +
-        `Preço atual: $${currentPrice.toFixed(2)}${pnlLine}`
+        `Preço atual: $${currentPrice.toFixed(2)}\n` +
+        `📊 PnL hoje: $${pnl.toFixed(2)}`
       );
     } catch (e) {
       console.log(`  ❌ Erro no TP2: ${e.message}`);
@@ -1188,9 +1176,8 @@ async function run() {
       logEntry.side = tradeSide;
       logEntry.stopLoss = stopPrice;
       logEntry.takeProfit = tp2Price;
-      const pnlPaper = await getDailyClosedPnl();
-      const pnlLinePaper = pnlPaper !== null ? `\n📊 PnL hoje: $${pnlPaper.toFixed(2)}` : "";
-      await sendTelegram(`📋 <b>Bot v1 ${CONFIG.symbol}</b> — PAPER ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)${pnlLinePaper}`);
+      const pnlPaper = getDailyClosedPnl();
+      await sendTelegram(`📋 <b>Bot v1 ${CONFIG.symbol}</b> — PAPER ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)}\nSL: $${stopPrice} | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\n📊 PnL hoje: $${pnlPaper.toFixed(2)}`);
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — ${direction} $${tradeSize.toFixed(2)} ${CONFIG.symbol}`,
@@ -1217,9 +1204,8 @@ async function run() {
         logEntry.stopLoss = stopPrice;
         logEntry.takeProfit = tp2Price;
         console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP1: $${tp1Price} | TP2: $${tp2Price}`);
-        const pnlLive = await getDailyClosedPnl();
-        const pnlLineLive = pnlLive !== null ? `\n📊 PnL hoje: $${pnlLive.toFixed(2)}` : "";
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)} | Lev: ${effectiveLeverage}x\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}${pnlLineLive}`);
+        const pnlLive = getDailyClosedPnl();
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)} | Lev: ${effectiveLeverage}x\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}\n📊 PnL hoje: $${pnlLive.toFixed(2)}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
