@@ -287,36 +287,44 @@ app.get("/api/status", (req, res) => {
 
 // TradingView alert endpoint
 // Expected payload: { "secret": "...", "action": "buy"|"sell", "symbol": "BTCUSDT", "price": 75000 }
-app.post("/webhook", async (req, res) => {
+app.post("/webhook", (req, res) => {
   const ts = new Date().toISOString();
   console.log(`\n[${ts}] Webhook received:`, JSON.stringify(req.body));
+
   if (!req.body || typeof req.body !== "object") {
     console.log("  ❌ Empty or non-JSON body — set Content-Type: application/json in TradingView alert");
     return res.status(400).json({ error: "Invalid body — must be JSON with Content-Type: application/json" });
   }
-  try { return await handleWebhook(req, res); }
-  catch (err) { console.log("  ❌ Unhandled error:", err.message); return res.status(500).json({ error: err.message }); }
-});
 
-async function handleWebhook(req, res) {
-
-  const { secret, action, symbol, price, leverage, entry_price } = req.body;
-
-  // Validate secret token
+  // Validate secret before responding to avoid leaking info on invalid requests
+  const secret = req.body?.secret;
   if (CONFIG.webhookSecret && secret !== CONFIG.webhookSecret) {
     console.log("  ❌ Invalid secret — rejected");
     return res.status(401).json({ error: "Unauthorized" });
   }
 
+  // Respond immediately so TradingView doesn't time out (it has a ~3s limit).
+  // Trade processing continues asynchronously in the background.
+  res.json({ status: "received" });
+
+  handleWebhook(req.body).catch(err => {
+    console.log("  ❌ Unhandled error:", err.message);
+  });
+});
+
+async function handleWebhook(body) {
+
+  const { secret, action, symbol, price, leverage, entry_price } = body;
+
   // Validate required fields
   if (!action) {
     console.log("  ❌ Missing field: action");
-    return res.status(400).json({ error: "Missing required field: action (buy or sell)" });
+    return;
   }
 
   if (!["buy", "sell", "tp"].includes(action.toLowerCase())) {
     console.log("  ❌ Invalid action:", action);
-    return res.status(400).json({ error: "action must be 'buy', 'sell' or 'tp'" });
+    return;
   }
 
   const actionLower   = action.toLowerCase();
@@ -349,14 +357,14 @@ async function handleWebhook(req, res) {
     if (CONFIG.paperTrading) {
       console.log(`  📋 PAPER TP — nenhuma ordem enviada`);
       await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER TP\nFecharia metade da posição`);
-      return res.json({ status: "paper", action: "tp", symbol: sym });
+      return;
     }
     try {
       const openPos = await getOpenPosition(sym);
       if (!openPos) {
         console.log(`  ⚠️  Nenhuma posição aberta em ${sym} — TP ignorado`);
         await sendTelegram(`⚠️ <b>Bot v2 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
-        return res.json({ status: "skipped", reason: "No open position", symbol: sym });
+        return;
       }
       console.log(`  Posição: ${openPos.side} qty=${openPos.size} — a fechar metade...`);
       const result = await closeHalfPosition(sym, openPos);
@@ -416,11 +424,11 @@ async function handleWebhook(req, res) {
         (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "") +
         `Order: ${result.orderId}`
       );
-      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId, newSl });
+      return;
     } catch (err) {
       console.log(`  ❌ TP ERROR — ${err.message}`);
       await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro no TP\n${err.message}`);
-      return res.status(500).json({ error: err.message });
+      return;
     }
   }
 
@@ -429,7 +437,7 @@ async function handleWebhook(req, res) {
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
     await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}%`);
-    return res.json({ status: "paper", orderId: paperId, action: actionLower, symbol: sym, price: priceNum });
+    return;
   }
 
   // ── Daily loss limit check ────────────────────────────────────────────────
@@ -445,14 +453,14 @@ async function handleWebhook(req, res) {
         const msg = `🛑 Limite de perda diária por par atingido em ${sym}: $${symbolPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossPerSymbol})`;
         console.log(`  ${msg}`);
         await sendTelegram(`🛑 <b>Bot v2 ${sym}</b> — Bloqueado\n${msg}`);
-        return res.json({ status: "blocked", reason: "daily_loss_per_symbol", symbol: sym, pnl: symbolPnl });
+        return;
       }
 
       if (CONFIG.maxDailyLossTotal > 0 && totalPnl < -CONFIG.maxDailyLossTotal) {
         const msg = `🛑 Limite de perda diária global atingido: $${totalPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossTotal})`;
         console.log(`  ${msg}`);
         await sendTelegram(`🛑 <b>Bot v2</b> — Bloqueado (todos os pares)\n${msg}`);
-        return res.json({ status: "blocked", reason: "daily_loss_total", pnl: totalPnl });
+        return;
       }
 
       dailyPnlLine = `📊 PnL hoje — ${sym}: $${symbolPnl.toFixed(2)} | Total: $${totalPnl.toFixed(2)}`;
@@ -475,7 +483,7 @@ async function handleWebhook(req, res) {
           console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
           logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
           await sendTelegram(`⏭ <b>Bot v2 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
-          return res.json({ status: "skipped", reason: `Already ${openPos.side}`, symbol: sym });
+          return;
         }
         console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size}) before opening ${actionLower.toUpperCase()}...`);
         const closeResult = await closePosition(sym, openPos);
@@ -499,13 +507,11 @@ async function handleWebhook(req, res) {
       (dailyPnlLine ? `${dailyPnlLine}\n` : "") +
       `Order: ${order.orderId}`
     );
-    return res.json({ status: "ok", orderId: order.orderId, action: actionLower, symbol: sym, price: priceNum });
 
   } catch (err) {
     console.log(`  ❌ ERROR — ${err.message}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
     await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro na ordem\n${err.message}`);
-    return res.status(500).json({ error: err.message });
   }
 }
 
