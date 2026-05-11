@@ -158,7 +158,7 @@ async function getOpenPosition(symbol) {
   const position = data.result?.list?.[0];
   if (!position) return null;
   const size = parseFloat(position.size);
-  return size > 0 ? { side: position.side, size } : null;
+  return size > 0 ? { side: position.side, size, stopLoss: parseFloat(position.stopLoss || "0") } : null;
 }
 
 async function closePosition(symbol, position) {
@@ -378,15 +378,31 @@ async function handleWebhook(req, res) {
       let dailyPnl = null;
       try { dailyPnl = await getDailyClosedPnl(sym); } catch (_) {}
 
-      // Move SL to entry price (break-even) to eliminate remaining risk
-      let beSl = null;
+      // Progressive SL tightening — works for both long and short:
+      //   TP1: current SL ≠ entry_price  → move SL to entry_price (break-even)
+      //   TP2+: current SL ≈ entry_price → move SL to midpoint(currentSL, TP_price)
+      //         midpoint moves SL up for longs, down for shorts — always tighter
+      let newSl = null;
       if (entryNum && !isNaN(entryNum)) {
         try {
-          await setBreakEvenStop(sym, entryNum);
-          beSl = entryNum;
-          console.log(`  ✅ SL movido para entrada @ $${entryNum} (break-even)`);
+          // Re-fetch position to get current SL after the half-close settled
+          const posAfter = await getOpenPosition(sym);
+          const currentSl = posAfter?.stopLoss ?? 0;
+          const tolerance = entryNum * 0.001; // 0.1% tolerance for float comparison
+          const breakEvenSet = currentSl > 0 && Math.abs(currentSl - entryNum) <= tolerance;
+
+          if (breakEvenSet) {
+            // TP2+ — move SL halfway between current SL and this TP price
+            newSl = parseFloat(((currentSl + priceNum) / 2).toFixed(2));
+            console.log(`  ✅ SL progressivo (TP2+): $${currentSl} → $${newSl} (meio entre $${currentSl} e $${priceNum})`);
+          } else {
+            // TP1 — move SL to entry price (break-even)
+            newSl = parseFloat(entryNum.toFixed(2));
+            console.log(`  ✅ SL break-even (TP1): → $${newSl}`);
+          }
+          await setBreakEvenStop(sym, newSl);
         } catch (e) {
-          console.log(`  ⚠️  Break-even SL falhou: ${e.message}`);
+          console.log(`  ⚠️  Ajuste de SL falhou: ${e.message}`);
         }
       } else {
         console.log(`  ℹ️  entry_price não fornecido — SL não alterado`);
@@ -395,12 +411,12 @@ async function handleWebhook(req, res) {
       await sendTelegram(
         `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
-        (beSl ? `🛡 SL movido para entrada @ $${beSl} (break-even)\n` : "") +
+        (newSl !== null ? `🛡 Novo SL: $${newSl}\n` : "") +
         (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
         (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "") +
         `Order: ${result.orderId}`
       );
-      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId, breakEvenSl: beSl });
+      return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId, newSl });
     } catch (err) {
       console.log(`  ❌ TP ERROR — ${err.message}`);
       await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro no TP\n${err.message}`);
