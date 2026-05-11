@@ -363,9 +363,23 @@ async function handleWebhook(req, res) {
       console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
 
+      // PnL da operação: (exit - entry) × qty fechada
+      const entryNum = parseFloat(entry_price);
+      const closedQtyNum = parseFloat(result.closedQty);
+      let opPnl = null;
+      if (entryNum && !isNaN(entryNum) && closedQtyNum > 0) {
+        opPnl = openPos.side === "Buy"
+          ? (priceNum - entryNum) * closedQtyNum
+          : (entryNum - priceNum) * closedQtyNum;
+        console.log(`  💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)} (entrada $${entryNum} → saída $${priceNum} × ${closedQtyNum})`);
+      }
+
+      // PnL do dia via Bybit closed-pnl
+      let dailyPnl = null;
+      try { dailyPnl = await getDailyClosedPnl(sym); } catch (_) {}
+
       // Move SL to entry price (break-even) to eliminate remaining risk
       let beSl = null;
-      const entryNum = parseFloat(entry_price);
       if (entryNum && !isNaN(entryNum)) {
         try {
           await setBreakEvenStop(sym, entryNum);
@@ -382,6 +396,8 @@ async function handleWebhook(req, res) {
         `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
         (beSl ? `🛡 SL movido para entrada @ $${beSl} (break-even)\n` : "") +
+        (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
+        (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "") +
         `Order: ${result.orderId}`
       );
       return res.json({ status: "ok", action: "tp", symbol: sym, closedQty: result.closedQty, remainingQty: result.remainingQty, orderId: result.orderId, breakEvenSl: beSl });
