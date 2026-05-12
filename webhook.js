@@ -193,7 +193,8 @@ async function placeOrder(symbol, action, price, lev, atrValue = null) {
   });
   const data = await res.json();
   if (data.retCode !== 0) throw new Error(`Order failed: ${data.retMsg}`);
-  return data.result;
+  // Return order result enriched with SL + sizing info so the caller can use it in logs/Telegram
+  return { ...data.result, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize };
 }
 
 async function fetchCurrentPrice(symbol) {
@@ -289,18 +290,20 @@ async function getDailyClosedPnl(symbol = null) {
   return list.reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
 }
 
-async function setTrailingStop(symbol, action, entryPrice) {
-  const price = await fetchCurrentPrice(symbol);
-  if (!price) return;
-
-  const trailingDistance = (price * CONFIG.trailingStopPct).toFixed(2);
+// atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
+// Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
+async function setTrailingStop(symbol, action, entryPrice, atr = null) {
+  const trailingDistance = atr
+    ? (atr * CONFIG.atrMultiplier).toFixed(2)
+    : (entryPrice * CONFIG.trailingStopPct).toFixed(2);
 
   // Only start trailing once price moves TRAILING_ACTIVATION_PCT in our favour
   const activePrice = action === "buy"
     ? (entryPrice * (1 + CONFIG.trailingActivationPct)).toFixed(2)
     : (entryPrice * (1 - CONFIG.trailingActivationPct)).toFixed(2);
 
-  console.log(`  Trailing stop: distance=$${trailingDistance} | activates @ $${activePrice} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% from entry)`);
+  const src = atr ? `${CONFIG.atrMultiplier}×ATR($${parseFloat(atr).toFixed(4)})` : `${CONFIG.trailingStopPct * 100}% fixo`;
+  console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePrice} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% de lucro)`);
 
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
@@ -585,14 +588,18 @@ async function handleWebhook(body) {
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
-      await setTrailingStop(sym, actionLower, priceNum);
+      await setTrailingStop(sym, actionLower, priceNum, resolvedAtr);
     }
 
-    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", "OK");
+    const slLabel = order.atrUsed
+      ? `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% = ${CONFIG.atrMultiplier}×ATR)`
+      : `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% fixo)`;
+
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", `SL=$${order.slPrice}`);
     await sendTelegram(
       `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
-      `Preço: $${priceNum} | Size: $${CONFIG.tradeSize}\n` +
-      `SL: ${CONFIG.stopLossPct*100}% | TP: via TradingView\n` +
+      `Preço: $${priceNum} | Size: $${order.tradeSize ?? CONFIG.tradeSize}\n` +
+      `SL: ${slLabel} | TP: via TradingView\n` +
       (dailyPnlLine ? `${dailyPnlLine}\n` : "") +
       `Order: ${order.orderId}`
     );
