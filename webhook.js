@@ -31,6 +31,8 @@ const CONFIG = {
   atrMultiplier:    parseFloat(process.env.ATR_MULTIPLIER  || "1.5"),
   atrPeriod:        parseInt(process.env.ATR_PERIOD        || "14"),
   candleInterval:   process.env.CANDLE_INTERVAL            || "15",  // minutes: 1,3,5,15,30,60,120,240,D
+  // Volatility filter: skip trade if ATR-derived SL % exceeds this threshold (0 = disabled)
+  maxSlPct:         parseFloat(process.env.MAX_SL_PCT      || "0"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -546,9 +548,40 @@ async function handleWebhook(body) {
       }
     }
 
+    // Resolve ATR — payload first, then fetch from Bybit candles
     const atrNum = payloadAtr ? parseFloat(payloadAtr) : null;
-    if (atrNum) console.log(`  ATR recebido do payload: $${atrNum.toFixed(4)}`);
-    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, atrNum);
+    let resolvedAtr = atrNum;
+    if (resolvedAtr) {
+      console.log(`  ATR recebido do payload: $${resolvedAtr.toFixed(4)}`);
+    } else {
+      try {
+        resolvedAtr = await fetchATR(sym);
+        console.log(`  ATR(${CONFIG.atrPeriod},${CONFIG.candleInterval}m) calculado: $${resolvedAtr.toFixed(4)}`);
+      } catch (e) {
+        console.log(`  ⚠️  ATR fetch falhou: ${e.message} — SL fixo será usado`);
+      }
+    }
+
+    // ── Volatility filter ─────────────────────────────────────────────────────
+    if (resolvedAtr && CONFIG.maxSlPct > 0) {
+      const slPct = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
+      if (slPct > CONFIG.maxSlPct) {
+        const slPctStr    = (slPct * 100).toFixed(2);
+        const limitPctStr = (CONFIG.maxSlPct * 100).toFixed(1);
+        const msg = `⏸ Sinal ignorado — mercado volátil: SL seria ${slPctStr}% > limite ${limitPctStr}%`;
+        console.log(`  ${msg}`);
+        await sendTelegram(
+          `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
+          `Mercado demasiado volátil para entrar\n` +
+          `ATR(${CONFIG.atrPeriod})=$${resolvedAtr.toFixed(4)} → SL seria ${slPctStr}%\n` +
+          `Limite configurado: ${limitPctStr}%`
+        );
+        return;
+      }
+      console.log(`  ✅ Filtro volatilidade OK: SL ${((resolvedAtr * CONFIG.atrMultiplier / priceNum) * 100).toFixed(2)}% ≤ ${(CONFIG.maxSlPct * 100).toFixed(1)}%`);
+    }
+
+    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, resolvedAtr);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
@@ -582,6 +615,7 @@ app.listen(PORT, () => {
   console.log(`  Leverage : ${CONFIG.leverage}x`);
   console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
   console.log(`  SL       : ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m) × ${CONFIG.atrMultiplier} | fallback ${CONFIG.stopLossPct * 100}%`);
+  console.log(`  Vol.filter: ${CONFIG.maxSlPct > 0 ? `skip se SL > ${(CONFIG.maxSlPct * 100).toFixed(1)}%` : "desativado (MAX_SL_PCT=0)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
