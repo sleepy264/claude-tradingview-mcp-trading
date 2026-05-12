@@ -26,6 +26,11 @@ const CONFIG = {
   maxDailyLossPerSymbol:  parseFloat(process.env.MAX_DAILY_LOSS_PER_SYMBOL || "0"),  // 0 = disabled
   maxDailyLossTotal:      parseFloat(process.env.MAX_DAILY_LOSS_TOTAL      || "0"),  // 0 = disabled
   riskPerTradeUSD:        parseFloat(process.env.RISK_PER_TRADE_USD        || "0"),  // 0 = fixed size
+  // ATR-based SL: SL is placed at ATR_MULTIPLIER × ATR(ATR_PERIOD) from entry
+  // If ATR fetch fails, falls back to STOP_LOSS_PCT
+  atrMultiplier:    parseFloat(process.env.ATR_MULTIPLIER  || "1.5"),
+  atrPeriod:        parseInt(process.env.ATR_PERIOD        || "14"),
+  candleInterval:   process.env.CANDLE_INTERVAL            || "15",  // minutes: 1,3,5,15,30,60,120,240,D
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -85,6 +90,30 @@ async function getInstrumentLotSize(symbol) {
   return { minQty: parseFloat(lot?.minOrderQty || "0.001"), qtyStep: parseFloat(lot?.qtyStep || "0.001") };
 }
 
+// Fetch candles from Bybit and compute simple ATR(period).
+// Bybit kline returns rows newest-first: [time, open, high, low, close, volume, turnover]
+// If TradingView already sends "atr" in the payload, this function is skipped entirely.
+async function fetchATR(symbol) {
+  const limit = CONFIG.atrPeriod + 1; // need one extra candle for the first prev-close
+  const res   = await fetch(
+    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${CONFIG.candleInterval}&limit=${limit}`
+  );
+  const data    = await res.json();
+  const candles = data.result?.list;
+  if (!candles || candles.length < CONFIG.atrPeriod + 1)
+    throw new Error(`ATR: só ${candles?.length ?? 0} velas disponíveis (precisa de ${CONFIG.atrPeriod + 1})`);
+
+  let trSum = 0;
+  for (let i = 0; i < CONFIG.atrPeriod; i++) {
+    const high      = parseFloat(candles[i][2]);
+    const low       = parseFloat(candles[i][3]);
+    const prevClose = parseFloat(candles[i + 1][4]);  // i+1 = older candle
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    trSum += tr;
+  }
+  return trSum / CONFIG.atrPeriod;
+}
+
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
 // Formula: loss = tradeSize × leverage × stopLossPct = riskUSD
 //          tradeSize = riskUSD / (leverage × stopLossPct), capped at maxTradeSize
@@ -101,13 +130,37 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
   return qty.toFixed(decimals);
 }
 
-async function placeOrder(symbol, action, price, lev) {
-  const side      = action === "buy" ? "Buy" : "Sell";
+// atrValue: if provided (from payload or pre-fetched), skips the Bybit candle fetch.
+async function placeOrder(symbol, action, price, lev, atrValue = null) {
+  const side = action === "buy" ? "Buy" : "Sell";
+
+  // ── ATR-based SL ─────────────────────────────────────────────────────────
+  let atr = atrValue;
+  if (!atr) {
+    try {
+      atr = await fetchATR(symbol);
+    } catch (e) {
+      console.log(`  ⚠️  ATR fetch falhou (${e.message}) — a usar SL fixo ${CONFIG.stopLossPct * 100}%`);
+    }
+  }
+
+  let slPct, slDistance;
+  if (atr) {
+    slDistance = atr * CONFIG.atrMultiplier;
+    slPct      = slDistance / price;
+    console.log(`  ATR(${CONFIG.atrPeriod},${CONFIG.candleInterval}m)=$${atr.toFixed(4)} | SL=${CONFIG.atrMultiplier}×ATR=$${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
+  } else {
+    slPct      = CONFIG.stopLossPct;
+    slDistance = price * slPct;
+    console.log(`  SL fixo: ${(slPct * 100).toFixed(2)}%`);
+  }
+
+  // ── Position sizing ───────────────────────────────────────────────────────
   const tradeSize = CONFIG.riskPerTradeUSD > 0
-    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, lev, CONFIG.stopLossPct, CONFIG.tradeSize)
+    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, lev, slPct, CONFIG.tradeSize)
     : CONFIG.tradeSize;
   const tradeSizeMode = CONFIG.riskPerTradeUSD > 0
-    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem)`
+    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
     : `fixo ($${tradeSize})`;
 
   const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
@@ -115,8 +168,9 @@ async function placeOrder(symbol, action, price, lev) {
   console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
   const stopLoss = action === "buy"
-    ? (price * (1 - CONFIG.stopLossPct)).toFixed(2)
-    : (price * (1 + CONFIG.stopLossPct)).toFixed(2);
+    ? (price - slDistance).toFixed(2)
+    : (price + slDistance).toFixed(2);
+  console.log(`  SL: $${stopLoss}`);
   // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
   // to avoid conflict with the half-close + break-even logic
 
@@ -314,7 +368,7 @@ app.post("/webhook", (req, res) => {
 
 async function handleWebhook(body) {
 
-  const { secret, action, symbol, price, leverage, entry_price } = body;
+  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr } = body;
 
   // Validate required fields
   if (!action) {
@@ -492,7 +546,9 @@ async function handleWebhook(body) {
       }
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev);
+    const atrNum = payloadAtr ? parseFloat(payloadAtr) : null;
+    if (atrNum) console.log(`  ATR recebido do payload: $${atrNum.toFixed(4)}`);
+    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, atrNum);
     console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
 
     if (CONFIG.tradeMode === "futures") {
@@ -524,8 +580,9 @@ app.listen(PORT, () => {
   console.log(`  Port     : ${PORT}`);
   console.log(`  Mode     : ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log(`  Leverage : ${CONFIG.leverage}x`);
-  console.log(`  Trade    : $${CONFIG.tradeSize} per signal`);
+  console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
+  console.log(`  SL       : ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m) × ${CONFIG.atrMultiplier} | fallback ${CONFIG.stopLossPct * 100}%`);
   console.log(`  Endpoint : POST /webhook`);
-  console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000 }`);
+  console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
 });
