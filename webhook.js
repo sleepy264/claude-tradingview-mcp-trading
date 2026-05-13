@@ -480,8 +480,7 @@ async function handleWebhook(body) {
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
         (newSl !== null ? `🛡 Novo SL: $${newSl}\n` : "") +
         (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
-        (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "") +
-        `Order: ${result.orderId}`
+        (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "")
       );
       return;
     } catch (err) {
@@ -600,8 +599,7 @@ async function handleWebhook(body) {
       `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
       `Preço: $${priceNum} | Size: $${order.tradeSize ?? CONFIG.tradeSize}\n` +
       `SL: ${slLabel} | TP: via TradingView\n` +
-      (dailyPnlLine ? `${dailyPnlLine}\n` : "") +
-      `Order: ${order.orderId}`
+      (dailyPnlLine ? `${dailyPnlLine}\n` : "")
     );
 
   } catch (err) {
