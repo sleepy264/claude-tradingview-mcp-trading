@@ -33,6 +33,10 @@ const CONFIG = {
   candleInterval:   process.env.CANDLE_INTERVAL            || "15",  // minutes: 1,3,5,15,30,60,120,240,D
   // Volatility filter: skip trade if ATR-derived SL % exceeds this threshold (0 = disabled)
   maxSlPct:         parseFloat(process.env.MAX_SL_PCT      || "0"),
+  // Trend filter: block signals that go considerably against the higher-timeframe trend (0 = disabled)
+  trendInterval:    process.env.TREND_INTERVAL              || "60",  // higher TF for trend (minutes)
+  trendEmaPeriod:   parseInt(process.env.TREND_EMA_PERIOD   || "50"),
+  trendMarginPct:   parseFloat(process.env.TREND_MARGIN_PCT || "0"),  // 0.01 = block if >1% wrong side
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -132,6 +136,28 @@ async function fetchATR(symbol, interval) {
     trSum += tr;
   }
   return trSum / CONFIG.atrPeriod;
+}
+
+// Fetch higher-timeframe candles and compute EMA(period) for trend direction.
+// Returns the EMA value; caller compares to current price to determine trend.
+async function fetchTrendEMA(symbol, interval, period) {
+  const limit = period * 2; // extra candles for EMA warm-up
+  const res   = await fetch(
+    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`
+  );
+  const data    = await res.json();
+  const candles = data.result?.list;
+  if (!candles || candles.length < period)
+    throw new Error(`Trend EMA: só ${candles?.length ?? 0} velas (precisa de ${period})`);
+
+  // Bybit returns newest-first — reverse to oldest-first for sequential EMA
+  const closes = candles.map(c => parseFloat(c[4])).reverse();
+  const k      = 2 / (period + 1);
+  let ema      = closes[0]; // seed with oldest close
+  for (let i = 1; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
 }
 
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
@@ -553,18 +579,60 @@ async function handleWebhook(body) {
       console.log(`  Leverage set to ${effectiveLev}x`);
 
       const openPos = await getOpenPosition(sym);
-      if (openPos) {
-        const openSideLower = openPos.side.toLowerCase();
-        if (openSideLower === actionLower) {
-          console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
-          logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
-          await sendTelegram(`⏭ <b>Bot v2 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
-          return;
+
+      // ── Duplicate signal guard ──────────────────────────────────────────────
+      if (openPos && openPos.side.toLowerCase() === actionLower) {
+        console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
+        logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
+        await sendTelegram(`⏭ <b>Bot v2 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
+        return;
+      }
+
+      // ── Trend filter ────────────────────────────────────────────────────────
+      if (CONFIG.trendMarginPct > 0) {
+        try {
+          const trendInt = toBybitInterval(CONFIG.trendInterval);
+          const ema      = await fetchTrendEMA(sym, trendInt, CONFIG.trendEmaPeriod);
+          const diff     = (priceNum - ema) / ema; // >0 = price above EMA (bullish)
+          const trendDir = diff >= 0 ? "BULLISH" : "BEARISH";
+          console.log(`  Tendência EMA${CONFIG.trendEmaPeriod}(${trendInt}m): $${ema.toFixed(4)} | ${trendDir} | diff=${(diff * 100).toFixed(2)}%`);
+
+          const againstTrend =
+            (actionLower === "buy"  && diff < -CONFIG.trendMarginPct) ||
+            (actionLower === "sell" && diff >  CONFIG.trendMarginPct);
+
+          if (againstTrend) {
+            const diffPct = (Math.abs(diff) * 100).toFixed(2);
+            console.log(`  🚫 ${actionLower.toUpperCase()} bloqueado — ${diffPct}% contra tendência ${trendDir} (margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%)`);
+
+            // Close existing opposite position before blocking the new order
+            if (openPos) {
+              console.log(`  🔄 A fechar ${openPos.side} (qty=${openPos.size}) — sinal contra tendência...`);
+              const closeResult = await closePosition(sym, openPos);
+              console.log(`  ✅ Posição fechada — ${closeResult.orderId}`);
+              logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Fechado — sinal ${actionLower} contra tendência ${trendDir}`);
+            }
+
+            await sendTelegram(
+              `🚫 <b>Bot v2 ${sym}</b> — ${actionLower.toUpperCase()} bloqueado\n` +
+              `Sinal ${diffPct}% contra tendência ${trendDir}\n` +
+              `EMA${CONFIG.trendEmaPeriod}(${trendInt}m): $${ema.toFixed(4)} | Preço: $${priceNum}\n` +
+              (openPos ? `📤 Posição ${openPos.side} fechada` : "Sem posição aberta")
+            );
+            return;
+          }
+          console.log(`  ✅ Filtro tendência OK: ${(Math.abs(diff) * 100).toFixed(2)}% ≤ margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%`);
+        } catch (e) {
+          console.log(`  ⚠️  Trend filter falhou: ${e.message} — a continuar`);
         }
+      }
+
+      // ── Close opposite position (normal reversal) ───────────────────────────
+      if (openPos) {
         console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size}) before opening ${actionLower.toUpperCase()}...`);
         const closeResult = await closePosition(sym, openPos);
         console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
-        logTrade(sym, openSideLower === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${openPos.side} — reversing to ${actionLower}`);
+        logTrade(sym, openPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${openPos.side} — reversing to ${actionLower}`);
       }
     }
 
@@ -643,6 +711,7 @@ app.listen(PORT, () => {
   console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
   console.log(`  SL       : ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m) × ${CONFIG.atrMultiplier} | fallback ${CONFIG.stopLossPct * 100}%`);
   console.log(`  Vol.filter: ${CONFIG.maxSlPct > 0 ? `skip se SL > ${(CONFIG.maxSlPct * 100).toFixed(1)}%` : "desativado (MAX_SL_PCT=0)"}`);
+  console.log(`  Tendência : ${CONFIG.trendMarginPct > 0 ? `EMA${CONFIG.trendEmaPeriod}(${CONFIG.trendInterval}m) | margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%` : "desativado (TREND_MARGIN_PCT=0)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
