@@ -399,14 +399,33 @@ function mexcHeaders(timestamp, signature) {
 // Calculated from entry/exit prices — no MEXC API call needed.
 // PnL = (exitPrice - entryPrice) / entryPrice × tradeSize × leverage  (long)
 // PnL = (entryPrice - exitPrice) / entryPrice × tradeSize × leverage  (short)
-// Resets at midnight UTC or on bot restart.
+// Persisted to daily-pnl.json so restarts don't reset the daily total.
 
-let _dailyPnl = { date: "", total: 0 };
+const PNL_FILE = "daily-pnl.json";
 
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
+function _loadDailyPnl() {
+  try {
+    if (existsSync(PNL_FILE)) {
+      const data = JSON.parse(readFileSync(PNL_FILE, "utf8"));
+      if (data.date === _todayUTC()) return data;
+    }
+  } catch {}
+  return { date: _todayUTC(), total: 0 };
+}
+
+function _saveDailyPnl(pnl) {
+  try { writeFileSync(PNL_FILE, JSON.stringify(pnl)); } catch {}
+}
+
+let _dailyPnl = _loadDailyPnl();  // survives restarts within the same day
+
 function getDailyClosedPnl() {
-  if (_dailyPnl.date !== _todayUTC()) _dailyPnl = { date: _todayUTC(), total: 0 };
+  if (_dailyPnl.date !== _todayUTC()) {
+    _dailyPnl = { date: _todayUTC(), total: 0 };
+    _saveDailyPnl(_dailyPnl);
+  }
   return _dailyPnl.total;
 }
 
@@ -417,6 +436,7 @@ function addDailyPnl(entryPrice, exitPrice, side, tradeSize, leverage, fraction 
     : (entryPrice - exitPrice) / entryPrice;
   const pnl = pct * tradeSize * leverage * fraction;
   _dailyPnl.total += pnl;
+  _saveDailyPnl(_dailyPnl);
   console.log(`  📊 PnL sessão: $${_dailyPnl.total.toFixed(2)} (este fecho: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)})`);
 }
 
