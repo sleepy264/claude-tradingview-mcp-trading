@@ -92,13 +92,31 @@ async function getInstrumentLotSize(symbol) {
   return { minQty: parseFloat(lot?.minOrderQty || "0.001"), qtyStep: parseFloat(lot?.qtyStep || "0.001") };
 }
 
+// Bybit supports these kline intervals (minutes, or D/W/M).
+// TradingView may send unsupported values (e.g. "2") — map to nearest supported.
+const BYBIT_INTERVALS = [1, 3, 5, 15, 30, 60, 120, 240, 360, 720];
+
+function toBybitInterval(tvInterval) {
+  const str = String(tvInterval || "").toUpperCase();
+  if (["D", "W", "M"].includes(str)) return str;
+  const num = parseInt(str);
+  if (isNaN(num)) return CONFIG.candleInterval; // fallback to config default
+  if (BYBIT_INTERVALS.includes(num)) return String(num);
+  // Map to nearest supported numeric interval
+  const nearest = BYBIT_INTERVALS.reduce((a, b) =>
+    Math.abs(b - num) < Math.abs(a - num) ? b : a
+  );
+  console.log(`  ⚠️  Intervalo ${num}m não suportado pela Bybit — a usar ${nearest}m`);
+  return String(nearest);
+}
+
 // Fetch candles from Bybit and compute simple ATR(period).
-// Bybit kline returns rows newest-first: [time, open, high, low, close, volume, turnover]
+// interval: Bybit-compatible interval string — derived from TradingView payload or CANDLE_INTERVAL.
 // If TradingView already sends "atr" in the payload, this function is skipped entirely.
-async function fetchATR(symbol) {
+async function fetchATR(symbol, interval) {
   const limit = CONFIG.atrPeriod + 1; // need one extra candle for the first prev-close
   const res   = await fetch(
-    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${CONFIG.candleInterval}&limit=${limit}`
+    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`
   );
   const data    = await res.json();
   const candles = data.result?.list;
@@ -140,7 +158,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null) {
   let atr = atrValue;
   if (!atr) {
     try {
-      atr = await fetchATR(symbol);
+      atr = await fetchATR(symbol, CONFIG.candleInterval);
     } catch (e) {
       console.log(`  ⚠️  ATR fetch falhou (${e.message}) — a usar SL fixo ${CONFIG.stopLossPct * 100}%`);
     }
@@ -373,7 +391,7 @@ app.post("/webhook", (req, res) => {
 
 async function handleWebhook(body) {
 
-  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr } = body;
+  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr, interval: payloadInterval } = body;
 
   // Validate required fields
   if (!action) {
@@ -550,15 +568,19 @@ async function handleWebhook(body) {
       }
     }
 
-    // Resolve ATR — payload first, then fetch from Bybit candles
+    // Resolve interval — payload {{interval}} takes priority over CANDLE_INTERVAL env var
+    const candleInterval = toBybitInterval(payloadInterval || CONFIG.candleInterval);
+    if (payloadInterval) console.log(`  Intervalo do payload: ${payloadInterval} → Bybit: ${candleInterval}m`);
+
+    // Resolve ATR — payload first, then fetch from Bybit candles using signal's own interval
     const atrNum = payloadAtr ? parseFloat(payloadAtr) : null;
     let resolvedAtr = atrNum;
     if (resolvedAtr) {
       console.log(`  ATR recebido do payload: $${resolvedAtr.toFixed(4)}`);
     } else {
       try {
-        resolvedAtr = await fetchATR(sym);
-        console.log(`  ATR(${CONFIG.atrPeriod},${CONFIG.candleInterval}m) calculado: $${resolvedAtr.toFixed(4)}`);
+        resolvedAtr = await fetchATR(sym, candleInterval);
+        console.log(`  ATR(${CONFIG.atrPeriod},${candleInterval}m) calculado: $${resolvedAtr.toFixed(4)}`);
       } catch (e) {
         console.log(`  ⚠️  ATR fetch falhou: ${e.message} — SL fixo será usado`);
       }
@@ -575,7 +597,7 @@ async function handleWebhook(body) {
         await sendTelegram(
           `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
           `Mercado demasiado volátil para entrar\n` +
-          `ATR(${CONFIG.atrPeriod})=$${resolvedAtr.toFixed(4)} → SL seria ${slPctStr}%\n` +
+          `ATR(${CONFIG.atrPeriod},${candleInterval}m)=$${resolvedAtr.toFixed(4)} → SL seria ${slPctStr}%\n` +
           `Limite configurado: ${limitPctStr}%`
         );
         return;
