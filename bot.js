@@ -1205,7 +1205,7 @@ async function run() {
         logEntry.takeProfit = tp2Price;
         console.log(`✅ ORDER PLACED — ${order.orderId} | SL: $${stopPrice} | TP1: $${tp1Price} | TP2: $${tp2Price}`);
         const pnlLive = getDailyClosedPnl();
-        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)} | Lev: ${effectiveLeverage}x\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\nOrder: ${order.orderId}\n📊 PnL hoje: $${pnlLive.toFixed(2)}`);
+        await sendTelegram(`✅ <b>Bot v1 ${CONFIG.symbol}</b> — LIVE ${direction}\nPreço: $${price.toFixed(2)} | Size: $${tradeSize.toFixed(2)} | Lev: ${effectiveLeverage}x\nSL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)\n📊 PnL hoje: $${pnlLive.toFixed(2)}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
