@@ -259,7 +259,12 @@ async function getOpenPosition(symbol) {
   const position = data.result?.list?.[0];
   if (!position) return null;
   const size = parseFloat(position.size);
-  return size > 0 ? { side: position.side, size, stopLoss: parseFloat(position.stopLoss || "0") } : null;
+  return size > 0 ? {
+    side:     position.side,
+    size,
+    stopLoss: parseFloat(position.stopLoss  || "0"),
+    avgPrice: parseFloat(position.avgPrice  || "0"),  // entry price from Bybit — reliable even after partial closes
+  } : null;
 }
 
 async function closePosition(symbol, position) {
@@ -474,11 +479,15 @@ async function handleWebhook(body) {
       console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
 
+      // Entry price — use Bybit's avgPrice (always reliable) with payload entry_price as fallback
+      const entryNum = (openPos.avgPrice > 0 ? openPos.avgPrice : null)
+                    ?? (parseFloat(entry_price) > 0 ? parseFloat(entry_price) : null);
+      if (entryNum) console.log(`  Entry price: $${entryNum} (${openPos.avgPrice > 0 ? "Bybit avgPrice" : "payload entry_price"})`);
+
       // PnL da operação: (exit - entry) × qty fechada
-      const entryNum = parseFloat(entry_price);
       const closedQtyNum = parseFloat(result.closedQty);
       let opPnl = null;
-      if (entryNum && !isNaN(entryNum) && closedQtyNum > 0) {
+      if (entryNum && closedQtyNum > 0) {
         opPnl = openPos.side === "Buy"
           ? (priceNum - entryNum) * closedQtyNum
           : (entryNum - priceNum) * closedQtyNum;
@@ -494,7 +503,7 @@ async function handleWebhook(body) {
       //   TP2+: current SL ≈ entry_price → move SL to midpoint(currentSL, TP_price)
       //         midpoint moves SL up for longs, down for shorts — always tighter
       let newSl = null;
-      if (entryNum && !isNaN(entryNum)) {
+      if (entryNum) {
         try {
           // Re-fetch position to get current SL after the half-close settled
           const posAfter = await getOpenPosition(sym);
