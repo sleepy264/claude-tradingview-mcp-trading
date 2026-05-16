@@ -346,23 +346,40 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
     ? (atr * CONFIG.atrMultiplier).toFixed(2)
     : (entryPrice * CONFIG.trailingStopPct).toFixed(2);
 
-  // Only start trailing once price moves TRAILING_ACTIVATION_PCT in our favour
-  const activePrice = action === "buy"
-    ? (entryPrice * (1 + CONFIG.trailingActivationPct)).toFixed(2)
-    : (entryPrice * (1 - CONFIG.trailingActivationPct)).toFixed(2);
+  // Desired activation price (TRAILING_ACTIVATION_PCT in profit from entry)
+  const activePriceNum = action === "buy"
+    ? entryPrice * (1 + CONFIG.trailingActivationPct)
+    : entryPrice * (1 - CONFIG.trailingActivationPct);
+
+  // Check current price — if it already passed activePriceNum, Bybit rejects activePrice.
+  // In that case omit it: trailing activates immediately (correct behaviour).
+  const currentPrice = await fetchCurrentPrice(symbol);
+  const alreadyActivated = currentPrice > 0 && (
+    action === "buy"  ? currentPrice >= activePriceNum :
+                        currentPrice <= activePriceNum
+  );
 
   const src = atr ? `${CONFIG.atrMultiplier}×ATR($${parseFloat(atr).toFixed(4)})` : `${CONFIG.trailingStopPct * 100}% fixo`;
-  console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePrice} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% de lucro)`);
+  if (alreadyActivated) {
+    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${activePriceNum.toFixed(2)})`);
+  } else {
+    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePriceNum.toFixed(2)} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% de lucro)`);
+  }
 
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
-  const body       = JSON.stringify({ category: "linear", symbol, trailingStop: trailingDistance, activePrice, positionIdx: 0 });
-  const sig        = sign(timestamp, recvWindow, body);
-  await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
+  const orderBody  = alreadyActivated
+    ? { category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 }
+    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: activePriceNum.toFixed(2), positionIdx: 0 };
+  const body = JSON.stringify(orderBody);
+  const sig  = sign(timestamp, recvWindow, body);
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
     body,
   });
+  const data = await res.json();
+  if (data.retCode !== 0) console.log(`  ⚠️  Trailing stop falhou: ${data.retMsg}`);
 }
 
 // ─── Webhook endpoint ─────────────────────────────────────────────────────────
