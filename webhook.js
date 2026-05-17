@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
-import { appendFileSync, existsSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -37,6 +37,18 @@ const CONFIG = {
   trendInterval:    process.env.TREND_INTERVAL              || "60",  // higher TF for trend (minutes)
   trendEmaPeriod:   parseInt(process.env.TREND_EMA_PERIOD   || "50"),
   trendMarginPct:   parseFloat(process.env.TREND_MARGIN_PCT || "0"),  // 0.01 = block if >1% wrong side
+  // Chase Limit: try limit order at bid/ask (maker fee 0.02%) before falling back to market (taker 0.055%)
+  chaseLimitEnabled:    process.env.CHASE_LIMIT             !== "false",  // true by default
+  chaseLimitTimeoutMs:  parseInt(process.env.CHASE_LIMIT_TIMEOUT_MS || "3000"),
+  // Break-even SL buffer: on TP1, SL moves to entry ± (ATR × this multiplier) instead of exact entry.
+  // Prevents SL from triggering on micro-retracements right after TP1. Set to 0 to disable.
+  breakEvenBufferAtr:   parseFloat(process.env.BREAK_EVEN_BUFFER_ATR || "0.3"),
+  // Fee viability filter: skip trade if expected TP1 profit < round-trip fees × this threshold (0 = disabled)
+  feeViabilityThreshold: parseFloat(process.env.FEE_VIABILITY_THRESHOLD || "1.5"),
+  // Cooldown after inferred SL: block same-symbol same-direction re-entry for this many ms (0 = disabled)
+  cooldownAfterSlMs:    parseInt(process.env.COOLDOWN_AFTER_SL_MS || "900000"),  // default 15 min
+  // Max SL hits per symbol per day before blocking all new entries for that symbol (0 = disabled)
+  maxSlPerSymbol:       parseInt(process.env.MAX_SL_PER_SYMBOL || "0"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -53,6 +65,93 @@ function logTrade(symbol, action, price, sizeUSD, orderId, mode, notes) {
   const ts  = new Date().toISOString();
   const row = [ts, symbol, action.toUpperCase(), price, sizeUSD, orderId, mode, `"${notes}"`].join(",");
   appendFileSync(LOG_FILE, row + "\n");
+}
+
+// ─── Symbol State (cooldown + SL tracking) ───────────────────────────────────
+// Tracks per-symbol: last buy/sell signal time, last TP time, daily SL count.
+// Persisted to disk so Railway restarts don't reset the state.
+
+const SYMBOL_STATE_FILE = "symbol-state.json";
+let symbolState = {};
+
+function loadSymbolState() {
+  try {
+    if (existsSync(SYMBOL_STATE_FILE))
+      symbolState = JSON.parse(readFileSync(SYMBOL_STATE_FILE, "utf8"));
+  } catch { symbolState = {}; }
+}
+
+function saveSymbolState() {
+  try { writeFileSync(SYMBOL_STATE_FILE, JSON.stringify(symbolState, null, 2)); } catch {}
+}
+
+function _getSymState(symbol) {
+  if (!symbolState[symbol]) symbolState[symbol] = {};
+  return symbolState[symbol];
+}
+
+function _todayUTC() { return new Date().toISOString().slice(0, 10); }
+
+// Called after a BUY/SELL order is successfully placed.
+function recordSignalPlaced(symbol, action) {
+  const s = _getSymState(symbol);
+  if (action === "buy") s.lastBuyTime = Date.now();
+  else                  s.lastSellTime = Date.now();
+  saveSymbolState();
+}
+
+// Called when a TP signal is processed (position closed naturally, not by SL).
+function recordTpReceived(symbol) {
+  _getSymState(symbol).lastTpTime = Date.now();
+  saveSymbolState();
+}
+
+// Check if a new entry should be blocked due to cooldown or daily SL limit.
+// Logic:
+//   SL inferred when: no open position + recently placed same-dir signal + no TP received after it.
+//   If SL inferred → increment daily counter → check cooldown and daily limit.
+// Returns { blocked, reason } — side-effect: persists SL count if SL is inferred.
+function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
+  const s     = _getSymState(symbol);
+  const today = _todayUTC();
+  const now   = Date.now();
+
+  // Reset daily counter on new UTC day
+  if (s.slDate !== today) { s.slCountToday = 0; s.slDate = today; }
+
+  const lastSameDir = action === "buy" ? s.lastBuyTime : s.lastSellTime;
+  if (!lastSameDir) return { blocked: false }; // no previous signal → nothing to infer
+
+  const elapsed       = now - lastSameDir;
+  const tpAfterSignal = s.lastTpTime && s.lastTpTime > lastSameDir;
+
+  // SL inferred: no open position + same-dir signal within 24h + no TP received after it
+  const slInferred = !hasOpenPosition && elapsed < 24 * 60 * 60 * 1000 && !tpAfterSignal;
+  if (!slInferred) return { blocked: false };
+
+  // Increment SL counter
+  s.slCountToday = (s.slCountToday || 0) + 1;
+  saveSymbolState();
+  console.log(`  📊 SL inferido em ${symbol} (${action}) — ${s.slCountToday}× hoje`);
+
+  // Check daily SL limit
+  if (CONFIG.maxSlPerSymbol > 0 && s.slCountToday >= CONFIG.maxSlPerSymbol) {
+    return {
+      blocked: true,
+      reason: `🛑 ${symbol} bloqueado — ${s.slCountToday} SL hoje (limite: ${CONFIG.maxSlPerSymbol}/dia)`,
+    };
+  }
+
+  // Check cooldown
+  if (CONFIG.cooldownAfterSlMs > 0 && elapsed < CONFIG.cooldownAfterSlMs) {
+    const remainingMin = Math.ceil((CONFIG.cooldownAfterSlMs - elapsed) / 60000);
+    return {
+      blocked: true,
+      reason: `⏸ Cooldown após SL em ${symbol} (${action}) — aguarda ${remainingMin}min`,
+    };
+  }
+
+  return { blocked: false }; // SL inferred but cooldown already passed — allow entry
 }
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
@@ -112,6 +211,45 @@ function toBybitInterval(tvInterval) {
   );
   console.log(`  ⚠️  Intervalo ${num}m não suportado pela Bybit — a usar ${nearest}m`);
   return String(nearest);
+}
+
+// Fetch current best bid and ask prices for a symbol.
+async function fetchBidAsk(symbol) {
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
+  const data = await res.json();
+  const t    = data.result?.list?.[0];
+  if (!t) throw new Error(`fetchBidAsk: sem dados de ticker para ${symbol}`);
+  return { bid: parseFloat(t.bid1Price), ask: parseFloat(t.ask1Price) };
+}
+
+// Query the status of an open/recent order.
+// Returns orderStatus string (e.g. "New", "Filled", "PartiallyFilled", "Cancelled") or null on error.
+async function getOrderStatus(symbol, orderId) {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = `category=linear&symbol=${symbol}&orderId=${orderId}`;
+  const sig        = sign(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/realtime?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  return data.result?.list?.[0]?.orderStatus ?? null;
+}
+
+// Cancel an open order by orderId.
+async function cancelOrder(symbol, orderId) {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const body       = JSON.stringify({ category: "linear", symbol, orderId });
+  const sig        = sign(timestamp, recvWindow, body);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) console.log(`  ⚠️  Cancelamento de ordem falhou: ${data.retMsg}`);
+  return data;
 }
 
 // Fetch candles from Bybit and compute simple ATR(period).
@@ -177,6 +315,8 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
 }
 
 // atrValue: if provided (from payload or pre-fetched), skips the Bybit candle fetch.
+// Returns { orderId, slPrice, slPct, slDistance, atrUsed, tradeSize, filledAs }
+//   filledAs: "maker" (limit filled) | "taker" (market fallback)
 async function placeOrder(symbol, action, price, lev, atrValue = null) {
   const side = action === "buy" ? "Buy" : "Sell";
 
@@ -194,7 +334,8 @@ async function placeOrder(symbol, action, price, lev, atrValue = null) {
   if (atr) {
     slDistance = atr * CONFIG.atrMultiplier;
     slPct      = slDistance / price;
-    console.log(`  ATR(${CONFIG.atrPeriod},${CONFIG.candleInterval}m)=$${atr.toFixed(4)} | SL=${CONFIG.atrMultiplier}×ATR=$${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
+    // Note: interval label omitted here — already logged in handleWebhook when ATR was resolved
+    console.log(`  ATR=$${atr.toFixed(4)} | SL=${CONFIG.atrMultiplier}×ATR=$${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
   } else {
     slPct      = CONFIG.stopLossPct;
     slDistance = price * slPct;
@@ -220,25 +361,91 @@ async function placeOrder(symbol, action, price, lev, atrValue = null) {
   // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
   // to avoid conflict with the half-close + break-even logic
 
-  const orderBody = CONFIG.tradeMode === "futures"
-    ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
-        stopLoss, slTriggerBy: "LastPrice" }
-    : { category: "spot", symbol, side, orderType: "Market", qty: quantity };
+  // ── Chase Limit → Market fallback ────────────────────────────────────────
+  // 1st attempt: Limit order at current bid (buy) or ask (sell) → maker fee 0.02%
+  // If not filled within CHASE_LIMIT_TIMEOUT_MS → cancel → Market order → taker fee 0.055%
+  let orderId  = null;
+  let filledAs = "taker";
 
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const body       = JSON.stringify(orderBody);
-  const sig        = sign(timestamp, recvWindow, body);
+  if (CONFIG.chaseLimitEnabled && CONFIG.tradeMode === "futures") {
+    try {
+      const { bid, ask } = await fetchBidAsk(symbol);
+      const limitPrice   = (action === "buy" ? bid : ask).toFixed(2);
+      console.log(`  🎯 Chase Limit @ $${limitPrice} (${action === "buy" ? "bid" : "ask"}) — aguarda ${CONFIG.chaseLimitTimeoutMs}ms`);
 
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Order failed: ${data.retMsg}`);
-  // Return order result enriched with SL + sizing info so the caller can use it in logs/Telegram
-  return { ...data.result, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize };
+      const limitBody = JSON.stringify({
+        category: "linear", symbol, side,
+        orderType: "Limit",
+        price: limitPrice,
+        qty: quantity,
+        timeInForce: "GTC",
+        stopLoss, slTriggerBy: "LastPrice",
+        positionIdx: 0,
+      });
+      const ts1  = (Date.now() - 1500).toString();
+      const rw1  = "10000";
+      const sig1 = sign(ts1, rw1, limitBody);
+      const res1 = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig1, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts1, "X-BAPI-RECV-WINDOW": rw1 },
+        body: limitBody,
+      });
+      const d1 = await res1.json();
+
+      if (d1.retCode === 0) {
+        const limitOrderId = d1.result?.orderId;
+        // Wait for potential fill
+        await new Promise(r => setTimeout(r, CONFIG.chaseLimitTimeoutMs));
+        const status = await getOrderStatus(symbol, limitOrderId);
+        console.log(`  Status após ${CONFIG.chaseLimitTimeoutMs}ms: ${status ?? "desconhecido"}`);
+
+        if (status === "Filled") {
+          orderId  = limitOrderId;
+          filledAs = "maker";
+          console.log(`  ✅ LIMIT FILLED — taxa maker 0.02%`);
+        } else if (status === "PartiallyFilled") {
+          // Accept partial fill, cancel remaining to avoid open limit sitting in book
+          await cancelOrder(symbol, limitOrderId);
+          orderId  = limitOrderId;
+          filledAs = "maker";
+          console.log(`  ✅ LIMIT PARCIALMENTE FILLED — restante cancelado | taxa maker 0.02%`);
+        } else {
+          // Not filled → cancel and fall through to market
+          console.log(`  ⚠️  Limit não encheu (${status ?? "unknown"}) — a cancelar → Market`);
+          await cancelOrder(symbol, limitOrderId);
+        }
+      } else {
+        console.log(`  ⚠️  Limit rejeitada pela Bybit (${d1.retMsg}) — a usar Market`);
+      }
+    } catch (e) {
+      console.log(`  ⚠️  Chase Limit erro (${e.message}) — a usar Market`);
+    }
+  }
+
+  // ── Market order (fallback ou direto se chase limit desativado) ───────────
+  if (!orderId) {
+    const marketBody = JSON.stringify(
+      CONFIG.tradeMode === "futures"
+        ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
+            stopLoss, slTriggerBy: "LastPrice" }
+        : { category: "spot", symbol, side, orderType: "Market", qty: quantity }
+    );
+    const ts2  = (Date.now() - 1500).toString();
+    const rw2  = "10000";
+    const sig2 = sign(ts2, rw2, marketBody);
+    const res2 = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig2, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts2, "X-BAPI-RECV-WINDOW": rw2 },
+      body: marketBody,
+    });
+    const d2 = await res2.json();
+    if (d2.retCode !== 0) throw new Error(`Order failed: ${d2.retMsg}`);
+    orderId  = d2.result?.orderId;
+    filledAs = "taker";
+    console.log(`  ✅ MARKET ORDER — taxa taker 0.055%`);
+  }
+
+  return { orderId, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize, filledAs };
 }
 
 async function fetchCurrentPrice(symbol) {
@@ -495,6 +702,7 @@ async function handleWebhook(body) {
       const result = await closeHalfPosition(sym, openPos);
       console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
+      recordTpReceived(sym);
 
       // Entry price — use Bybit's avgPrice (always reliable) with payload entry_price as fallback
       const entryNum = (openPos.avgPrice > 0 ? openPos.avgPrice : null)
@@ -533,9 +741,22 @@ async function handleWebhook(body) {
             newSl = parseFloat(((currentSl + priceNum) / 2).toFixed(2));
             console.log(`  ✅ SL progressivo (TP2+): $${currentSl} → $${newSl} (meio entre $${currentSl} e $${priceNum})`);
           } else {
-            // TP1 — move SL to entry price (break-even)
-            newSl = parseFloat(entryNum.toFixed(2));
-            console.log(`  ✅ SL break-even (TP1): → $${newSl}`);
+            // TP1 — move SL to entry ± ATR buffer (avoids micro-retracções a bater no SL)
+            let beBuffer = 0;
+            if (CONFIG.breakEvenBufferAtr > 0) {
+              try {
+                const beAtr = await fetchATR(sym, CONFIG.candleInterval);
+                beBuffer    = beAtr * CONFIG.breakEvenBufferAtr;
+              } catch {}
+            }
+            const beSl = openPos.side === "Buy"
+              ? entryNum - beBuffer   // long: SL ligeiramente abaixo da entrada
+              : entryNum + beBuffer;  // short: SL ligeiramente acima da entrada
+            newSl = parseFloat(beSl.toFixed(2));
+            const bufLabel = beBuffer > 0
+              ? ` (entry $${entryNum} ${openPos.side === "Buy" ? "-" : "+"} ${CONFIG.breakEvenBufferAtr}×ATR=$${beBuffer.toFixed(2)})`
+              : "";
+            console.log(`  ✅ SL break-even (TP1): → $${newSl}${bufLabel}`);
           }
           await setBreakEvenStop(sym, newSl);
         } catch (e) {
@@ -605,6 +826,15 @@ async function handleWebhook(body) {
       console.log(`  Leverage set to ${effectiveLev}x`);
 
       const openPos = await getOpenPosition(sym);
+
+      // ── Cooldown + daily SL limit ───────────────────────────────────────────
+      const cooldownCheck = checkCooldownAndSlLimit(sym, actionLower, !!openPos);
+      if (cooldownCheck.blocked) {
+        console.log(`  ${cooldownCheck.reason}`);
+        logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "BLOCKED", cooldownCheck.reason);
+        await sendTelegram(`${cooldownCheck.reason}\n<b>Bot v2 ${sym}</b> — sinal ${actionLower.toUpperCase()} ignorado`);
+        return;
+      }
 
       // ── Duplicate signal guard ──────────────────────────────────────────────
       if (openPos && openPos.side.toLowerCase() === actionLower) {
@@ -680,6 +910,24 @@ async function handleWebhook(body) {
       }
     }
 
+    // ── Fee viability filter ──────────────────────────────────────────────────
+    // Skip trade if expected TP1 profit (1:1 RR, half position) < round-trip fees × threshold.
+    // Uses worst-case taker fee (0.055%) for both sides — if chase limit fires, we're even better off.
+    if (CONFIG.feeViabilityThreshold > 0 && resolvedAtr) {
+      const slPct           = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
+      const notional        = CONFIG.tradeSize * effectiveLev;
+      const feesRoundTrip   = notional * 0.00055 * 2;            // taker 0.055% × 2 sides
+      const expectedTp1     = notional * slPct * 0.5;            // 1:1 RR on half position at TP1
+      const minRequired     = feesRoundTrip * CONFIG.feeViabilityThreshold;
+      if (expectedTp1 < minRequired) {
+        const msg = `⏸ Trade ignorado — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas ($${feesRoundTrip.toFixed(2)}) × ${CONFIG.feeViabilityThreshold}`;
+        console.log(`  ${msg}`);
+        await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nSL% ${(slPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
+        return;
+      }
+      console.log(`  ✅ Viabilidade taxas OK: TP1 $${expectedTp1.toFixed(2)} ≥ taxas $${feesRoundTrip.toFixed(2)} × ${CONFIG.feeViabilityThreshold}`);
+    }
+
     // ── Volatility filter ─────────────────────────────────────────────────────
     if (resolvedAtr && CONFIG.maxSlPct > 0) {
       const slPct = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
@@ -700,21 +948,27 @@ async function handleWebhook(body) {
     }
 
     const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, resolvedAtr);
-    console.log(`  ✅ ORDER PLACED — ${order.orderId}`);
+    const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
+    console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
+    recordSignalPlaced(sym, actionLower);
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(sym, actionLower, priceNum, resolvedAtr);
     }
 
-    const slLabel = order.atrUsed
+    const slLabel  = order.atrUsed
       ? `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% = ${CONFIG.atrMultiplier}×ATR)`
       : `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% fixo)`;
+    const feeLabel = order.filledAs === "maker"
+      ? "maker 0.02% 💚"
+      : "taker 0.055%";
 
-    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", `SL=$${order.slPrice}`);
+    logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", `SL=$${order.slPrice} | fee=${order.filledAs}`);
     await sendTelegram(
       `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
       `Preço: $${priceNum} | Size: $${order.tradeSize ?? CONFIG.tradeSize}\n` +
       `SL: ${slLabel} | TP: via TradingView\n` +
+      `Taxa: ${feeLabel}\n` +
       (dailyPnlLine ? `${dailyPnlLine}\n` : "")
     );
 
@@ -728,6 +982,7 @@ async function handleWebhook(body) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 initCsv();
+loadSymbolState();
 app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  TradingView Webhook Bot v2");
@@ -738,6 +993,10 @@ app.listen(PORT, () => {
   console.log(`  SL       : ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m) × ${CONFIG.atrMultiplier} | fallback ${CONFIG.stopLossPct * 100}%`);
   console.log(`  Vol.filter: ${CONFIG.maxSlPct > 0 ? `skip se SL > ${(CONFIG.maxSlPct * 100).toFixed(1)}%` : "desativado (MAX_SL_PCT=0)"}`);
   console.log(`  Tendência : ${CONFIG.trendMarginPct > 0 ? `EMA${CONFIG.trendEmaPeriod}(${CONFIG.trendInterval}m) | margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%` : "desativado (TREND_MARGIN_PCT=0)"}`);
+  console.log(`  Chase Limit: ${CONFIG.chaseLimitEnabled ? `ativo — timeout ${CONFIG.chaseLimitTimeoutMs}ms → fallback Market` : "desativado (sempre Market)"}`);
+  console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
+  console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
+  console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
