@@ -504,8 +504,18 @@ async function getOpenPosition(symbol) {
   const pos  = list[0];
   const size = parseFloat(pos.holdVol);
   if (size <= 0) return null;
-  // unrealisedPnl: MEXC field name (British spelling); fall back to 0 if absent
-  const unrealizedPnl = parseFloat(pos.unrealisedPnl ?? pos.unrealizedPnl ?? 0);
+
+  // Log raw position fields once so we can confirm the exact MEXC field names
+  const pnlFields = Object.fromEntries(
+    Object.entries(pos).filter(([k]) => /pnl|profit|loss/i.test(k))
+  );
+  console.log(`  [debug] MEXC pos PnL fields: ${JSON.stringify(pnlFields)}`);
+
+  // Try known MEXC field names; if none found, set to null (unknown — not 0)
+  const rawPnl = pos.unrealisedPnl ?? pos.unrealizedPnl ?? pos.unRealizedPnl
+               ?? pos.positionPnl ?? pos.openPositionPnl ?? null;
+  const unrealizedPnl = rawPnl !== null ? parseFloat(rawPnl) : null;
+
   return { side: pos.positionType === 1 ? "Buy" : "Sell", size, unrealizedPnl };
 }
 
@@ -1284,21 +1294,27 @@ async function run() {
 
             } else if (isOpposite) {
               // Opposite position open — conditional reversal
-              const pnl    = openPos.unrealizedPnl ?? 0;
-              const lossOk = pnl >= -CONFIG.maxReversalLossUSD;
+              const pnl        = openPos.unrealizedPnl; // null = field not found in MEXC response
+              const pnlKnown   = pnl !== null && !isNaN(pnl);
+              // If PnL is unknown (field not mapped), treat conservatively as a large loss → block
+              const lossOk     = pnlKnown && pnl >= -CONFIG.maxReversalLossUSD;
+              const pnlDisplay = pnlKnown ? `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}` : "desconhecido";
 
-              console.log(`  🔄 Posição oposta detectada: ${openPos.side} qty=${openPos.size} | PnL não realizado: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`);
+              console.log(`  🔄 Posição oposta detectada: ${openPos.side} qty=${openPos.size} | PnL não realizado: ${pnlDisplay}`);
 
               if (lossOk) {
-                console.log(`  ✅ Perda (${pnl.toFixed(2)}) dentro do limite (-$${CONFIG.maxReversalLossUSD}) — a fechar e reverter para ${tradeSide.toUpperCase()}...`);
+                console.log(`  ✅ Perda ($${pnl.toFixed(2)}) dentro do limite (-$${CONFIG.maxReversalLossUSD}) — a fechar e reverter para ${tradeSide.toUpperCase()}...`);
                 await closePosition(CONFIG.symbol, openSide, `Reversão → ${tradeSide}`);
                 // Proceed — placeMexcOrder will open the new position below
               } else {
-                const msg = `⏸ Reversão bloqueada — ${openPos.side} tem PnL $${pnl.toFixed(2)} (limite: -$${CONFIG.maxReversalLossUSD})\nA aguardar redução do risco antes de reverter`;
+                const reason = pnlKnown
+                  ? `PnL $${pnl.toFixed(2)} (limite: -$${CONFIG.maxReversalLossUSD})`
+                  : `PnL desconhecido — campo não mapeado na resposta MEXC (ver log [debug])`;
+                const msg = `⏸ Reversão bloqueada — ${openPos.side} tem ${reason}\nA aguardar redução do risco antes de reverter`;
                 console.log(`  ${msg}`);
                 await sendTelegram(`⏸ <b>Bot v1 ${CONFIG.symbol}</b> — Sinal ${tradeSide.toUpperCase()} válido\n${msg}`);
-                logEntry.error = `Reversal blocked: pnl=$${pnl.toFixed(2)} < -$${CONFIG.maxReversalLossUSD}`;
-                throw new Error(`Reversal blocked — unrealized loss too high`);
+                logEntry.error = `Reversal blocked: ${reason}`;
+                throw new Error(`Reversal blocked — ${reason}`);
               }
 
             } else {
