@@ -83,6 +83,9 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "futures",
+  // Conditional reversal: if an opposite position is open, only close+reverse if
+  // unrealized loss is below this threshold. 0 = only reverse if in profit/break-even.
+  maxReversalLossUSD: parseFloat(process.env.MAX_REVERSAL_LOSS_USD || "1"),
   mexc: {
     apiKey: process.env.MEXC_API_KEY,
     secretKey: process.env.MEXC_SECRET_KEY,
@@ -220,6 +223,53 @@ function calcRSI(closes, period = 14) {
   if (gains === 0) return 0;
   const rs = (gains / period) / (losses / period);
   return 100 - 100 / (1 + rs);
+}
+
+/**
+ * Cross-validate RSI(3) extreme values against actual candle closes.
+ * RSI(3)=0 should mean the last 3 candles all closed lower than the previous.
+ * RSI(3)=100 should mean the last 3 candles all closed higher than the previous.
+ * If the candle evidence contradicts the extreme value, the signal is likely a
+ * data artefact — return { valid: false } so the caller substitutes RSI(14).
+ *
+ * @param {number}   rsi3   — the RSI(3) value (0 or 100 triggers the check)
+ * @param {number[]} closes — array of close prices (most-recent last)
+ * @returns {{ valid: boolean, reason?: string }}
+ */
+function validateRsi3(rsi3, closes) {
+  const isExtreme = rsi3 === 0 || rsi3 === 100;
+  if (!isExtreme) return { valid: true };
+
+  const needed = 4; // need at least 4 closes to compare 3 consecutive pairs
+  if (closes.length < needed) return { valid: true }; // can't verify → accept
+
+  // Last 3 closes and the candle before them
+  const slice = closes.slice(-needed); // [c0, c1, c2, c3]  c3 = most recent
+  const pairs = [[slice[0], slice[1]], [slice[1], slice[2]], [slice[2], slice[3]]];
+
+  if (rsi3 === 0) {
+    // Expect each close < previous close (all down)
+    const allDown = pairs.every(([prev, curr]) => curr < prev);
+    if (!allDown) {
+      const pctDown = pairs.filter(([p, c]) => c < p).length;
+      return {
+        valid: false,
+        reason: `RSI(3)=0 mas apenas ${pctDown}/3 candles decrescentes — substituindo por RSI(14)`,
+      };
+    }
+  } else {
+    // rsi3 === 100 — expect each close > previous close (all up)
+    const allUp = pairs.every(([prev, curr]) => curr > prev);
+    if (!allUp) {
+      const pctUp = pairs.filter(([p, c]) => c > p).length;
+      return {
+        valid: false,
+        reason: `RSI(3)=100 mas apenas ${pctUp}/3 candles crescentes — substituindo por RSI(14)`,
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 function calcATR(candles, period = 14) {
@@ -454,7 +504,9 @@ async function getOpenPosition(symbol) {
   const pos  = list[0];
   const size = parseFloat(pos.holdVol);
   if (size <= 0) return null;
-  return { side: pos.positionType === 1 ? "Buy" : "Sell", size };
+  // unrealisedPnl: MEXC field name (British spelling); fall back to 0 if absent
+  const unrealizedPnl = parseFloat(pos.unrealisedPnl ?? pos.unrealizedPnl ?? 0);
+  return { side: pos.positionType === 1 ? "Buy" : "Sell", size, unrealizedPnl };
 }
 
 async function getInstrumentInfo(symbol) {
@@ -1057,7 +1109,8 @@ async function run() {
   // Calculate indicators
   const ema8     = calcEMA(closes, 8);
   const vwap     = calcVWAP(candles);
-  const rsi3     = calcRSI(closes, 3);
+  const rsi3Raw  = calcRSI(closes, 3);
+  const rsi14_15m = calcRSI(closes, 14);   // 15m RSI(14) — fallback for extreme RSI(3)
   const ema50_1h = calcEMA(closes1h, 50);
 
   const atrData  = calcATR(candles, 14);
@@ -1066,11 +1119,25 @@ async function run() {
   const lastVol  = candles[candles.length - 1].volume;
   const volLow   = lastVol < volAvg;
 
+  // Cross-validate RSI(3) extreme values against candle closes
+  let rsi3 = rsi3Raw;
+  let rsi3Substituted = false;
+  if (rsi3Raw !== null && !isNaN(rsi3Raw) && (rsi3Raw === 0 || rsi3Raw === 100)) {
+    const { valid, reason } = validateRsi3(rsi3Raw, closes);
+    if (!valid) {
+      console.log(`  ⚠️  RSI(3) cross-validation: ${reason}`);
+      rsi3 = rsi14_15m;   // substitute with RSI(14) on same timeframe
+      rsi3Substituted = true;
+    } else {
+      console.log(`  ✅ RSI(3)=${rsi3Raw.toFixed(0)} confirmado pelos últimos 3 candles`);
+    }
+  }
+
   const rsi3Valid    = rsi3 !== null && !isNaN(rsi3);
   const rsi14_1hValid = rsi14_1h !== null && !isNaN(rsi14_1h);
   console.log(`  EMA(8)  15m: $${ema8 != null ? ema8.toFixed(2) : "N/A"}`);
   console.log(`  VWAP    15m: $${vwap != null ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3)  15m: ${rsi3Valid ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  RSI(3)  15m: ${rsi3Valid ? rsi3.toFixed(2) : "N/A"}${rsi3Substituted ? " (substituído por RSI(14) 15m)" : rsi3Raw !== null && (rsi3Raw === 0 || rsi3Raw === 100) ? " ⚠️ extremo" : ""}`);
   console.log(`  RSI(14) 1H:  ${rsi14_1hValid ? rsi14_1h.toFixed(2) : "N/A"} (1H RSI filter)`);
   console.log(`  EMA(50) 1H:  $${ema50_1h != null ? ema50_1h.toFixed(2) : "N/A"} (trend filter)`);
   const effectiveLeverage = atrData ? calcEffectiveLeverage(atrData.atr, atrData.avg50) : parseInt(process.env.LEVERAGE || "60");
@@ -1206,14 +1273,40 @@ async function run() {
         if (CONFIG.tradeMode === "futures") {
           const openPos = await getOpenPosition(CONFIG.symbol);
           if (openPos) {
-            const currentState = loadPositionState();
-            const isReentry = currentState?.halfClosed && openPos.side.toLowerCase() === tradeSide;
-            if (!isReentry) {
+            const currentState  = loadPositionState();
+            const openSide      = openPos.side.toLowerCase(); // "buy" or "sell"
+            const isReentry     = currentState?.halfClosed && openSide === tradeSide;
+            const isOpposite    = openSide !== tradeSide;
+
+            if (isReentry) {
+              // Re-entry after TP1 — position is same direction and half-closed
+              console.log(`🔁 Re-entrada após TP1 — posição ${tradeSide} já tem metade aberta, a adicionar...`);
+
+            } else if (isOpposite) {
+              // Opposite position open — conditional reversal
+              const pnl    = openPos.unrealizedPnl ?? 0;
+              const lossOk = pnl >= -CONFIG.maxReversalLossUSD;
+
+              console.log(`  🔄 Posição oposta detectada: ${openPos.side} qty=${openPos.size} | PnL não realizado: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`);
+
+              if (lossOk) {
+                console.log(`  ✅ Perda (${pnl.toFixed(2)}) dentro do limite (-$${CONFIG.maxReversalLossUSD}) — a fechar e reverter para ${tradeSide.toUpperCase()}...`);
+                await closePosition(CONFIG.symbol, openSide, `Reversão → ${tradeSide}`);
+                // Proceed — placeMexcOrder will open the new position below
+              } else {
+                const msg = `⏸ Reversão bloqueada — ${openPos.side} tem PnL $${pnl.toFixed(2)} (limite: -$${CONFIG.maxReversalLossUSD})\nA aguardar redução do risco antes de reverter`;
+                console.log(`  ${msg}`);
+                await sendTelegram(`⏸ <b>Bot v1 ${CONFIG.symbol}</b> — Sinal ${tradeSide.toUpperCase()} válido\n${msg}`);
+                logEntry.error = `Reversal blocked: pnl=$${pnl.toFixed(2)} < -$${CONFIG.maxReversalLossUSD}`;
+                throw new Error(`Reversal blocked — unrealized loss too high`);
+              }
+
+            } else {
+              // Same direction, not a re-entry — duplicate signal, skip
               console.log(`⚠️  Posição já aberta (${openPos.side} qty=${openPos.size}) — a saltar nova ordem.`);
               logEntry.error = `Position already open: ${openPos.side} qty=${openPos.size}`;
               throw new Error(`Position already open: ${openPos.side} qty=${openPos.size}`);
             }
-            console.log(`🔁 Re-entrada após TP1 — posição ${tradeSide} já tem metade aberta, a adicionar...`);
           }
         }
         console.log(`  Leverage efetivo: ${effectiveLeverage}x | SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
