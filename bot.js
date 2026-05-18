@@ -651,6 +651,19 @@ async function checkTrailingStop(symbol, currentPrice, atr) {
   const state = loadPositionState();
   if (!state || !state.breakEvenSet) return; // only after break-even
 
+  // Confirm position is still open — user may have closed it manually
+  const pos = await getOpenPosition(symbol).catch(() => null);
+  if (!pos) {
+    console.log(`  ℹ️  Trailing stop: posição já não existe — a limpar estado.`);
+    clearPositionState();
+    await sendTelegram(
+      `ℹ️ <b>Posição fechada externamente</b> — ${symbol}\n` +
+      `Nenhuma posição aberta detectada — estado limpo.\n` +
+      `(SL não foi alterado)`
+    );
+    return;
+  }
+
   const { side, entryPrice, slPrice } = state;
   const trailHigh = state.trailHigh ?? currentPrice;
   const trailLow  = state.trailLow  ?? currentPrice;
