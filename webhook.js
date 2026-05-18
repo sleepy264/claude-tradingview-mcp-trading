@@ -23,6 +23,12 @@ const CONFIG = {
   takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
   trailingStopPct:        parseFloat(process.env.TRAILING_STOP_PCT        || "0.03"),
   trailingActivationPct:  parseFloat(process.env.TRAILING_ACTIVATION_PCT  || "0.003"),
+  // Stable coins (e.g. BTC, SOL, ETH): wider trailing to avoid early stop-outs.
+  // STABLE_SYMBOLS = comma-separated list of symbols (e.g. BTCUSDT,SOLUSDT,ETHUSDT)
+  // Leave empty to disable the feature (all symbols use the defaults above).
+  stableSymbols:              (process.env.STABLE_SYMBOLS || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
+  stableTrailingStopPct:      parseFloat(process.env.STABLE_TRAILING_STOP_PCT       || "0.05"),
+  stableTrailingActivationPct: parseFloat(process.env.STABLE_TRAILING_ACTIVATION_PCT || "0.01"),
   maxDailyLossPerSymbol:  parseFloat(process.env.MAX_DAILY_LOSS_PER_SYMBOL || "0"),  // 0 = disabled
   maxDailyLossTotal:      parseFloat(process.env.MAX_DAILY_LOSS_TOTAL      || "0"),  // 0 = disabled
   riskPerTradeUSD:        parseFloat(process.env.RISK_PER_TRADE_USD        || "0"),  // 0 = fixed size
@@ -548,15 +554,20 @@ async function getDailyClosedPnl(symbol = null) {
 
 // atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
 // Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
+// Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT / STABLE_TRAILING_ACTIVATION_PCT.
 async function setTrailingStop(symbol, action, entryPrice, atr = null) {
+  const isStable = CONFIG.stableSymbols.includes(symbol.toUpperCase());
+  const trailingStopPct      = isStable ? CONFIG.stableTrailingStopPct      : CONFIG.trailingStopPct;
+  const trailingActivationPct = isStable ? CONFIG.stableTrailingActivationPct : CONFIG.trailingActivationPct;
+
   const trailingDistance = atr
     ? (atr * CONFIG.atrMultiplier).toFixed(2)
-    : (entryPrice * CONFIG.trailingStopPct).toFixed(2);
+    : (entryPrice * trailingStopPct).toFixed(2);
 
-  // Desired activation price (TRAILING_ACTIVATION_PCT in profit from entry)
+  // Desired activation price (trailingActivationPct in profit from entry)
   const activePriceNum = action === "buy"
-    ? entryPrice * (1 + CONFIG.trailingActivationPct)
-    : entryPrice * (1 - CONFIG.trailingActivationPct);
+    ? entryPrice * (1 + trailingActivationPct)
+    : entryPrice * (1 - trailingActivationPct);
 
   // Check current price — if it already passed activePriceNum, Bybit rejects activePrice.
   // In that case omit it: trailing activates immediately (correct behaviour).
@@ -566,7 +577,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
                         currentPrice <= activePriceNum
   );
 
-  const src = atr ? `${CONFIG.atrMultiplier}×ATR($${parseFloat(atr).toFixed(4)})` : `${CONFIG.trailingStopPct * 100}% fixo`;
+  const src = atr ? `${CONFIG.atrMultiplier}×ATR($${parseFloat(atr).toFixed(4)})` : `${(trailingStopPct * 100).toFixed(1)}% fixo${isStable ? " (stable)" : ""}`;
   if (alreadyActivated) {
     console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${activePriceNum.toFixed(2)})`);
   } else {
@@ -997,6 +1008,7 @@ app.listen(PORT, () => {
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
+  console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
