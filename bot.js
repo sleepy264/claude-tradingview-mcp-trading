@@ -365,11 +365,14 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       price < vwap,
     );
 
+    // For mean-reversion shorts: wait for the bounce ABOVE EMA(8) before shorting.
+    // When RSI(3) > 60 in a downtrend the price is bouncing up — naturally above EMA(8).
+    // Requiring price < EMA(8) contradicts RSI > 60 and blocks every valid short setup.
     check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
+      "Price above EMA(8) (bounce into short)",
+      `> ${ema8.toFixed(2)}`,
       price.toFixed(2),
-      price < ema8,
+      price > ema8,
     );
 
     check(
