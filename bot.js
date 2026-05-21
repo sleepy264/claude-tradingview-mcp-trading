@@ -86,6 +86,9 @@ const CONFIG = {
   // Conditional reversal: if an opposite position is open, only close+reverse if
   // unrealized loss is below this threshold. 0 = only reverse if in profit/break-even.
   maxReversalLossUSD: parseFloat(process.env.MAX_REVERSAL_LOSS_USD || "1"),
+  // Cooldown after SL: wait this many ms before opening a new position on the same symbol.
+  // Prevents re-entering immediately into the same bounce that triggered the SL.
+  cooldownAfterSlMs: parseInt(process.env.COOLDOWN_AFTER_SL_MS || "900000"), // 15 min
   mexc: {
     apiKey: process.env.MEXC_API_KEY,
     secretKey: process.env.MEXC_SECRET_KEY,
@@ -589,6 +592,33 @@ function clearPositionState() {
   try { if (existsSync(STATE_FILE)) unlinkSync(STATE_FILE); } catch (e) {}
 }
 
+// ─── Cooldown state (persists across Railway restarts) ────────────────────────
+
+const COOLDOWN_FILE = "cooldown-state.json";
+
+function recordSlHit(symbol) {
+  try {
+    writeFileSync(COOLDOWN_FILE, JSON.stringify({ symbol, slHitAt: Date.now() }, null, 2));
+  } catch (e) {}
+}
+
+function checkCooldown(symbol) {
+  if (CONFIG.cooldownAfterSlMs <= 0) return { blocked: false };
+  try {
+    if (!existsSync(COOLDOWN_FILE)) return { blocked: false };
+    const { symbol: s, slHitAt } = JSON.parse(readFileSync(COOLDOWN_FILE, "utf8"));
+    if (s !== symbol) return { blocked: false };
+    const elapsed = Date.now() - slHitAt;
+    if (elapsed < CONFIG.cooldownAfterSlMs) {
+      const remainingSec = Math.ceil((CONFIG.cooldownAfterSlMs - elapsed) / 1000);
+      return { blocked: true, remainingSec };
+    }
+    // Cooldown expired — clean up
+    try { unlinkSync(COOLDOWN_FILE); } catch (e) {}
+  } catch (e) {}
+  return { blocked: false };
+}
+
 // ─── Cancel a MEXC plan order ─────────────────────────────────────────────────
 
 async function cancelMexcPlanOrder(symbol, planOrderId) {
@@ -879,11 +909,14 @@ async function checkSlTp(symbol, currentPrice) {
     try {
       await closePosition(symbol, side, `SL @ $${slPrice}`);
       addDailyPnl(entryPrice, currentPrice, side, tradeSize, leverage, 1);
+      recordSlHit(symbol); // start cooldown — no new entry for COOLDOWN_AFTER_SL_MS
+      const cooldownMin = Math.round(CONFIG.cooldownAfterSlMs / 60000);
       const pnl = getDailyClosedPnl();
       await sendTelegram(
         `🔴 <b>Stop-Loss</b> — ${symbol}\n` +
         `Entrada: $${entryPrice} | SL: $${slPrice}\n` +
         `Preço atual: $${currentPrice.toFixed(2)}\n` +
+        `⏸ Cooldown: ${cooldownMin}min sem novas entradas\n` +
         `📊 PnL hoje: $${pnl.toFixed(2)}`
       );
     } catch (e) {
@@ -1265,6 +1298,15 @@ async function run() {
     failed.forEach((f) => console.log(`   - ${f}`));
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
+
+    // Check cooldown — do not re-enter immediately after a SL on the same symbol
+    const cooldown = checkCooldown(CONFIG.symbol);
+    if (cooldown.blocked) {
+      const remainingMin = Math.ceil(cooldown.remainingSec / 60);
+      console.log(`⏸ COOLDOWN ATIVO — ${remainingMin}min restantes após último SL. A aguardar...`);
+      logSkip(price, `Cooldown após SL (${remainingMin}min restantes)`);
+      return;
+    }
 
     const direction = tradeSide === "buy" ? "LONG" : "SHORT";
     const atr = atrData.atr;
