@@ -552,6 +552,15 @@ async function getDailyClosedPnl(symbol = null) {
   return list.reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
 }
 
+// Format a price/distance value with enough decimal places to avoid rounding to zero.
+// For low-price assets (e.g. HANAUSDT @ $0.0335), toFixed(2) would produce "0.00".
+function formatPrice(value) {
+  if (!value || value <= 0) return "0";
+  if (value >= 1) return value.toFixed(2);
+  const decimals = Math.max(2, -Math.floor(Math.log10(value)) + 2);
+  return value.toFixed(decimals);
+}
+
 // atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
 // Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
 // Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT / STABLE_TRAILING_ACTIVATION_PCT.
@@ -560,9 +569,16 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const trailingStopPct      = isStable ? CONFIG.stableTrailingStopPct      : CONFIG.trailingStopPct;
   const trailingActivationPct = isStable ? CONFIG.stableTrailingActivationPct : CONFIG.trailingActivationPct;
 
-  const trailingDistance = atr
-    ? (atr * CONFIG.atrMultiplier).toFixed(2)
-    : (entryPrice * trailingStopPct).toFixed(2);
+  const rawDistance  = atr
+    ? atr * CONFIG.atrMultiplier
+    : entryPrice * trailingStopPct;
+  const trailingDistance = formatPrice(rawDistance);
+
+  // Guard: if distance rounds to zero Bybit will reject the request
+  if (parseFloat(trailingDistance) === 0) {
+    console.log(`  ⚠️  Trailing stop ignorado — distância calculada é zero (ATR demasiado pequeno)`);
+    return;
+  }
 
   // Desired activation price (trailingActivationPct in profit from entry)
   const activePriceNum = action === "buy"
@@ -588,7 +604,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const recvWindow = "5000";
   const orderBody  = alreadyActivated
     ? { category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 }
-    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: activePriceNum.toFixed(2), positionIdx: 0 };
+    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: formatPrice(activePriceNum), positionIdx: 0 };
   const body = JSON.stringify(orderBody);
   const sig  = sign(timestamp, recvWindow, body);
   const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
@@ -888,7 +904,12 @@ async function handleWebhook(body) {
             );
             return;
           }
-          console.log(`  ✅ Filtro tendência OK: ${(Math.abs(diff) * 100).toFixed(2)}% ≤ margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%`);
+          const isAligned = (actionLower === "buy" && diff >= 0) || (actionLower === "sell" && diff < 0);
+          if (isAligned) {
+            console.log(`  ✅ Filtro tendência OK: alinhado com ${trendDir} (diff=${(diff * 100).toFixed(2)}%)`);
+          } else {
+            console.log(`  ✅ Filtro tendência OK: ${(Math.abs(diff) * 100).toFixed(2)}% contra tendência — dentro da margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%`);
+          }
         } catch (e) {
           console.log(`  ⚠️  Trend filter falhou: ${e.message} — a continuar`);
         }
