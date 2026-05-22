@@ -55,6 +55,9 @@ const CONFIG = {
   cooldownAfterSlMs:    parseInt(process.env.COOLDOWN_AFTER_SL_MS || "900000"),  // default 15 min
   // Max SL hits per symbol per day before blocking all new entries for that symbol (0 = disabled)
   maxSlPerSymbol:       parseInt(process.env.MAX_SL_PER_SYMBOL || "0"),
+  // Minimum Risk:Reward ratio filter: skip trade if TP% / SL% < minRR (0 = disabled)
+  // Example: minRR=1.5 means TP must be at least 1.5× the SL distance to enter
+  minRR:                parseFloat(process.env.MIN_RR || "0"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -979,6 +982,25 @@ async function handleWebhook(body) {
       console.log(`  ✅ Filtro volatilidade OK: SL ${((resolvedAtr * CONFIG.atrMultiplier / priceNum) * 100).toFixed(2)}% ≤ ${(CONFIG.maxSlPct * 100).toFixed(1)}%`);
     }
 
+    // ── Minimum R:R filter ────────────────────────────────────────────────────
+    if (CONFIG.minRR > 0 && resolvedAtr) {
+      const slPct  = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
+      const tpPct  = CONFIG.takeProfitPct;
+      const rrRatio = tpPct / slPct;
+      if (rrRatio < CONFIG.minRR) {
+        const msg = `⏸ R:R insuficiente: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) < mínimo ${CONFIG.minRR} — sinal ignorado`;
+        console.log(`  ${msg}`);
+        await sendTelegram(
+          `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
+          `${msg}\n` +
+          `ATR=${resolvedAtr.toFixed(4)} → SL=$${(resolvedAtr * CONFIG.atrMultiplier).toFixed(4)} (${(slPct * 100).toFixed(2)}%)\n` +
+          `TP alvo: ${(tpPct * 100).toFixed(2)}%`
+        );
+        return;
+      }
+      console.log(`  ✅ R:R OK: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) ≥ mínimo ${CONFIG.minRR}`);
+    }
+
     const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, resolvedAtr);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
@@ -1028,6 +1050,7 @@ app.listen(PORT, () => {
   console.log(`  Chase Limit: ${CONFIG.chaseLimitEnabled ? `ativo — timeout ${CONFIG.chaseLimitTimeoutMs}ms → fallback Market` : "desativado (sempre Market)"}`);
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
+  console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} (TP${(CONFIG.takeProfitPct * 100).toFixed(2)}% / SL%)` : "desativado (MIN_RR=0)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
