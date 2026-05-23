@@ -511,12 +511,6 @@ async function getOpenPosition(symbol) {
   const size = parseFloat(pos.holdVol);
   if (size <= 0) return null;
 
-  // Log raw position fields once so we can confirm the exact MEXC field names
-  const pnlFields = Object.fromEntries(
-    Object.entries(pos).filter(([k]) => /pnl|profit|loss/i.test(k))
-  );
-  console.log(`  [debug] MEXC pos PnL fields: ${JSON.stringify(pnlFields)}`);
-
   // Try known MEXC field names; if none found, set to null (unknown — not 0)
   const rawPnl = pos.unrealisedPnl ?? pos.unrealizedPnl ?? pos.unRealizedPnl
                ?? pos.positionPnl ?? pos.openPositionPnl ?? null;
@@ -1241,14 +1235,27 @@ async function run() {
   const trendBearish = price < ema50_1h;
   console.log(`  1H Trend: ${trendBullish ? "BULLISH (longs only)" : trendBearish ? "BEARISH (shorts only)" : "NEUTRAL"}`);
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
-
-  // Determine direction from VWAP — must align with 1H trend
-  const h1Side = price > vwap ? "buy" : "sell";
+  // Determine trade direction from VWAP — must align with 1H trend
+  const h1Side      = price > vwap ? "buy" : "sell";
+  const tradeSide   = h1Side;
   const trendAligned = (h1Side === "buy" && trendBullish) || (h1Side === "sell" && trendBearish);
 
-  const tradeSide = h1Side;
+  // Pre-check: if a same-direction position is already open, skip the full safety check.
+  // Prevents the "ALL CONDITIONS MET → ORDER FAILED" loop every cycle when a position is active.
+  if (!CONFIG.paperTrading && CONFIG.tradeMode === "futures") {
+    const preCheckPos = await getOpenPosition(CONFIG.symbol).catch(() => null);
+    if (preCheckPos) {
+      const openSide  = preCheckPos.side.toLowerCase();
+      const isReentry = loadPositionState()?.halfClosed && openSide === tradeSide;
+      if (openSide === tradeSide && !isReentry) {
+        console.log(`\n⏭ Posição ${preCheckPos.side} (qty=${preCheckPos.size}) já aberta na direção do sinal — a saltar`);
+        return;
+      }
+    }
+  }
+
+  // Run safety check
+  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
   // Calculate position size — risk-based if RISK_PER_TRADE_USD is set, otherwise fixed
   const tradeSize = CONFIG.riskPerTradeUSD > 0
