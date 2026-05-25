@@ -76,6 +76,8 @@ function checkOnboarding() {
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
+  // MEXC futures uses underscore format (NVDA_USDT). Derive it automatically from symbol.
+  get mexcSymbol() { return toMexcSymbol(this.symbol); },
   timeframe: process.env.TIMEFRAME || "4H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD  || "100"),
@@ -167,13 +169,24 @@ async function fetchCandlesMexc(symbol, interval, limit) {
   }));
 }
 
+// MEXC futures uses underscore format (e.g. NVDA_USDT, BTC_USDT).
+// OKX uses no-underscore format (e.g. NVDAUSDT, BTCUSDT).
+// Convert automatically when falling back to MEXC.
+function toMexcSymbol(symbol) {
+  if (symbol.includes("_")) return symbol; // already MEXC format
+  if (symbol.endsWith("USDT")) return symbol.slice(0, -4) + "_USDT";
+  if (symbol.endsWith("USDC")) return symbol.slice(0, -4) + "_USDC";
+  return symbol;
+}
+
 async function fetchCandles(symbol, interval, limit = 100) {
   try {
     return await fetchCandlesOkx(symbol, interval, limit);
   } catch (e) {
     if (e.message.includes("doesn't exist") || e.message.includes("does not exist")) {
-      console.log(`  ℹ️  OKX não tem ${symbol} — a usar MEXC como fonte de dados`);
-      return await fetchCandlesMexc(symbol, interval, limit);
+      const mexcSymbol = toMexcSymbol(symbol);
+      console.log(`  ℹ️  OKX não tem ${symbol} — a usar MEXC (${mexcSymbol}) como fonte de dados`);
+      return await fetchCandlesMexc(mexcSymbol, interval, limit);
     }
     throw e;
   }
@@ -1137,7 +1150,9 @@ async function run() {
   // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  const mexcSym = CONFIG.mexcSymbol;
+  const mexcNote = mexcSym !== CONFIG.symbol ? ` (MEXC: ${mexcSym})` : "";
+  console.log(`Symbol: ${CONFIG.symbol}${mexcNote} | Timeframe: ${CONFIG.timeframe}`);
 
   // Load log and check daily limits
   const log = loadLog();
@@ -1214,9 +1229,9 @@ async function run() {
 
   // ── SL/TP monitoring — runs every cycle before any new trade logic ──────
   console.log("\n── SL/TP & Break-even check ─────────────────────────────\n");
-  await checkSlTp(CONFIG.symbol, price);
-  await checkBreakEven(CONFIG.symbol, price, atrData.atr);
-  await checkTrailingStop(CONFIG.symbol, price, atrData.atr);
+  await checkSlTp(CONFIG.mexcSymbol, price);
+  await checkBreakEven(CONFIG.mexcSymbol, price, atrData.atr);
+  await checkTrailingStop(CONFIG.mexcSymbol, price, atrData.atr);
 
   if (!atrData.volatile) {
     console.log("\n🚫 Market is choppy (ATR below average) — no trade.");
@@ -1243,7 +1258,7 @@ async function run() {
   // Pre-check: if a same-direction position is already open, skip the full safety check.
   // Prevents the "ALL CONDITIONS MET → ORDER FAILED" loop every cycle when a position is active.
   if (!CONFIG.paperTrading && CONFIG.tradeMode === "futures") {
-    const preCheckPos = await getOpenPosition(CONFIG.symbol).catch(() => null);
+    const preCheckPos = await getOpenPosition(CONFIG.mexcSymbol).catch(() => null);
     if (preCheckPos) {
       const openSide  = preCheckPos.side.toLowerCase();
       const isReentry = loadPositionState()?.halfClosed && openSide === tradeSide;
@@ -1346,7 +1361,7 @@ async function run() {
       );
       try {
         if (CONFIG.tradeMode === "futures") {
-          const openPos = await getOpenPosition(CONFIG.symbol);
+          const openPos = await getOpenPosition(CONFIG.mexcSymbol);
           if (openPos) {
             const currentState  = loadPositionState();
             const openSide      = openPos.side.toLowerCase(); // "buy" or "sell"
@@ -1369,7 +1384,7 @@ async function run() {
 
               if (lossOk) {
                 console.log(`  ✅ Perda ($${pnl.toFixed(2)}) dentro do limite (-$${CONFIG.maxReversalLossUSD}) — a fechar e reverter para ${tradeSide.toUpperCase()}...`);
-                await closePosition(CONFIG.symbol, openSide, `Reversão → ${tradeSide}`);
+                await closePosition(CONFIG.mexcSymbol, openSide, `Reversão → ${tradeSide}`);
                 // Proceed — placeMexcOrder will open the new position below
               } else {
                 const reason = pnlKnown
@@ -1391,7 +1406,7 @@ async function run() {
           }
         }
         console.log(`  Leverage efetivo: ${effectiveLeverage}x | SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
-        const order = await placeMexcOrder(CONFIG.symbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price, effectiveLeverage);
+        const order = await placeMexcOrder(CONFIG.mexcSymbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price, effectiveLeverage);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         logEntry.side = tradeSide;
