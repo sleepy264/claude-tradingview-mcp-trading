@@ -186,7 +186,18 @@ async function fetchCandles(symbol, interval, limit = 100) {
     if (e.message.includes("doesn't exist") || e.message.includes("does not exist")) {
       const mexcSymbol = toMexcSymbol(symbol);
       console.log(`  ℹ️  OKX não tem ${symbol} — a usar MEXC (${mexcSymbol}) como fonte de dados`);
-      return await fetchCandlesMexc(mexcSymbol, interval, limit);
+      try {
+        return await fetchCandlesMexc(mexcSymbol, interval, limit);
+      } catch (e2) {
+        // MEXC stock futures only trade during US market hours (Mon–Fri 14:30–21:00 UTC).
+        // Outside those hours the kline endpoint returns "Contract does not exist".
+        throw new Error(
+          `Par ${symbol} não encontrado em nenhuma exchange.\n` +
+          `  OKX: ${e.message}\n` +
+          `  MEXC (${mexcSymbol}): ${e2.message}\n` +
+          `  Se for um stock future (ex: NVDA, TSLA) verifique o horário: seg–sex 14:30–21:00 UTC.`
+        );
+      }
     }
     throw e;
   }
@@ -1164,11 +1175,17 @@ async function run() {
 
   // Fetch candle data — 15m for entry indicators, 1H for trend filter, BTC for correlation
   console.log("\n── Fetching market data ─────────────────────────────────\n");
-  const [candles, candles1h, btcTrend] = await Promise.all([
-    fetchCandles(CONFIG.symbol, "15m", 500),
-    fetchCandles(CONFIG.symbol, "1h",  200),
-    fetchBtcTrend(),
-  ]);
+  let candles, candles1h, btcTrend;
+  try {
+    [candles, candles1h, btcTrend] = await Promise.all([
+      fetchCandles(CONFIG.symbol, "15m", 500),
+      fetchCandles(CONFIG.symbol, "1h",  200),
+      fetchBtcTrend(),
+    ]);
+  } catch (e) {
+    console.log(`\n⚠️  Dados de mercado indisponíveis — a saltar ciclo.\n${e.message}`);
+    return; // exit gracefully — Railway will retry on next cron tick
+  }
   const closes   = candles.map((c) => c.close);
   const closes1h = candles1h.map((c) => c.close);
   const price = closes[closes.length - 1];
