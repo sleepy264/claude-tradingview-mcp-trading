@@ -85,6 +85,9 @@ const CONFIG = {
   positionTimeoutHours:  parseFloat(process.env.POSITION_TIMEOUT_HOURS   || "0"),
   positionTimeoutPnlMin: parseFloat(process.env.POSITION_TIMEOUT_PNL_MIN || "-1"),
   positionTimeoutPnlMax: parseFloat(process.env.POSITION_TIMEOUT_PNL_MAX || "1"),
+  // Spread check: skip entry if bid/ask spread exceeds this % of mid price (0 = disabled).
+  // Example: MAX_SPREAD_PCT=0.1 → skip if spread > 0.1% (i.e. 10 bps)
+  maxSpreadPct: parseFloat(process.env.MAX_SPREAD_PCT || "0"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -370,6 +373,17 @@ function calcDynamicLeverage(atr, avg50, baseLev) {
   if (ratio > 1.5) return Math.floor(baseLev * 0.5);
   if (ratio > 1.0) return Math.floor(baseLev * 0.75);
   return baseLev;
+}
+
+// Fetch best bid/ask from Bybit orderbook and return spread as % of mid price.
+async function fetchSpreadPct(symbol) {
+  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=1`);
+  const data = await res.json();
+  const bid  = parseFloat(data.result?.b?.[0]?.[0]);
+  const ask  = parseFloat(data.result?.a?.[0]?.[0]);
+  if (!bid || !ask) throw new Error("Orderbook vazio");
+  const mid = (bid + ask) / 2;
+  return { bid, ask, spreadPct: (ask - bid) / mid };
 }
 
 // Returns { currentVol, avgVol, ratio } for volume filter.
@@ -1166,6 +1180,22 @@ async function handleWebhook(body) {
       console.log(`  ✅ R:R OK: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) ≥ mínimo ${CONFIG.minRR}`);
     }
 
+    // ── Spread check ─────────────────────────────────────────────────────────
+    if (CONFIG.maxSpreadPct > 0) {
+      try {
+        const { bid, ask, spreadPct } = await fetchSpreadPct(sym);
+        if (spreadPct > CONFIG.maxSpreadPct) {
+          const msg = `⏸ Spread demasiado largo: ${(spreadPct * 100).toFixed(4)}% (máx ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%) — sinal ignorado`;
+          console.log(`  ${msg}`);
+          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nBid: $${bid} | Ask: $${ask}`);
+          return;
+        }
+        console.log(`  ✅ Spread OK: ${(spreadPct * 100).toFixed(4)}% ≤ ${(CONFIG.maxSpreadPct * 100).toFixed(4)}% (bid $${bid} / ask $${ask})`);
+      } catch (e) {
+        console.log(`  ⚠️  Spread check falhou: ${e.message} — a continuar`);
+      }
+    }
+
     const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
@@ -1221,6 +1251,7 @@ app.listen(PORT, () => {
   console.log(`  Horário   : ${CONFIG.tradeHoursStart !== null ? `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC` : "24/7 (TRADE_HOURS_START/END para limitar)"}`);
   console.log(`  Volume    : ${CONFIG.volumeFilterMult > 0 ? `skip se vol < ${CONFIG.volumeFilterMult}× média(${CONFIG.volumeFilterPeriods})` : "desativado (VOLUME_FILTER_MULT para ativar)"}`);
   console.log(`  Timeout   : ${CONFIG.positionTimeoutHours > 0 ? `fecha após ${CONFIG.positionTimeoutHours}h se PnL entre $${CONFIG.positionTimeoutPnlMin} e $${CONFIG.positionTimeoutPnlMax}` : "desativado (POSITION_TIMEOUT_HOURS para ativar)"}`);
+  console.log(`  Spread    : ${CONFIG.maxSpreadPct > 0 ? `skip se spread > ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%` : "desativado (MAX_SPREAD_PCT para ativar)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
