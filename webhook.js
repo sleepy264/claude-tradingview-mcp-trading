@@ -55,9 +55,17 @@ const CONFIG = {
   cooldownAfterSlMs:    parseInt(process.env.COOLDOWN_AFTER_SL_MS || "900000"),  // default 15 min
   // Max SL hits per symbol per day before blocking all new entries for that symbol (0 = disabled)
   maxSlPerSymbol:       parseInt(process.env.MAX_SL_PER_SYMBOL || "0"),
-  // Minimum Risk:Reward ratio filter: skip trade if TP% / SL% < minRR (0 = disabled)
-  // Example: minRR=1.5 means TP must be at least 1.5× the SL distance to enter
-  minRR:                parseFloat(process.env.MIN_RR || "0"),
+  // Minimum Risk:Reward ratio filter (0 = disabled).
+  // Since TP is fired by TradingView (not placed on Bybit), the TP reference is computed
+  // dynamically as SL × minRR (the minimum move TradingView's strategy should target).
+  // The filter only blocks if MAX_TP_PCT is set and the implied TP target exceeds it
+  // (i.e., the required move is unrealistically large for the current volatility).
+  // Example: minRR=1.35, SL=3.79% → implied TP target = 5.12%; blocked only if MAX_TP_PCT < 5.12%
+  minRR:                parseFloat(process.env.MIN_RR     || "0"),
+  // Maximum implied TP % cap for the dynamic R:R filter (0 = no cap / always pass).
+  // Block trade if SL×minRR would require a move larger than this to reach minRR.
+  // Example: MAX_TP_PCT=0.12 → block if implied TP > 12% (unrealistically large target)
+  maxTpPct:             parseFloat(process.env.MAX_TP_PCT || "0"),
   // Reversal loss guard: block closing an opposite position if its unrealized loss
   // exceeds this threshold in USD. 0 = always reverse (no protection).
   // Example: MAX_REVERSAL_LOSS_USD=5 → only reverse if open position loss ≤ $5
@@ -1177,22 +1185,25 @@ async function handleWebhook(body) {
     }
 
     // ── Minimum R:R filter ────────────────────────────────────────────────────
+    // TP is fired externally by TradingView, so we can't fix a static TP%.
+    // Instead, we compute the *implied* TP target = SL × minRR (the minimum move the
+    // strategy must achieve to satisfy the R:R requirement) and block only if that
+    // implied target exceeds MAX_TP_PCT (unrealistically large given the volatility).
     if (CONFIG.minRR > 0 && resolvedAtr) {
-      const slPct  = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
-      const tpPct  = CONFIG.takeProfitPct;
-      const rrRatio = tpPct / slPct;
-      if (rrRatio < CONFIG.minRR) {
-        const msg = `⏸ R:R insuficiente: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) < mínimo ${CONFIG.minRR} — sinal ignorado`;
+      const slPct       = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
+      const impliedTpPct = slPct * CONFIG.minRR;   // min move TradingView must target
+      if (CONFIG.maxTpPct > 0 && impliedTpPct > CONFIG.maxTpPct) {
+        const msg = `⏸ TP implícito ${(impliedTpPct * 100).toFixed(2)}% (SL ${(slPct * 100).toFixed(2)}% × ${CONFIG.minRR}) > máx ${(CONFIG.maxTpPct * 100).toFixed(2)}% — sinal ignorado`;
         console.log(`  ${msg}`);
         await sendTelegram(
           `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
           `${msg}\n` +
           `ATR=${resolvedAtr.toFixed(4)} → SL=$${(resolvedAtr * CONFIG.atrMultiplier).toFixed(4)} (${(slPct * 100).toFixed(2)}%)\n` +
-          `TP alvo: ${(tpPct * 100).toFixed(2)}%`
+          `Para R:R≥${CONFIG.minRR} o TradingView teria de alvo ≥${(impliedTpPct * 100).toFixed(2)}% — demasiado`
         );
         return;
       }
-      console.log(`  ✅ R:R OK: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) ≥ mínimo ${CONFIG.minRR}`);
+      console.log(`  ✅ R:R OK: SL ${(slPct * 100).toFixed(2)}% → TP implícito ${(impliedTpPct * 100).toFixed(2)}% (×${CONFIG.minRR})${CONFIG.maxTpPct > 0 ? ` ≤ máx ${(CONFIG.maxTpPct * 100).toFixed(2)}%` : ""}`);
     }
 
     // ── Spread check ─────────────────────────────────────────────────────────
@@ -1260,7 +1271,7 @@ app.listen(PORT, () => {
   console.log(`  Chase Limit: ${CONFIG.chaseLimitEnabled ? `ativo — timeout ${CONFIG.chaseLimitTimeoutMs}ms → fallback Market` : "desativado (sempre Market)"}`);
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
-  console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} (TP${(CONFIG.takeProfitPct * 100).toFixed(2)}% / SL%)` : "desativado (MIN_RR=0)"}`);
+  console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} — TP implícito=SL×${CONFIG.minRR}${CONFIG.maxTpPct > 0 ? ` | bloq. se TP implícito > ${(CONFIG.maxTpPct*100).toFixed(2)}%` : " | sem cap (MAX_TP_PCT=0)"}` : "desativado (MIN_RR=0)"}`);
   console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `bloqueada se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}`);
   console.log(`  Lev.dinâm : ${CONFIG.dynamicLeverage ? "ativo (ATR>avg→75% | ATR>1.5×avg→50%)" : "desativado (DYNAMIC_LEVERAGE=true para ativar)"}`);
   console.log(`  Horário   : ${CONFIG.tradeHoursStart !== null ? `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC` : "24/7 (TRADE_HOURS_START/END para limitar)"}`);
