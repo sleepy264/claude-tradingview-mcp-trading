@@ -925,7 +925,22 @@ async function handleWebhook(body) {
               : "";
             console.log(`  ✅ SL break-even (TP1): → $${newSl}${bufLabel}`);
           }
-          await setBreakEvenStop(sym, newSl);
+
+          // Validate SL is on the correct side of current price before submitting.
+          // For a Buy  position: SL must be < current price (stop loss is below).
+          // For a Sell position: SL must be > current price (stop loss is above).
+          // If the position is in loss at TP time the computed break-even can end up
+          // on the wrong side, causing Bybit to reject the order.
+          const slInvalid = newSl !== null && (
+            openPos.side === "Buy"  ? newSl >= priceNum :
+            openPos.side === "Sell" ? newSl <= priceNum : false
+          );
+          if (slInvalid) {
+            console.log(`  ⚠️  SL break-even $${newSl} inválido para ${openPos.side} @ $${priceNum} — ajuste ignorado`);
+            newSl = null;
+          } else {
+            await setBreakEvenStop(sym, newSl);
+          }
         } catch (e) {
           console.log(`  ⚠️  Ajuste de SL falhou: ${e.message}`);
         }
