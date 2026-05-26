@@ -91,6 +91,9 @@ const CONFIG = {
   // Cooldown after SL: wait this many ms before opening a new position on the same symbol.
   // Prevents re-entering immediately into the same bounce that triggered the SL.
   cooldownAfterSlMs: parseInt(process.env.COOLDOWN_AFTER_SL_MS || "900000"), // 15 min
+  // Spread check: skip entry if bid/ask spread exceeds this % of mid price (0 = disabled).
+  // Example: MAX_SPREAD_PCT=0.1 → skip if spread > 0.1% (10 bps)
+  maxSpreadPct: parseFloat(process.env.MAX_SPREAD_PCT || "0"),
   mexc: {
     apiKey: process.env.MEXC_API_KEY,
     secretKey: process.env.MEXC_SECRET_KEY,
@@ -177,6 +180,18 @@ function toMexcSymbol(symbol) {
   if (symbol.endsWith("USDT")) return symbol.slice(0, -4) + "_USDT";
   if (symbol.endsWith("USDC")) return symbol.slice(0, -4) + "_USDC";
   return symbol;
+}
+
+// Fetch best bid/ask from MEXC contract orderbook and return spread as % of mid price.
+async function fetchMexcSpreadPct(symbol) {
+  const res  = await fetch(`${CONFIG.mexc.baseUrl}/api/v1/contract/depth/${symbol}?limit=1`);
+  const data = await res.json();
+  if (!data.success) throw new Error(`MEXC depth: ${data.message}`);
+  const bid = parseFloat(data.data?.bids?.[0]?.[0]);
+  const ask = parseFloat(data.data?.asks?.[0]?.[0]);
+  if (!bid || !ask) throw new Error("MEXC orderbook vazio");
+  const mid = (bid + ask) / 2;
+  return { bid, ask, spreadPct: (ask - bid) / mid };
 }
 
 async function fetchCandles(symbol, interval, limit = 100) {
@@ -1423,6 +1438,21 @@ async function run() {
           }
         }
         console.log(`  Leverage efetivo: ${effectiveLeverage}x | SL: $${stopPrice} (1.5×ATR) | TP1: $${tp1Price} (3×ATR) | TP2: $${tp2Price} (5×ATR)`);
+        if (CONFIG.maxSpreadPct > 0) {
+          try {
+            const { bid, ask, spreadPct } = await fetchMexcSpreadPct(CONFIG.mexcSymbol);
+            if (spreadPct > CONFIG.maxSpreadPct) {
+              const msg = `⏸ Spread demasiado largo: ${(spreadPct * 100).toFixed(4)}% (máx ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%) — ordem cancelada`;
+              console.log(`  ${msg}`);
+              await sendTelegram(`⏸ <b>Bot v1 ${CONFIG.symbol}</b> — Ordem cancelada\n${msg}\nBid: $${bid} | Ask: $${ask}`);
+              throw new Error(msg);
+            }
+            console.log(`  ✅ Spread OK: ${(spreadPct * 100).toFixed(4)}% ≤ ${(CONFIG.maxSpreadPct * 100).toFixed(4)}% (bid $${bid} / ask $${ask})`);
+          } catch (e) {
+            if (e.message.includes("Spread demasiado")) throw e; // re-throw to block order
+            console.log(`  ⚠️  Spread check falhou: ${e.message} — a continuar`);
+          }
+        }
         const order = await placeMexcOrder(CONFIG.mexcSymbol, tradeSide, tradeSize, price, stopPrice, tp1Price, tp2Price, effectiveLeverage);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
