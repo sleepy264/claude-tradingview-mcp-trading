@@ -58,6 +58,10 @@ const CONFIG = {
   // Minimum Risk:Reward ratio filter: skip trade if TP% / SL% < minRR (0 = disabled)
   // Example: minRR=1.5 means TP must be at least 1.5× the SL distance to enter
   minRR:                parseFloat(process.env.MIN_RR || "0"),
+  // Reversal loss guard: block closing an opposite position if its unrealized loss
+  // exceeds this threshold in USD. 0 = always reverse (no protection).
+  // Example: MAX_REVERSAL_LOSS_USD=5 → only reverse if open position loss ≤ $5
+  maxReversalLossUSD:   parseFloat(process.env.MAX_REVERSAL_LOSS_USD || "0"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -476,10 +480,11 @@ async function getOpenPosition(symbol) {
   if (!position) return null;
   const size = parseFloat(position.size);
   return size > 0 ? {
-    side:     position.side,
+    side:           position.side,
     size,
-    stopLoss: parseFloat(position.stopLoss  || "0"),
-    avgPrice: parseFloat(position.avgPrice  || "0"),  // entry price from Bybit — reliable even after partial closes
+    stopLoss:       parseFloat(position.stopLoss      || "0"),
+    avgPrice:       parseFloat(position.avgPrice      || "0"),  // entry price from Bybit — reliable even after partial closes
+    unrealizedPnl:  parseFloat(position.unrealisedPnl || "0"),  // Bybit field name: unrealisedPnl
   } : null;
 }
 
@@ -920,7 +925,16 @@ async function handleWebhook(body) {
 
       // ── Close opposite position (normal reversal) ───────────────────────────
       if (openPos) {
-        console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size}) before opening ${actionLower.toUpperCase()}...`);
+        // Reversal loss guard: block if existing position loss exceeds threshold
+        if (CONFIG.maxReversalLossUSD > 0 && openPos.unrealizedPnl < -CONFIG.maxReversalLossUSD) {
+          const pnlDisplay = `$${openPos.unrealizedPnl.toFixed(2)}`;
+          const msg = `⏸ Reversão bloqueada — ${openPos.side} tem PnL não realizado ${pnlDisplay} (limite: -$${CONFIG.maxReversalLossUSD})\nA aguardar recuperação antes de reverter para ${actionLower.toUpperCase()}`;
+          console.log(`  ${msg}`);
+          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Reversão bloqueada\n${msg}`);
+          return;
+        }
+        const pnlInfo = CONFIG.maxReversalLossUSD > 0 ? ` | PnL: $${openPos.unrealizedPnl.toFixed(2)}` : "";
+        console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size})${pnlInfo} before opening ${actionLower.toUpperCase()}...`);
         const closeResult = await closePosition(sym, openPos);
         console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
         logTrade(sym, openPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${openPos.side} — reversing to ${actionLower}`);
@@ -1051,6 +1065,7 @@ app.listen(PORT, () => {
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} (TP${(CONFIG.takeProfitPct * 100).toFixed(2)}% / SL%)` : "desativado (MIN_RR=0)"}`);
+  console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `bloqueada se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
