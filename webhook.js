@@ -62,6 +62,29 @@ const CONFIG = {
   // exceeds this threshold in USD. 0 = always reverse (no protection).
   // Example: MAX_REVERSAL_LOSS_USD=5 → only reverse if open position loss ≤ $5
   maxReversalLossUSD:   parseFloat(process.env.MAX_REVERSAL_LOSS_USD || "0"),
+  // Dynamic leverage: reduce leverage when ATR is elevated vs its 50-bar average.
+  //   ATR ≤ avg        → full leverage
+  //   ATR 1.0–1.5× avg → 75% of base leverage
+  //   ATR > 1.5× avg   → 50% of base leverage
+  // Set DYNAMIC_LEVERAGE=true to enable.
+  dynamicLeverage:      process.env.DYNAMIC_LEVERAGE === "true",
+  // Time filter: only process buy/sell signals within this UTC hour window (inclusive start, exclusive end).
+  // Example: TRADE_HOURS_START=8 TRADE_HOURS_END=22 → only trade 08:00–21:59 UTC
+  // Supports overnight: TRADE_HOURS_START=22 TRADE_HOURS_END=6 → 22:00–05:59 UTC
+  // Leave both unset (default) to trade 24/7.
+  tradeHoursStart: process.env.TRADE_HOURS_START != null ? parseInt(process.env.TRADE_HOURS_START) : null,
+  tradeHoursEnd:   process.env.TRADE_HOURS_END   != null ? parseInt(process.env.TRADE_HOURS_END)   : null,
+  // Volume filter: skip entry if current bar volume < VOLUME_FILTER_MULT × avg of last N bars.
+  // Example: VOLUME_FILTER_MULT=0.5 → skip if volume is below 50% of its 20-bar average.
+  // 0 = disabled.
+  volumeFilterMult:     parseFloat(process.env.VOLUME_FILTER_MULT    || "0"),
+  volumeFilterPeriods:  parseInt(process.env.VOLUME_FILTER_PERIODS   || "20"),
+  // Position timeout: close stagnant positions that have been open longer than X hours
+  // AND whose unrealized PnL is between PNL_MIN and PNL_MAX (default: -$1 to +$1).
+  // 0 = disabled. Checked every 5 minutes in the background.
+  positionTimeoutHours:  parseFloat(process.env.POSITION_TIMEOUT_HOURS   || "0"),
+  positionTimeoutPnlMin: parseFloat(process.env.POSITION_TIMEOUT_PNL_MIN || "-1"),
+  positionTimeoutPnlMax: parseFloat(process.env.POSITION_TIMEOUT_PNL_MAX || "1"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -110,12 +133,15 @@ function recordSignalPlaced(symbol, action) {
   const s = _getSymState(symbol);
   if (action === "buy") s.lastBuyTime = Date.now();
   else                  s.lastSellTime = Date.now();
+  s.positionOpenTime = Date.now(); // for position timeout tracking
   saveSymbolState();
 }
 
 // Called when a TP signal is processed (position closed naturally, not by SL).
 function recordTpReceived(symbol) {
-  _getSymState(symbol).lastTpTime = Date.now();
+  const s = _getSymState(symbol);
+  s.lastTpTime      = Date.now();
+  s.positionOpenTime = null; // position closed — stop timeout tracking
   saveSymbolState();
 }
 
@@ -309,6 +335,88 @@ async function fetchTrendEMA(symbol, interval, period) {
     ema = closes[i] * k + ema * (1 - k);
   }
   return ema;
+}
+
+// Returns whether hourUTC falls within [start, end) — handles overnight windows.
+function isInTimeWindow(hourUTC, start, end) {
+  if (start === null || end === null) return true;
+  if (start <= end) return hourUTC >= start && hourUTC < end;
+  return hourUTC >= start || hourUTC < end; // overnight: e.g. 22→6
+}
+
+// Fetch the 50-bar simple average of True Range (used as baseline for dynamic leverage).
+// Requires ATR_PERIOD + 50 + 1 candles.
+async function fetchATRAvg50(symbol, interval) {
+  const avgPeriod = 50;
+  const limit     = CONFIG.atrPeriod + avgPeriod + 1;
+  const res       = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  const data      = await res.json();
+  const candles   = data.result?.list;
+  if (!candles || candles.length < CONFIG.atrPeriod + 2)
+    throw new Error(`ATRAvg50: só ${candles?.length ?? 0} velas`);
+  // Bybit: newest-first. Compute TR for each consecutive pair.
+  const trs = [];
+  for (let i = 0; i < candles.length - 1; i++) {
+    const h = parseFloat(candles[i][2]), l = parseFloat(candles[i][3]), pc = parseFloat(candles[i + 1][4]);
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  // Long-term baseline = avg of all available TRs (atrPeriod + avgPeriod bars)
+  return trs.reduce((a, b) => a + b, 0) / trs.length;
+}
+
+// Reduce leverage when ATR is elevated relative to its 50-bar baseline.
+function calcDynamicLeverage(atr, avg50, baseLev) {
+  const ratio = atr / avg50;
+  if (ratio > 1.5) return Math.floor(baseLev * 0.5);
+  if (ratio > 1.0) return Math.floor(baseLev * 0.75);
+  return baseLev;
+}
+
+// Returns { currentVol, avgVol, ratio } for volume filter.
+// currentVol = volume of the most recent completed bar; avgVol = mean of last `periods` bars.
+async function fetchVolumeRatio(symbol, interval, periods) {
+  const limit   = periods + 1; // +1 so candles[0] (possibly open bar) is excluded
+  const res     = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  const data    = await res.json();
+  const candles = data.result?.list;
+  if (!candles || candles.length < 2) throw new Error("Volume: candles insuficientes");
+  // candles[0] = current (may be incomplete); candles[1..] = completed bars
+  const completed  = candles.slice(1);
+  const currentVol = parseFloat(completed[0][5]);
+  const avgVol     = completed.reduce((s, c) => s + parseFloat(c[5]), 0) / completed.length;
+  return { currentVol, avgVol, ratio: currentVol / avgVol };
+}
+
+// Background position timeout check — runs every 5 min when POSITION_TIMEOUT_HOURS > 0.
+async function checkPositionTimeouts() {
+  if (!CONFIG.positionTimeoutHours) return;
+  const timeoutMs = CONFIG.positionTimeoutHours * 3_600_000;
+  const now       = Date.now();
+  for (const [sym, state] of Object.entries(symbolState)) {
+    if (!state.positionOpenTime) continue;
+    const elapsed = now - state.positionOpenTime;
+    if (elapsed < timeoutMs) continue;
+    try {
+      const pos = await getOpenPosition(sym);
+      if (!pos) { state.positionOpenTime = null; saveSymbolState(); continue; }
+      const pnl = pos.unrealizedPnl;
+      if (pnl >= CONFIG.positionTimeoutPnlMin && pnl <= CONFIG.positionTimeoutPnlMax) {
+        const elapsedH = (elapsed / 3_600_000).toFixed(1);
+        console.log(`\n⏰ Timeout — ${sym} aberto há ${elapsedH}h | PnL: $${pnl.toFixed(2)} — a fechar`);
+        const result = await closePosition(sym, pos);
+        console.log(`  ✅ Fechado por timeout — ${result.orderId}`);
+        state.positionOpenTime = null;
+        saveSymbolState();
+        await sendTelegram(
+          `⏰ <b>Bot v2 ${sym}</b> — Posição fechada por timeout\n` +
+          `Aberta há ${elapsedH}h | PnL: $${pnl.toFixed(2)}\n` +
+          `(PnL dentro de $${CONFIG.positionTimeoutPnlMin} a $${CONFIG.positionTimeoutPnlMax})`
+        );
+      }
+    } catch (e) {
+      console.log(`  ⚠️  Timeout check ${sym}: ${e.message}`);
+    }
+  }
 }
 
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
@@ -698,6 +806,16 @@ async function handleWebhook(body) {
   const sym           = symbol || process.env.SYMBOL || "BTCUSDT";
   const effectiveLev  = leverage ? parseInt(leverage) : CONFIG.leverage;
 
+  // ── Time filter (buy/sell only — TP always passes through) ────────────────
+  if (actionLower !== "tp" && CONFIG.tradeHoursStart !== null && CONFIG.tradeHoursEnd !== null) {
+    const hourUTC = new Date().getUTCHours();
+    if (!isInTimeWindow(hourUTC, CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd)) {
+      const window = `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC`;
+      console.log(`  ⏰ Fora do horário de trading (${String(hourUTC).padStart(2,"0")}:xx UTC | janela: ${window}) — sinal ignorado`);
+      return;
+    }
+  }
+
   // Use price from payload — but validate against live price.
   // If payload price differs by >10% from market, it's stale/wrong → use live price.
   let priceNum = parseFloat(price);
@@ -959,6 +1077,39 @@ async function handleWebhook(body) {
       }
     }
 
+    // ── Dynamic leverage ──────────────────────────────────────────────────────
+    let dynLev = effectiveLev;
+    if (CONFIG.dynamicLeverage && resolvedAtr) {
+      try {
+        const avg50 = await fetchATRAvg50(sym, candleInterval);
+        dynLev      = calcDynamicLeverage(resolvedAtr, avg50, effectiveLev);
+        const ratio = (resolvedAtr / avg50).toFixed(2);
+        if (dynLev !== effectiveLev) {
+          console.log(`  📊 Alavancagem dinâmica: ${effectiveLev}x → ${dynLev}x (ATR ${ratio}× acima da média)`);
+        } else {
+          console.log(`  ✅ Alavancagem dinâmica: ${dynLev}x (ATR ${ratio}× da média — sem redução)`);
+        }
+      } catch (e) {
+        console.log(`  ⚠️  Alavancagem dinâmica falhou: ${e.message} — a usar ${effectiveLev}x`);
+      }
+    }
+
+    // ── Volume filter ─────────────────────────────────────────────────────────
+    if (CONFIG.volumeFilterMult > 0) {
+      try {
+        const { currentVol, avgVol, ratio } = await fetchVolumeRatio(sym, candleInterval, CONFIG.volumeFilterPeriods);
+        if (ratio < CONFIG.volumeFilterMult) {
+          const msg = `⏸ Volume baixo: ${ratio.toFixed(2)}× média — mínimo ${CONFIG.volumeFilterMult}× — sinal ignorado`;
+          console.log(`  ${msg}`);
+          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nVol atual: ${currentVol.toFixed(0)} | Média(${CONFIG.volumeFilterPeriods}): ${avgVol.toFixed(0)}`);
+          return;
+        }
+        console.log(`  ✅ Filtro volume OK: ${ratio.toFixed(2)}× média (mínimo ${CONFIG.volumeFilterMult}×)`);
+      } catch (e) {
+        console.log(`  ⚠️  Filtro volume falhou: ${e.message} — a continuar`);
+      }
+    }
+
     // ── Fee viability filter ──────────────────────────────────────────────────
     // Skip trade if expected TP1 profit (1:1 RR, half position) < round-trip fees × threshold.
     // Uses worst-case taker fee (0.055%) for both sides — if chase limit fires, we're even better off.
@@ -1015,7 +1166,7 @@ async function handleWebhook(body) {
       console.log(`  ✅ R:R OK: ${rrRatio.toFixed(2)} (TP ${(tpPct * 100).toFixed(2)}% / SL ${(slPct * 100).toFixed(2)}%) ≥ mínimo ${CONFIG.minRR}`);
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum, effectiveLev, resolvedAtr);
+    const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
     recordSignalPlaced(sym, actionLower);
@@ -1066,9 +1217,19 @@ app.listen(PORT, () => {
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} (TP${(CONFIG.takeProfitPct * 100).toFixed(2)}% / SL%)` : "desativado (MIN_RR=0)"}`);
   console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `bloqueada se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}`);
+  console.log(`  Lev.dinâm : ${CONFIG.dynamicLeverage ? "ativo (ATR>avg→75% | ATR>1.5×avg→50%)" : "desativado (DYNAMIC_LEVERAGE=true para ativar)"}`);
+  console.log(`  Horário   : ${CONFIG.tradeHoursStart !== null ? `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC` : "24/7 (TRADE_HOURS_START/END para limitar)"}`);
+  console.log(`  Volume    : ${CONFIG.volumeFilterMult > 0 ? `skip se vol < ${CONFIG.volumeFilterMult}× média(${CONFIG.volumeFilterPeriods})` : "desativado (VOLUME_FILTER_MULT para ativar)"}`);
+  console.log(`  Timeout   : ${CONFIG.positionTimeoutHours > 0 ? `fecha após ${CONFIG.positionTimeoutHours}h se PnL entre $${CONFIG.positionTimeoutPnlMin} e $${CONFIG.positionTimeoutPnlMax}` : "desativado (POSITION_TIMEOUT_HOURS para ativar)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
+
+  // Start background position timeout checker (every 5 min)
+  if (CONFIG.positionTimeoutHours > 0) {
+    setInterval(checkPositionTimeouts, 5 * 60 * 1000);
+    console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
+  }
 });
