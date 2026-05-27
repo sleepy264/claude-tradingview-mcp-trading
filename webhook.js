@@ -66,6 +66,13 @@ const CONFIG = {
   // Block trade if SL×minRR would require a move larger than this to reach minRR.
   // Example: MAX_TP_PCT=0.12 → block if implied TP > 12% (unrealistically large target)
   maxTpPct:             parseFloat(process.env.MAX_TP_PCT || "0"),
+  // TP loss guard: skip TP close if the position's unrealized PnL is below this threshold (USD).
+  // Prevents closing half the position at a loss when TradingView's TP fires at a price that is
+  // still below the bot's actual entry (e.g. due to slippage or a different entry price).
+  // 0 = always execute TP regardless of current PnL (default — no protection).
+  // Example: MIN_TP_PNL_USD=-1 → allow TP only if unrealized PnL ≥ -$1 (tiny loss accepted).
+  //          MIN_TP_PNL_USD=0  → only execute TP if position is at or above break-even.
+  minTpPnlUSD:          parseFloat(process.env.MIN_TP_PNL_USD || "0"),
   // Reversal loss guard: block closing an opposite position if its unrealized loss
   // exceeds this threshold in USD. 0 = always reverse (no protection).
   // Example: MAX_REVERSAL_LOSS_USD=5 → only reverse if open position loss ≤ $5
@@ -873,7 +880,22 @@ async function handleWebhook(body) {
         await sendTelegram(`⚠️ <b>Bot v2 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
         return;
       }
-      console.log(`  Posição: ${openPos.side} qty=${openPos.size} — a fechar metade...`);
+      console.log(`  Posição: ${openPos.side} qty=${openPos.size} | PnL não realizado: ${openPos.unrealizedPnl >= 0 ? "+" : ""}$${openPos.unrealizedPnl.toFixed(2)}`);
+
+      // TP loss guard: skip if unrealized PnL is below the configured minimum
+      if (CONFIG.minTpPnlUSD !== 0 && openPos.unrealizedPnl < CONFIG.minTpPnlUSD) {
+        const msg = `⏸ TP ignorado — PnL não realizado $${openPos.unrealizedPnl.toFixed(2)} < mínimo $${CONFIG.minTpPnlUSD} (posição em perda)`;
+        console.log(`  ${msg}`);
+        await sendTelegram(
+          `⏸ <b>Bot v2 ${sym}</b> — TP ignorado\n` +
+          `Posição ${openPos.side} ainda em perda\n` +
+          `PnL atual: $${openPos.unrealizedPnl.toFixed(2)} | Mínimo para fechar: $${CONFIG.minTpPnlUSD}\n` +
+          `A aguardar recuperação antes de executar TP`
+        );
+        return;
+      }
+
+      console.log(`  A fechar metade...`);
       const result = await closeHalfPosition(sym, openPos);
       console.log(`  ✅ METADE FECHADA — orderId=${result.orderId} | fechado=${result.closedQty} | resta=${result.remainingQty}`);
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
@@ -1272,6 +1294,7 @@ app.listen(PORT, () => {
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} — TP implícito=SL×${CONFIG.minRR}${CONFIG.maxTpPct > 0 ? ` | bloq. se TP implícito > ${(CONFIG.maxTpPct*100).toFixed(2)}%` : " | sem cap (MAX_TP_PCT=0)"}` : "desativado (MIN_RR=0)"}`);
+  console.log(`  TP guard  : ${CONFIG.minTpPnlUSD !== 0 ? `skip TP se PnL < $${CONFIG.minTpPnlUSD}` : "desativado — TP sempre executa (MIN_TP_PNL_USD para ativar)"}`);
   console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `bloqueada se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}`);
   console.log(`  Lev.dinâm : ${CONFIG.dynamicLeverage ? "ativo (ATR>avg→75% | ATR>1.5×avg→50%)" : "desativado (DYNAMIC_LEVERAGE=true para ativar)"}`);
   console.log(`  Horário   : ${CONFIG.tradeHoursStart !== null ? `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC` : "24/7 (TRADE_HOURS_START/END para limitar)"}`);
