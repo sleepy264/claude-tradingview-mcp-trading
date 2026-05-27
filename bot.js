@@ -1013,15 +1013,101 @@ async function checkSlTp(symbol, currentPrice) {
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
 
-async function sendTelegram(message) {
+async function sendTelegram(message, chatId = null) {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
+  const target = chatId || process.env.TELEGRAM_CHAT_ID;
+  if (!token || !target) return;
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: target, text: message, parse_mode: "HTML" }),
   }).catch((e) => console.log("Telegram error:", e.message));
+}
+
+// ─── Telegram Command Polling ─────────────────────────────────────────────────
+// Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
+// Supported commands:
+//   /pnl1  — daily closed PnL (local session tracker)
+//   /pos1  — open position summary (from MEXC)
+
+async function handleTelegramCommand(text, chatId) {
+  const cmd = (text || "").trim().split(/\s+/)[0].toLowerCase().replace(/@\S+/, "");
+
+  if (cmd === "/pnl1") {
+    const pnl      = getDailyClosedPnl();
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const emoji    = pnl >= 0 ? "🟢" : "🔴";
+    await sendTelegram(
+      `${emoji} <b>PnL do dia — Bot v1</b> (${todayStr})\n` +
+      `Símbolo: <b>${CONFIG.symbol}</b>\n` +
+      `<b>Total: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</b>\n` +
+      `<i>(calculado localmente com base nos fechos da sessão)</i>`,
+      chatId
+    );
+    return;
+  }
+
+  if (cmd === "/pos1") {
+    try {
+      const pos = await getOpenPosition(CONFIG.mexcSymbol);
+      if (!pos) {
+        await sendTelegram(`📭 <b>Bot v1</b> — Sem posição aberta em ${CONFIG.symbol}`, chatId);
+        return;
+      }
+      const pnlStr = pos.unrealizedPnl !== null
+        ? `${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}`
+        : "n/d";
+      const emoji = pos.unrealizedPnl === null ? "📊" : pos.unrealizedPnl >= 0 ? "🟢" : "🔴";
+      await sendTelegram(
+        `${emoji} <b>Posição aberta — Bot v1</b>\n` +
+        `<b>${CONFIG.symbol}</b> ${pos.side} | qty=${pos.size}\n` +
+        `PnL não realizado: ${pnlStr}`,
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao obter posição MEXC: ${e.message}`, chatId);
+    }
+    return;
+  }
+}
+
+async function startTelegramPolling() {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log("⚠️  Telegram polling desativado — TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID em falta");
+    return;
+  }
+
+  let offset = 0;
+  console.log("📡 Telegram polling ativo — comandos disponíveis: /pnl1, /pos1");
+
+  const poll = async () => {
+    try {
+      const res  = await fetch(`https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message"]`, { signal: AbortSignal.timeout(30000) });
+      const data = await res.json();
+      if (!data.ok) return;
+
+      for (const update of data.result || []) {
+        offset = update.update_id + 1;
+        const msg    = update.message;
+        const text   = msg?.text || "";
+        const fromId = String(msg?.chat?.id || "");
+
+        // Only respond to messages from the configured chat
+        if (fromId !== String(chatId)) continue;
+        if (!text.startsWith("/")) continue;
+
+        console.log(`[Telegram cmd] ${text.trim()}`);
+        await handleTelegramCommand(text, fromId);
+      }
+    } catch (_) {
+      // Network blip — silently retry
+    }
+    setTimeout(poll, 1000);
+  };
+
+  poll();
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -1484,6 +1570,9 @@ async function run() {
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else {
+  // Start Telegram command polling in background (independent of trading cycle)
+  startTelegramPolling();
+
   run().catch((err) => {
     console.error("Bot error:", err);
     process.exit(1);
