@@ -1073,38 +1073,53 @@ async function handleTelegramCommand(text, chatId) {
 
 async function startTelegramPolling() {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const chatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
   if (!token || !chatId) {
     console.log("⚠️  Telegram polling desativado — TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID em falta");
     return;
   }
 
   let offset = 0;
-  console.log("📡 Telegram polling ativo — comandos disponíveis: /pnl1, /pos1");
+  console.log(`📡 Telegram polling ativo — comandos: /pnl1, /pos1 | chat_id=${chatId}`);
 
   const poll = async () => {
     try {
-      const res  = await fetch(`https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message"]`, { signal: AbortSignal.timeout(30000) });
+      // Use POST to avoid URL-encoding issues with array parameters
+      const res  = await fetch(`https://api.telegram.org/bot${token}/getUpdates`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ timeout: 25, offset, allowed_updates: ["message"] }),
+        signal:  AbortSignal.timeout(30000),
+      });
       const data = await res.json();
-      if (!data.ok) return;
+
+      if (!data.ok) {
+        console.log(`[Telegram poll] erro: ${data.description}`);
+        setTimeout(poll, 5000);
+        return;
+      }
 
       for (const update of data.result || []) {
         offset = update.update_id + 1;
         const msg    = update.message;
-        const text   = msg?.text || "";
-        const fromId = String(msg?.chat?.id || "");
+        const text   = (msg?.text || "").trim();
+        const fromId = String(msg?.chat?.id || "").trim();
 
         // Only respond to messages from the configured chat
-        if (fromId !== String(chatId)) continue;
+        if (fromId !== chatId) continue;
         if (!text.startsWith("/")) continue;
 
-        console.log(`[Telegram cmd] ${text.trim()}`);
-        await handleTelegramCommand(text, fromId);
+        console.log(`[Telegram cmd] ${text}`);
+        handleTelegramCommand(text, fromId).catch((e) =>
+          console.log(`[Telegram cmd] erro: ${e.message}`)
+        );
       }
-    } catch (_) {
-      // Network blip — silently retry
+    } catch (e) {
+      console.log(`[Telegram poll] ${e.message} — a tentar novamente em 5s`);
+      setTimeout(poll, 5000);
+      return;
     }
-    setTimeout(poll, 1000);
+    setTimeout(poll, 500);
   };
 
   poll();
