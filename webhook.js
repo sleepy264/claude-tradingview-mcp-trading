@@ -213,15 +213,139 @@ function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
 
-async function sendTelegram(message) {
+async function sendTelegram(message, chatId = null) {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
+  const target = chatId || process.env.TELEGRAM_CHAT_ID;
+  if (!token || !target) return;
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: target, text: message, parse_mode: "HTML" }),
   }).catch((e) => console.log("Telegram error:", e.message));
+}
+
+// ─── Telegram Command Polling ─────────────────────────────────────────────────
+// Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
+// Supported commands:
+//   /pnl2  — daily closed PnL (total + per symbol)
+//   /pos2  — open positions summary
+
+async function handleTelegramCommand(text, chatId) {
+  const cmd = (text || "").trim().split(/\s+/)[0].toLowerCase().replace(/@\S+/, "");
+
+  if (cmd === "/pnl2") {
+    try {
+      // Fetch all closed trades today (no symbol filter) and group by symbol
+      const todayMidnight = new Date();
+      todayMidnight.setHours(0, 0, 0, 0);
+      const startTime  = todayMidnight.getTime().toString();
+      const timestamp  = (Date.now() - 1500).toString();
+      const recvWindow = "10000";
+      const params     = `category=linear&startTime=${startTime}&limit=200`;
+      const sig        = sign(timestamp, recvWindow, params);
+      const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
+        headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      });
+      const data = await res.json();
+      const list = data.result?.list || [];
+
+      // Group by symbol
+      const bySymbol = {};
+      let total = 0;
+      for (const item of list) {
+        const sym = item.symbol;
+        const pnl = parseFloat(item.closedPnl || 0);
+        bySymbol[sym] = (bySymbol[sym] || 0) + pnl;
+        total += pnl;
+      }
+
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const lines = Object.entries(bySymbol)
+        .sort((a, b) => b[1] - a[1])
+        .map(([sym, pnl]) => `  ${sym}: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`);
+
+      const emoji = total >= 0 ? "🟢" : "🔴";
+      const msg = [
+        `${emoji} <b>PnL do dia — Bot v2</b> (${todayStr})`,
+        `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>`,
+        lines.length > 0 ? "\nPor símbolo:\n" + lines.join("\n") : "\nNenhuma trade fechada hoje.",
+      ].join("\n");
+
+      await sendTelegram(msg, chatId);
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao obter PnL: ${e.message}`, chatId);
+    }
+    return;
+  }
+
+  if (cmd === "/pos2") {
+    try {
+      const timestamp  = (Date.now() - 1500).toString();
+      const recvWindow = "10000";
+      const params     = "category=linear&settleCoin=USDT";
+      const sig        = sign(timestamp, recvWindow, params);
+      const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+        headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      });
+      const data = await res.json();
+      const positions = (data.result?.list || []).filter(p => parseFloat(p.size) > 0);
+
+      if (positions.length === 0) {
+        await sendTelegram(`📭 <b>Bot v2</b> — Sem posições abertas`, chatId);
+        return;
+      }
+
+      const lines = positions.map(p => {
+        const pnl    = parseFloat(p.unrealisedPnl || 0);
+        const emoji  = pnl >= 0 ? "🟢" : "🔴";
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${parseFloat(p.avgPrice).toFixed(4)}\n   PnL: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
+      });
+
+      await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}`, chatId);
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao obter posições: ${e.message}`, chatId);
+    }
+    return;
+  }
+}
+
+async function startTelegramPolling() {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log("⚠️  Telegram polling desativado — TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID em falta");
+    return;
+  }
+
+  let offset = 0;
+  console.log("📡 Telegram polling ativo — comandos disponíveis: /pnl2, /pos2");
+
+  const poll = async () => {
+    try {
+      const res  = await fetch(`https://api.telegram.org/bot${token}/getUpdates?timeout=25&offset=${offset}&allowed_updates=["message"]`, { signal: AbortSignal.timeout(30000) });
+      const data = await res.json();
+      if (!data.ok) return;
+
+      for (const update of data.result || []) {
+        offset = update.update_id + 1;
+        const msg     = update.message;
+        const text    = msg?.text || "";
+        const fromId  = String(msg?.chat?.id || "");
+
+        // Only respond to messages from the configured chat
+        if (fromId !== String(chatId)) continue;
+        if (!text.startsWith("/")) continue;
+
+        console.log(`[Telegram cmd] ${text.trim()}`);
+        await handleTelegramCommand(text, fromId);
+      }
+    } catch (_) {
+      // Network blip — silently retry
+    }
+    setTimeout(poll, 1000);
+  };
+
+  poll();
 }
 
 // ─── Bybit helpers ───────────────────────────────────────────────────────────
@@ -1312,4 +1436,7 @@ app.listen(PORT, () => {
     setInterval(checkPositionTimeouts, 5 * 60 * 1000);
     console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
   }
+
+  // Start Telegram command polling
+  startTelegramPolling();
 });
