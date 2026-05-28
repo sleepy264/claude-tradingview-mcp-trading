@@ -1585,9 +1585,6 @@ async function run() {
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else {
-  // Start Telegram command polling in background (independent of trading cycle)
-  startTelegramPolling();
-
   run().catch((err) => {
     console.error("Bot error:", err);
     process.exit(1);
