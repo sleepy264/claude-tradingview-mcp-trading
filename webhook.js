@@ -606,46 +606,43 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
 // atrValue: if provided (from payload or pre-fetched), skips the Bybit candle fetch.
 // Returns { orderId, slPrice, slPct, slDistance, atrUsed, tradeSize, filledAs }
 //   filledAs: "maker" (limit filled) | "taker" (market fallback)
-async function placeOrder(symbol, action, price, lev, atrValue = null) {
+// slOverride: absolute SL price from payload (e.g. TradingView indicator level).
+//   When provided, skips ATR calculation and uses this price directly.
+async function placeOrder(symbol, action, price, lev, atrValue = null, slOverride = null) {
   const side = action === "buy" ? "Buy" : "Sell";
 
-  // ── ATR-based SL ─────────────────────────────────────────────────────────
-  let atr = atrValue;
-  if (!atr) {
-    try {
-      atr = await fetchATR(symbol, CONFIG.candleInterval);
-    } catch (e) {
-      console.log(`  ⚠️  ATR fetch falhou (${e.message}) — a usar SL fixo ${CONFIG.stopLossPct * 100}%`);
-    }
-  }
+  let slPct, slDistance, stopLoss, atr = atrValue;
 
-  let slPct, slDistance;
-  if (atr) {
-    slDistance = atr * CONFIG.atrMultiplier;
+  if (slOverride) {
+    // ── SL from payload (TradingView structural level) ───────────────────
+    stopLoss   = parseFloat(slOverride).toFixed(2);
+    slDistance = Math.abs(price - parseFloat(slOverride));
     slPct      = slDistance / price;
-    // Note: interval label omitted here — already logged in handleWebhook when ATR was resolved
-    console.log(`  ATR=$${atr.toFixed(4)} | SL=${CONFIG.atrMultiplier}×ATR=$${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
+    console.log(`  SL do payload (TradingView): $${stopLoss} | distância $${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
   } else {
-    slPct      = CONFIG.stopLossPct;
-    slDistance = price * slPct;
-    console.log(`  SL fixo: ${(slPct * 100).toFixed(2)}%`);
+    // ── ATR-based SL (fallback) ───────────────────────────────────────────
+    if (!atr) {
+      try {
+        atr = await fetchATR(symbol, CONFIG.candleInterval);
+      } catch (e) {
+        console.log(`  ⚠️  ATR fetch falhou (${e.message}) — a usar SL fixo ${CONFIG.stopLossPct * 100}%`);
+      }
+    }
+
+    if (atr) {
+      slDistance = atr * CONFIG.atrMultiplier;
+      slPct      = slDistance / price;
+      console.log(`  ATR=$${atr.toFixed(4)} | SL=${CONFIG.atrMultiplier}×ATR=$${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
+    } else {
+      slPct      = CONFIG.stopLossPct;
+      slDistance = price * slPct;
+      console.log(`  SL fixo: ${(slPct * 100).toFixed(2)}%`);
+    }
+
+    stopLoss = action === "buy"
+      ? (price - slDistance).toFixed(2)
+      : (price + slDistance).toFixed(2);
   }
-
-  // ── Position sizing ───────────────────────────────────────────────────────
-  const tradeSize = CONFIG.riskPerTradeUSD > 0
-    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, lev, slPct, CONFIG.tradeSize)
-    : CONFIG.tradeSize;
-  const tradeSizeMode = CONFIG.riskPerTradeUSD > 0
-    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
-    : `fixo ($${tradeSize})`;
-
-  const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
-  const quantity = calcQty(tradeSize, lev, price, minQty, qtyStep);
-  console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
-
-  const stopLoss = action === "buy"
-    ? (price - slDistance).toFixed(2)
-    : (price + slDistance).toFixed(2);
   console.log(`  SL: $${stopLoss}`);
   // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
   // to avoid conflict with the half-close + break-even logic
@@ -957,7 +954,7 @@ app.post("/webhook", (req, res) => {
 
 async function handleWebhook(body) {
 
-  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr, interval: payloadInterval } = body;
+  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr, interval: payloadInterval, sl: payloadSl } = body;
 
   // Validate required fields
   if (!action) {
@@ -1308,63 +1305,67 @@ async function handleWebhook(body) {
       }
     }
 
+    // Effective SL % — use payload SL price if provided, otherwise ATR-derived.
+    // All pre-entry filters (fee viability, volatility, R:R) use this same value
+    // so they stay consistent with the SL that will actually be placed.
+    const slNum = parseFloat(payloadSl) > 0 ? parseFloat(payloadSl) : null;
+    const effectiveSlPct = slNum
+      ? Math.abs(priceNum - slNum) / priceNum
+      : resolvedAtr
+        ? (resolvedAtr * CONFIG.atrMultiplier) / priceNum
+        : CONFIG.stopLossPct;
+    const slSource = slNum ? `payload ($${slNum})` : resolvedAtr ? `ATR×${CONFIG.atrMultiplier}` : "fixo";
+    if (slNum) console.log(`  SL do payload: $${slNum} | distância ${(effectiveSlPct * 100).toFixed(3)}%`);
+
     // ── Fee viability filter ──────────────────────────────────────────────────
     // Skip trade if expected TP1 profit (1:1 RR, half position) < round-trip fees × threshold.
     // Uses worst-case taker fee (0.055%) for both sides — if chase limit fires, we're even better off.
-    if (CONFIG.feeViabilityThreshold > 0 && resolvedAtr) {
-      const slPct           = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
+    if (CONFIG.feeViabilityThreshold > 0 && (slNum || resolvedAtr)) {
       const notional        = CONFIG.tradeSize * effectiveLev;
-      const feesRoundTrip   = notional * 0.00055 * 2;            // taker 0.055% × 2 sides
-      const expectedTp1     = notional * slPct * 0.5;            // 1:1 RR on half position at TP1
+      const feesRoundTrip   = notional * 0.00055 * 2;
+      const expectedTp1     = notional * effectiveSlPct * 0.5;
       const minRequired     = feesRoundTrip * CONFIG.feeViabilityThreshold;
       if (expectedTp1 < minRequired) {
         const msg = `⏸ Trade ignorado — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas ($${feesRoundTrip.toFixed(2)}) × ${CONFIG.feeViabilityThreshold}`;
         console.log(`  ${msg}`);
-        await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nSL% ${(slPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
+        await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nSL (${slSource}): ${(effectiveSlPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
         return;
       }
       console.log(`  ✅ Viabilidade taxas OK: TP1 $${expectedTp1.toFixed(2)} ≥ taxas $${feesRoundTrip.toFixed(2)} × ${CONFIG.feeViabilityThreshold}`);
     }
 
     // ── Volatility filter ─────────────────────────────────────────────────────
-    if (resolvedAtr && CONFIG.maxSlPct > 0) {
-      const slPct = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
-      if (slPct > CONFIG.maxSlPct) {
-        const slPctStr    = (slPct * 100).toFixed(2);
+    if (CONFIG.maxSlPct > 0 && (slNum || resolvedAtr)) {
+      if (effectiveSlPct > CONFIG.maxSlPct) {
+        const slPctStr    = (effectiveSlPct * 100).toFixed(2);
         const limitPctStr = (CONFIG.maxSlPct * 100).toFixed(1);
-        const msg = `⏸ Sinal ignorado — mercado volátil: SL seria ${slPctStr}% > limite ${limitPctStr}%`;
+        const msg = `⏸ Sinal ignorado — SL demasiado largo: ${slPctStr}% > limite ${limitPctStr}%`;
         console.log(`  ${msg}`);
         await sendTelegram(
           `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
-          `Mercado demasiado volátil para entrar\n` +
-          `ATR(${CONFIG.atrPeriod},${candleInterval}m)=$${resolvedAtr.toFixed(4)} → SL seria ${slPctStr}%\n` +
-          `Limite configurado: ${limitPctStr}%`
+          `SL (${slSource}) demasiado largo\n` +
+          `SL: ${slPctStr}% | Limite: ${limitPctStr}%`
         );
         return;
       }
-      console.log(`  ✅ Filtro volatilidade OK: SL ${((resolvedAtr * CONFIG.atrMultiplier / priceNum) * 100).toFixed(2)}% ≤ ${(CONFIG.maxSlPct * 100).toFixed(1)}%`);
+      console.log(`  ✅ Filtro volatilidade OK: SL ${(effectiveSlPct * 100).toFixed(2)}% ≤ ${(CONFIG.maxSlPct * 100).toFixed(1)}%`);
     }
 
     // ── Minimum R:R filter ────────────────────────────────────────────────────
-    // TP is fired externally by TradingView, so we can't fix a static TP%.
-    // Instead, we compute the *implied* TP target = SL × minRR (the minimum move the
-    // strategy must achieve to satisfy the R:R requirement) and block only if that
-    // implied target exceeds MAX_TP_PCT (unrealistically large given the volatility).
-    if (CONFIG.minRR > 0 && resolvedAtr) {
-      const slPct       = (resolvedAtr * CONFIG.atrMultiplier) / priceNum;
-      const impliedTpPct = slPct * CONFIG.minRR;   // min move TradingView must target
+    if (CONFIG.minRR > 0 && (slNum || resolvedAtr)) {
+      const impliedTpPct = effectiveSlPct * CONFIG.minRR;
       if (CONFIG.maxTpPct > 0 && impliedTpPct > CONFIG.maxTpPct) {
-        const msg = `⏸ TP implícito ${(impliedTpPct * 100).toFixed(2)}% (SL ${(slPct * 100).toFixed(2)}% × ${CONFIG.minRR}) > máx ${(CONFIG.maxTpPct * 100).toFixed(2)}% — sinal ignorado`;
+        const msg = `⏸ TP implícito ${(impliedTpPct * 100).toFixed(2)}% (SL ${(effectiveSlPct * 100).toFixed(2)}% × ${CONFIG.minRR}) > máx ${(CONFIG.maxTpPct * 100).toFixed(2)}% — sinal ignorado`;
         console.log(`  ${msg}`);
         await sendTelegram(
           `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
           `${msg}\n` +
-          `ATR=${resolvedAtr.toFixed(4)} → SL=$${(resolvedAtr * CONFIG.atrMultiplier).toFixed(4)} (${(slPct * 100).toFixed(2)}%)\n` +
+          `SL (${slSource}): ${(effectiveSlPct * 100).toFixed(2)}%\n` +
           `Para R:R≥${CONFIG.minRR} o TradingView teria de alvo ≥${(impliedTpPct * 100).toFixed(2)}% — demasiado`
         );
         return;
       }
-      console.log(`  ✅ R:R OK: SL ${(slPct * 100).toFixed(2)}% → TP implícito ${(impliedTpPct * 100).toFixed(2)}% (×${CONFIG.minRR})${CONFIG.maxTpPct > 0 ? ` ≤ máx ${(CONFIG.maxTpPct * 100).toFixed(2)}%` : ""}`);
+      console.log(`  ✅ R:R OK: SL ${(effectiveSlPct * 100).toFixed(2)}% → TP implícito ${(impliedTpPct * 100).toFixed(2)}% (×${CONFIG.minRR})${CONFIG.maxTpPct > 0 ? ` ≤ máx ${(CONFIG.maxTpPct * 100).toFixed(2)}%` : ""}`);
     }
 
     // ── Spread check ─────────────────────────────────────────────────────────
@@ -1383,7 +1384,7 @@ async function handleWebhook(body) {
       }
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr);
+    const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
     recordSignalPlaced(sym, actionLower);
@@ -1443,7 +1444,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
-  console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "atr":0.5 (opcional) }`);
+  console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
 
   // Start background position timeout checker (every 5 min)
