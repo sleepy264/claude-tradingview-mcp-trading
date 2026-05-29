@@ -647,6 +647,18 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
   // to avoid conflict with the half-close + break-even logic
 
+  // ── Position sizing ───────────────────────────────────────────────────────
+  const tradeSize = CONFIG.riskPerTradeUSD > 0
+    ? calcRiskBasedTradeSize(CONFIG.riskPerTradeUSD, lev, slPct, CONFIG.tradeSize)
+    : CONFIG.tradeSize;
+  const tradeSizeMode = CONFIG.riskPerTradeUSD > 0
+    ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
+    : `fixo ($${tradeSize})`;
+
+  const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
+  const quantity = calcQty(tradeSize, lev, price, minQty, qtyStep);
+  console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+
   // ── Chase Limit → Market fallback ────────────────────────────────────────
   // 1st attempt: Limit order at current bid (buy) or ask (sell) → maker fee 0.02%
   // If not filled within CHASE_LIMIT_TIMEOUT_MS → cancel → Market order → taker fee 0.055%
