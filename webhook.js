@@ -748,8 +748,15 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
 
 async function fetchCurrentPrice(symbol) {
   const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
-  const data = await res.json();
-  return parseFloat(data.result?.list?.[0]?.lastPrice || "0");
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    const raw = await res.text().catch(() => "(ilegível)");
+    console.log(`  ⚠️  fetchCurrentPrice JSON parse falhou para ${symbol}: ${e.message} | body: ${raw.substring(0, 200)}`);
+    return null;
+  }
+  return parseFloat(data.result?.list?.[0]?.lastPrice || "0") || null;
 }
 
 async function getOpenPosition(symbol) {
@@ -999,6 +1006,10 @@ async function handleWebhook(body) {
   if (!priceNum || isNaN(priceNum)) {
     console.log("  ℹ️  No price in payload — fetching live price from Bybit...");
     priceNum = await fetchCurrentPrice(sym);
+    if (!priceNum) {
+      console.log("  ❌ Não foi possível obter preço live — sinal ignorado");
+      return;
+    }
   } else {
     const livePrice = await fetchCurrentPrice(sym);
     if (livePrice) {
