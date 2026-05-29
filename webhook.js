@@ -246,7 +246,12 @@ async function handleTelegramCommand(text, chatId) {
       const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
         headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
       });
-      const data = await res.json();
+      const rawText = await res.text();
+      let data;
+      try { data = JSON.parse(rawText); }
+      catch (e) {
+        throw new Error(`Bybit devolveu resposta inválida (HTTP ${res.status}): ${rawText.substring(0, 300)}`);
+      }
       const list = data.result?.list || [];
 
       // Group by symbol
@@ -287,7 +292,12 @@ async function handleTelegramCommand(text, chatId) {
       const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
         headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
       });
-      const data = await res.json();
+      const rawText = await res.text();
+      let data;
+      try { data = JSON.parse(rawText); }
+      catch (e) {
+        throw new Error(`Bybit devolveu resposta inválida (HTTP ${res.status}): ${rawText.substring(0, 300)}`);
+      }
       const positions = (data.result?.list || []).filter(p => parseFloat(p.size) > 0);
 
       if (positions.length === 0) {
