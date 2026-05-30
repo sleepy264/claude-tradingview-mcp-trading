@@ -1122,6 +1122,16 @@ async function startTelegramPolling() {
     setTimeout(poll, 500);
   };
 
+  // Register bot commands so the "/" menu appears in Telegram
+  fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ commands: [
+      { command: "pnl1", description: "📊 PnL do dia" },
+      { command: "pos1", description: "📈 Posição aberta" },
+    ]}),
+  }).catch(() => {});
+
   poll();
 }
 
