@@ -391,24 +391,51 @@ function sign(timestamp, recvWindow, body) {
 }
 
 async function setLeverage(symbol, lev) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(lev), sellLeverage: String(lev) });
-  const sig        = sign(timestamp, recvWindow, body);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
+  const attempt = async (leverage) => {
+    const timestamp  = (Date.now() - 1500).toString();
+    const recvWindow = "10000";
+    const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(leverage), sellLeverage: String(leverage) });
+    const sig        = sign(timestamp, recvWindow, body);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      body,
+    });
+    return res.json();
+  };
+
+  let data = await attempt(lev);
+
+  // If leverage exceeds instrument maximum, auto-cap and retry once.
+  // Bybit error message format: "cannot set leverage [REQ] gt maxLeverage [MAX]..."
+  if (data.retCode !== 0 && data.retCode !== 110043) {
+    const match = data.retMsg?.match(/gt maxLeverage \[(\d+)\]/);
+    if (match) {
+      const maxLev = Math.floor(parseInt(match[1]) / 100); // Bybit returns in basis points (×100)
+      console.log(`  ⚠️  Leverage ${lev}x excede máximo ${maxLev}x para ${symbol} — a usar ${maxLev}x`);
+      data = await attempt(maxLev);
+    }
+    if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
+  }
 }
 
-async function getInstrumentLotSize(symbol) {
+async function getInstrumentInfo(symbol) {
   const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/instruments-info?category=linear&symbol=${symbol}`);
   const data = await res.json();
-  const lot  = data.result?.list?.[0]?.lotSizeFilter;
-  return { minQty: parseFloat(lot?.minOrderQty || "0.001"), qtyStep: parseFloat(lot?.qtyStep || "0.001") };
+  const inst = data.result?.list?.[0];
+  const lot  = inst?.lotSizeFilter;
+  const lev  = inst?.leverageFilter;
+  return {
+    minQty:      parseFloat(lot?.minOrderQty   || "0.001"),
+    qtyStep:     parseFloat(lot?.qtyStep       || "0.001"),
+    maxLeverage: parseFloat(lev?.maxLeverage   || "0"),
+  };
+}
+
+// Keep old name as alias so existing callers still work
+async function getInstrumentLotSize(symbol) {
+  const { minQty, qtyStep } = await getInstrumentInfo(symbol);
+  return { minQty, qtyStep };
 }
 
 // Bybit supports these kline intervals (minutes, or D/W/M).
@@ -675,7 +702,12 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
     ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
     : `fixo ($${tradeSize})`;
 
-  const { minQty, qtyStep } = await getInstrumentLotSize(symbol);
+  const { minQty, qtyStep, maxLeverage } = await getInstrumentInfo(symbol);
+  // Cap leverage to instrument maximum (avoids "gt maxLeverage" error from Bybit)
+  if (maxLeverage > 0 && lev > maxLeverage) {
+    console.log(`  ⚠️  Leverage ${lev}x capado a ${maxLeverage}x (máx para ${symbol})`);
+    lev = maxLeverage;
+  }
   const quantity = calcQty(tradeSize, lev, price, minQty, qtyStep);
   console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
 
