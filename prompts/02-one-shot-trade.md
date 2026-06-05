@@ -330,37 +330,24 @@ conditions, not a generic template."
 
 ---
 
-## STEP 5 — Deploy to Railway (run the bot 24/7 in the cloud)
+## STEP 5 — Deploy to a Hostinger VPS (run the bot 24/7 in the cloud)
 
 Tell the user: "Now let's get this running in the cloud so it works even when your
-laptop is closed. We'll use Railway for this."
+laptop is closed. We'll put it on a Hostinger VPS — a small always-on server,
+from about $5/month."
 
-Check if Railway CLI is installed:
-```bash
-railway --version
-```
+Ask the user:
 
-If not installed, install it:
-```bash
-npm install -g @railway/cli
-```
+"Do you have a Hostinger VPS yet? If not, grab the cheapest KVM plan here — it's
+plenty for this bot: https://hostinger.com/lewisjackson10
 
-Check if they're logged into Railway:
-```bash
-railway whoami
-```
+Once it's set up, Hostinger gives you the server IP address and a root password.
+Paste me the IP and password when you have them (or type 'done' if you already
+have a VPS ready)."
 
-If not logged in:
-```bash
-railway login
-```
+**[PAUSE — wait for VPS IP + password]**
 
-Tell them: "I've opened the Railway login page. Log in with GitHub or email,
-then come back and type 'done'."
-
-**[PAUSE if login is needed]**
-
-Once logged in, ask the user before touching anything:
+Once you have the IP, ask the user before touching anything:
 
 "How often do you want the bot to check for trades?
 
@@ -379,29 +366,32 @@ Map their choice to a cron expression:
 - 3 → `0 * * * *`
 - Custom → interpret what they said and write the correct cron expression
 
-Now write that schedule into `railway.json` automatically — no need for the user to touch Railway:
+Now set the bot up on the VPS over SSH. Run these — substitute their IP, the repo
+URL, and their chosen cron expression:
 
 ```bash
-# Read their chosen cron, then update railway.json with it
+ssh root@THEIR_VPS_IP "apt update && apt install -y nodejs npm git && \
+  git clone <repo-url> bot && cd bot && npm install"
 ```
 
-Update the `deploy` section of `railway.json` to include:
-```json
-"cronSchedule": "[their chosen cron expression]"
-```
-
-Then deploy:
-```bash
-railway init
-railway up
-```
-
-Tell them: "Done — I've set your schedule to [plain English description of their choice] and deployed. You don't need to touch Railway at all.
-
-Your bot is now live. It's set to PAPER TRADING mode by default — which means it checks everything and logs every decision, but no real money moves until you turn it on. Watch it for a few days. When you're happy, run:
+Copy their local `.env` up so the bot has its keys:
 
 ```bash
-railway variables set PAPER_TRADING=false
+scp .env root@THEIR_VPS_IP:/root/bot/.env
+```
+
+Then add their schedule to the VPS crontab — no dashboards, no platform to manage:
+
+```bash
+ssh root@THEIR_VPS_IP "(crontab -l 2>/dev/null; echo '[their cron expression] cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1') | crontab -"
+```
+
+Tell them: "Done — your bot is on your Hostinger VPS and set to check [plain English description of their choice]. It runs whether your laptop is on or off.
+
+It's in PAPER TRADING mode by default — it checks everything and logs every decision, but no real money moves until you turn it on. Watch it for a few days. When you're happy, flip it live by setting `PAPER_TRADING=false` in the `.env` on the VPS:
+
+```bash
+ssh root@THEIR_VPS_IP "sed -i 's/PAPER_TRADING=true/PAPER_TRADING=false/' /root/bot/.env"
 ```
 
 And it goes live."

@@ -14,7 +14,7 @@
 
 1. **Claude connected to your exchange** — reads your TradingView chart and executes trades on BitGet automatically
 2. **A safety check** — every condition in your strategy must pass before a single trade goes through
-3. **24/7 cloud execution** — deploy to Railway and it runs on a schedule, even when your laptop is closed
+3. **24/7 cloud execution** — deploy to a Hostinger VPS and it runs on a schedule, even when your laptop is closed
 4. **Automatic tax accounting** — every trade logged to `trades.csv` with date, price, fees, and net amount, ready for your accountant
 5. **Free** — no email, no course, no upsell. Everything is in this repo.
 
@@ -48,7 +48,7 @@ If anything fails the safety check, it stops and tells you exactly which conditi
 
 Copy the entire contents of [`prompts/02-one-shot-trade.md`](prompts/02-one-shot-trade.md) and paste it into your Claude Code terminal.
 
-That's it. Claude acts as your onboarding agent — it clones the repo, walks you through connecting BitGet, sets your trading preferences, connects TradingView, optionally builds a strategy from a YouTube channel, deploys to Railway, and runs the bot for the first time. Every step is interactive. It pauses when it needs something from you and handles everything else automatically.
+That's it. Claude acts as your onboarding agent — it clones the repo, walks you through connecting BitGet, sets your trading preferences, connects TradingView, optionally builds a strategy from a YouTube channel, deploys it to a Hostinger VPS, and runs the bot for the first time. Every step is interactive. It pauses when it needs something from you and handles everything else automatically.
 
 ---
 
@@ -149,24 +149,35 @@ node bot.js
 
 ---
 
-## Deploy to Railway (Run in the Cloud 24/7)
+## Deploy to a Hostinger VPS (Run in the Cloud 24/7)
 
-The local setup runs when your laptop is open. Railway lets the bot check for setups around the clock — even while you sleep.
+The local setup runs when your laptop is open. A Hostinger VPS lets the bot check for setups around the clock — even while you sleep.
 
 > **Note:** Cloud mode pulls candle data directly from Binance's free market API instead of TradingView. No TradingView Desktop needed in the cloud. The strategy logic and safety check are identical.
 
-### 1. Deploy
+### 1. Get a VPS
+
+Grab a Hostinger VPS — the cheapest KVM plan is plenty, from ~$5/mo: **https://hostinger.com/lewisjackson10**
+
+Once it's provisioned, Hostinger gives you an IP and root password. SSH in:
 
 ```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
+ssh root@YOUR_VPS_IP
 ```
 
-### 2. Set your environment variables in Railway
+### 2. Deploy
 
-Go to your Railway project → Variables and add everything from `.env.example`:
+On the VPS:
+
+```bash
+apt update && apt install -y nodejs npm git
+git clone <your-repo-url> bot && cd bot
+npm install
+```
+
+### 3. Set your environment variables
+
+Create a `.env` file on the VPS with everything from `.env.example`:
 
 | Variable | Example |
 |----------|---------|
@@ -180,17 +191,17 @@ Go to your Railway project → Variables and add everything from `.env.example`:
 | `SYMBOL` | BTCUSDT |
 | `TIMEFRAME` | 4H |
 
-### 3. Set a cron schedule
+### 4. Set a cron schedule
 
-In Railway → Settings → Cron Schedule, set how often the bot runs. Recommended:
+The bot runs one check and exits, so schedule it with the VPS's built-in cron. Run `crontab -e` and add one line matching your chart timeframe (all run from the repo dir and log to `bot.log`):
 
-| Timeframe | Schedule | What it means |
+| Timeframe | Crontab line | What it means |
 |-----------|----------|----------------|
-| 4H chart | `0 */4 * * *` | Every 4 hours |
-| 1D chart | `0 9 * * *` | Once a day at 9am UTC |
-| 1H chart | `0 * * * *` | Every hour |
+| 4H chart | `0 */4 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every 4 hours |
+| 1D chart | `0 9 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Once a day at 9am UTC |
+| 1H chart | `0 * * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every hour |
 
-### 4. Start in paper trading mode
+### 5. Start in paper trading mode
 
 `PAPER_TRADING=true` logs every decision but never places real orders. Watch a few days of paper trades, confirm the logic matches what you expect, then flip it to `false`.
 
