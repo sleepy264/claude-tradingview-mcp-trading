@@ -101,6 +101,15 @@ const CONFIG = {
   // Spread check: skip entry if bid/ask spread exceeds this % of mid price (0 = disabled).
   // Example: MAX_SPREAD_PCT=0.1 → skip if spread > 0.1% (i.e. 10 bps)
   maxSpreadPct: parseFloat(process.env.MAX_SPREAD_PCT || "0"),
+  // Trailing-stop re-entry: if a position is closed by the trailing-stop at breakeven/profit
+  // (no SL hit, no TP signal), arm a re-entry watch at the exit price. If price later breaks
+  // back past that level in the original direction, re-enter — at most once per
+  // REENTRY_COOLDOWN_MS (default 1h, i.e. one 1h candle). The watch expires after
+  // REENTRY_EXPIRY_HOURS with no breakout, or is cancelled by any new buy/sell signal.
+  // 0/false = disabled.
+  trailingReentryEnabled: process.env.TRAILING_REENTRY_ENABLED === "true",
+  reentryCooldownMs:      parseInt(process.env.REENTRY_COOLDOWN_MS || "3600000"),  // 1h
+  reentryExpiryHours:     parseFloat(process.env.REENTRY_EXPIRY_HOURS || "6"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -145,11 +154,14 @@ function _getSymState(symbol) {
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
 // Called after a BUY/SELL order is successfully placed.
-function recordSignalPlaced(symbol, action) {
+function recordSignalPlaced(symbol, action, price = null) {
   const s = _getSymState(symbol);
   if (action === "buy") s.lastBuyTime = Date.now();
   else                  s.lastSellTime = Date.now();
   s.positionOpenTime = Date.now(); // for position timeout tracking
+  s.lastAction       = action;     // for trailing-stop re-entry direction
+  s.lastEntryPrice   = price;
+  delete s.reentry;                 // a fresh entry supersedes any pending re-entry watch
   saveSymbolState();
 }
 
@@ -632,6 +644,133 @@ async function checkPositionTimeouts() {
   }
 }
 
+// Background re-entry check — runs every 1 min when TRAILING_REENTRY_ENABLED=true.
+// 1) Detects positions closed without a TP signal: if closedPnl ≥ 0 (breakeven/profit,
+//    so it was the trailing-stop — not an SL loss), arms a re-entry watch at the exit price.
+// 2) For armed watches, re-enters the same direction once price breaks back past that
+//    level — at most once per REENTRY_COOLDOWN_MS, expiring after REENTRY_EXPIRY_HOURS.
+async function checkTrailingReentries() {
+  if (!CONFIG.trailingReentryEnabled) return;
+  const now = Date.now();
+
+  for (const [sym, state] of Object.entries(symbolState)) {
+    try {
+      // ── 1) Detect trailing-stop closure ──────────────────────────────────
+      if (state.positionOpenTime) {
+        const pos = await getOpenPosition(sym);
+        if (!pos) {
+          state.positionOpenTime = null;
+          const last = await getLastClosedPnl(sym);
+          if (last && parseFloat(last.closedPnl) >= 0 && state.lastAction) {
+            state.reentry = {
+              action:          state.lastAction,
+              level:           parseFloat(last.avgExitPrice),
+              createdAt:       now,
+              lastAttemptTime: 0,
+            };
+            console.log(`  🔁 ${sym}: posição fechada por trailing-stop @ $${last.avgExitPrice} (PnL $${parseFloat(last.closedPnl).toFixed(2)}) — a vigiar re-entrada ${state.lastAction.toUpperCase()}`);
+          }
+          saveSymbolState();
+        }
+      }
+
+      // ── 2) Check armed re-entry watches ──────────────────────────────────
+      if (state.reentry) {
+        const r = state.reentry;
+        const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
+        if (now - r.createdAt > expiryMs) {
+          console.log(`  ⌛ ${sym}: watch de re-entrada expirou (${CONFIG.reentryExpiryHours}h sem breakout)`);
+          delete state.reentry;
+          saveSymbolState();
+          continue;
+        }
+        if (now - r.lastAttemptTime < CONFIG.reentryCooldownMs) continue;
+
+        const currentPrice = await fetchCurrentPrice(sym);
+        if (!currentPrice) continue;
+
+        const breakout = r.action === "buy" ? currentPrice > r.level : currentPrice < r.level;
+        if (!breakout) continue;
+
+        const openPos = await getOpenPosition(sym);
+        if (openPos) { delete state.reentry; saveSymbolState(); continue; } // already has a position — drop watch
+
+        r.lastAttemptTime = now;
+        saveSymbolState();
+        await executeReentry(sym, r.action, currentPrice, r.level);
+      }
+    } catch (e) {
+      console.log(`  ⚠️  Reentry check ${sym}: ${e.message}`);
+    }
+  }
+}
+
+// Executes a trailing-stop re-entry: same direction as the position just closed by the
+// trailing-stop, now that price has broken back past the exit level. Applies the same
+// time/volatility/fee filters as a normal signal, but skips trend/volume/R:R — those
+// validate TradingView's own signal quality, not this price-confirmed continuation.
+async function executeReentry(symbol, action, priceNum, exitLevel) {
+  console.log(`\n🔁 [Re-entrada] ${symbol} ${action.toUpperCase()} @ $${priceNum} (rompeu nível de saída $${exitLevel})`);
+
+  if (CONFIG.tradeHoursStart !== null && CONFIG.tradeHoursEnd !== null) {
+    const hourUTC = new Date().getUTCHours();
+    if (!isInTimeWindow(hourUTC, CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd)) {
+      console.log(`  ⏰ Fora do horário de trading — re-entrada ignorada`);
+      return;
+    }
+  }
+
+  try {
+    let resolvedAtr = null;
+    try { resolvedAtr = await fetchATR(symbol, CONFIG.candleInterval); }
+    catch (e) { console.log(`  ⚠️  ATR fetch falhou: ${e.message} — SL fixo será usado`); }
+
+    let dynLev = CONFIG.leverage;
+    if (CONFIG.dynamicLeverage && resolvedAtr) {
+      try {
+        const avg50 = await fetchATRAvg50(symbol, CONFIG.candleInterval);
+        dynLev      = calcDynamicLeverage(resolvedAtr, avg50, CONFIG.leverage);
+      } catch {}
+    }
+
+    const effectiveSlPct = resolvedAtr ? (resolvedAtr * CONFIG.atrMultiplier) / priceNum : CONFIG.stopLossPct;
+
+    if (CONFIG.maxSlPct > 0 && effectiveSlPct > CONFIG.maxSlPct) {
+      console.log(`  ⏸ Re-entrada ignorada — SL ${(effectiveSlPct * 100).toFixed(2)}% > limite ${(CONFIG.maxSlPct * 100).toFixed(1)}%`);
+      return;
+    }
+
+    if (CONFIG.feeViabilityThreshold > 0 && resolvedAtr) {
+      const notional      = CONFIG.tradeSize * dynLev;
+      const feesRoundTrip = notional * 0.00055 * 2;
+      const expectedTp1   = notional * effectiveSlPct * 0.5;
+      if (expectedTp1 < feesRoundTrip * CONFIG.feeViabilityThreshold) {
+        console.log(`  ⏸ Re-entrada ignorada — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas × ${CONFIG.feeViabilityThreshold}`);
+        return;
+      }
+    }
+
+    await setLeverage(symbol, dynLev);
+    const order = await placeOrder(symbol, action, priceNum, dynLev, resolvedAtr, null);
+    console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${order.filledAs === "maker" ? "maker 0.02%" : "taker 0.055%"}`);
+    recordSignalPlaced(symbol, action, priceNum);
+
+    if (CONFIG.tradeMode === "futures") {
+      await setTrailingStop(symbol, action, priceNum, resolvedAtr);
+    }
+
+    logTrade(symbol, action, priceNum, order.tradeSize, order.orderId, "LIVE", `Re-entrada após trailing-stop @ $${exitLevel}`);
+    await sendTelegram(
+      `🔁 <b>Bot v2 ${symbol}</b> — Re-entrada ${action.toUpperCase()}\n` +
+      `Preço: $${priceNum} | Rompeu nível de saída do trailing-stop ($${exitLevel})\n` +
+      `SL: $${order.slPrice} (${(order.slPct * 100).toFixed(2)}%)`
+    );
+  } catch (e) {
+    console.log(`  ❌ Re-entrada falhou: ${e.message}`);
+    await sendTelegram(`❌ <b>Bot v2 ${symbol}</b> — Re-entrada falhou\n${e.message}`);
+  }
+}
+
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
 // Formula: loss = tradeSize × leverage × stopLossPct = riskUSD
 //          tradeSize = riskUSD / (leverage × stopLossPct), capped at maxTradeSize
@@ -900,6 +1039,20 @@ async function getDailyClosedPnl(symbol = null) {
   const data = await res.json();
   const list = data.result?.list || [];
   return list.reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
+}
+
+// Returns the most recently closed position record for a symbol (or null).
+// Used to detect how/at what price a position was closed (trailing-stop vs SL).
+async function getLastClosedPnl(symbol) {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = `category=linear&symbol=${symbol}&limit=1`;
+  const sig        = sign(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  return data.result?.list?.[0] || null;
 }
 
 // Format a price/distance value with enough decimal places to avoid rounding to zero.
@@ -1463,7 +1616,7 @@ async function handleWebhook(body) {
     const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
-    recordSignalPlaced(sym, actionLower);
+    recordSignalPlaced(sym, actionLower, priceNum);
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(sym, actionLower, priceNum, resolvedAtr);
@@ -1519,6 +1672,7 @@ app.listen(PORT, () => {
   console.log(`  Spread    : ${CONFIG.maxSpreadPct > 0 ? `skip se spread > ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%` : "desativado (MAX_SPREAD_PCT para ativar)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
+  console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "desativado (TRAILING_REENTRY_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -1527,6 +1681,12 @@ app.listen(PORT, () => {
   if (CONFIG.positionTimeoutHours > 0) {
     setInterval(checkPositionTimeouts, 5 * 60 * 1000);
     console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
+  }
+
+  // Start background trailing-stop re-entry checker (every 1 min)
+  if (CONFIG.trailingReentryEnabled) {
+    setInterval(checkTrailingReentries, 60 * 1000);
+    console.log(`🔁 Trailing re-entry checker ativo — verifica a cada 1min`);
   }
 
   // Start Telegram command polling
