@@ -22,13 +22,11 @@ const CONFIG = {
   stopLossPct:      parseFloat(process.env.STOP_LOSS_PCT       || "0.002"),
   takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
   trailingStopPct:        parseFloat(process.env.TRAILING_STOP_PCT        || "0.03"),
-  trailingActivationPct:  parseFloat(process.env.TRAILING_ACTIVATION_PCT  || "0.003"),
   // Stable coins (e.g. BTC, SOL, ETH): wider trailing to avoid early stop-outs.
   // STABLE_SYMBOLS = comma-separated list of symbols (e.g. BTCUSDT,SOLUSDT,ETHUSDT)
   // Leave empty to disable the feature (all symbols use the defaults above).
   stableSymbols:              (process.env.STABLE_SYMBOLS || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean),
   stableTrailingStopPct:      parseFloat(process.env.STABLE_TRAILING_STOP_PCT       || "0.05"),
-  stableTrailingActivationPct: parseFloat(process.env.STABLE_TRAILING_ACTIVATION_PCT || "0.01"),
   maxDailyLossPerSymbol:  parseFloat(process.env.MAX_DAILY_LOSS_PER_SYMBOL || "0"),  // 0 = disabled
   maxDailyLossTotal:      parseFloat(process.env.MAX_DAILY_LOSS_TOTAL      || "0"),  // 0 = disabled
   riskPerTradeUSD:        parseFloat(process.env.RISK_PER_TRADE_USD        || "0"),  // 0 = fixed size
@@ -915,30 +913,33 @@ function formatPrice(value) {
 
 // atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
 // Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
-// Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT / STABLE_TRAILING_ACTIVATION_PCT.
+// Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT.
+// Activation price = entry ± trailingDistance, so that when Bybit activates the
+// trail (stop = activePrice − distance), the initial stop lands at breakeven —
+// the trailing stop can never close the position at a loss, only at breakeven or profit.
 async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const isStable = CONFIG.stableSymbols.includes(symbol.toUpperCase());
   const trailingStopPct      = isStable ? CONFIG.stableTrailingStopPct      : CONFIG.trailingStopPct;
-  const trailingActivationPct = isStable ? CONFIG.stableTrailingActivationPct : CONFIG.trailingActivationPct;
 
   const rawDistance  = atr
     ? atr * CONFIG.atrMultiplier
     : entryPrice * trailingStopPct;
   const trailingDistance = formatPrice(rawDistance);
+  const distanceNum = parseFloat(trailingDistance);
 
   // Guard: if distance rounds to zero Bybit will reject the request
-  if (parseFloat(trailingDistance) === 0) {
+  if (distanceNum === 0) {
     console.log(`  ⚠️  Trailing stop ignorado — distância calculada é zero (ATR demasiado pequeno)`);
     return;
   }
 
-  // Desired activation price (trailingActivationPct in profit from entry)
+  // Activation price = entry ± trailingDistance (breakeven once trailing activates)
   const activePriceNum = action === "buy"
-    ? entryPrice * (1 + trailingActivationPct)
-    : entryPrice * (1 - trailingActivationPct);
+    ? entryPrice + distanceNum
+    : entryPrice - distanceNum;
 
   // Check current price — if it already passed activePriceNum, Bybit rejects activePrice.
-  // In that case omit it: trailing activates immediately (correct behaviour).
+  // In that case omit it: trailing activates immediately (stop = currentPrice − distance ≥ entry).
   const currentPrice = await fetchCurrentPrice(symbol);
   const alreadyActivated = currentPrice > 0 && (
     action === "buy"  ? currentPrice >= activePriceNum :
@@ -949,7 +950,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   if (alreadyActivated) {
     console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${activePriceNum.toFixed(2)})`);
   } else {
-    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePriceNum.toFixed(2)} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% de lucro)`);
+    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePriceNum.toFixed(2)} (breakeven garantido)`);
   }
 
   const timestamp  = Date.now().toString();
@@ -1517,7 +1518,7 @@ app.listen(PORT, () => {
   console.log(`  Timeout   : ${CONFIG.positionTimeoutHours > 0 ? `fecha após ${CONFIG.positionTimeoutHours}h se PnL entre $${CONFIG.positionTimeoutPnlMin} e $${CONFIG.positionTimeoutPnlMax}` : "desativado (POSITION_TIMEOUT_HOURS para ativar)"}`);
   console.log(`  Spread    : ${CONFIG.maxSpreadPct > 0 ? `skip se spread > ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%` : "desativado (MAX_SPREAD_PCT para ativar)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
-  console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | activation ${CONFIG.stableTrailingActivationPct * 100}% | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
+  console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
