@@ -464,10 +464,12 @@ async function getInstrumentInfo(symbol) {
   const inst = data.result?.list?.[0];
   const lot  = inst?.lotSizeFilter;
   const lev  = inst?.leverageFilter;
+  const prc  = inst?.priceFilter;
   return {
     minQty:      parseFloat(lot?.minOrderQty   || "0.001"),
     qtyStep:     parseFloat(lot?.qtyStep       || "0.001"),
     maxLeverage: parseFloat(lev?.maxLeverage   || "0"),
+    tickSize:    parseFloat(prc?.tickSize      || "0"),
   };
 }
 
@@ -828,10 +830,10 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
 
   if (slOverride) {
     // ── SL from payload (TradingView structural level) ───────────────────
-    stopLoss   = parseFloat(slOverride).toFixed(2);
+    stopLoss   = parseFloat(slOverride);
     slDistance = Math.abs(price - parseFloat(slOverride));
     slPct      = slDistance / price;
-    console.log(`  SL do payload (TradingView): $${stopLoss} | distância $${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
+    console.log(`  SL do payload (TradingView): distância $${slDistance.toFixed(4)} (${(slPct * 100).toFixed(3)}%)`);
   } else {
     // ── ATR-based SL (fallback) ───────────────────────────────────────────
     if (!atr) {
@@ -853,10 +855,10 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
     }
 
     stopLoss = action === "buy"
-      ? (price - slDistance).toFixed(2)
-      : (price + slDistance).toFixed(2);
+      ? price - slDistance
+      : price + slDistance;
   }
-  console.log(`  SL: $${stopLoss}`);
+  // stopLoss is rounded to the instrument tick size after getInstrumentInfo below.
   // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
   // to avoid conflict with the half-close + break-even logic
 
@@ -868,7 +870,10 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
     ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
     : `fixo ($${tradeSize})`;
 
-  const { minQty, qtyStep, maxLeverage } = await getInstrumentInfo(symbol);
+  const { minQty, qtyStep, maxLeverage, tickSize } = await getInstrumentInfo(symbol);
+  // Round SL to the instrument tick size (was toFixed(2) — wrong for sub-$1 / fine-tick assets)
+  stopLoss = roundToTick(stopLoss, tickSize);
+  console.log(`  SL: $${stopLoss}${tickSize > 0 ? ` (tick ${tickSize})` : ""}`);
   // Cap leverage to instrument maximum (avoids "gt maxLeverage" error from Bybit)
   if (maxLeverage > 0 && lev > maxLeverage) {
     console.log(`  ⚠️  Leverage ${lev}x capado a ${maxLeverage}x (máx para ${symbol})`);
@@ -886,7 +891,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   if (CONFIG.chaseLimitEnabled && CONFIG.tradeMode === "futures") {
     try {
       const { bid, ask } = await fetchBidAsk(symbol);
-      const limitPrice   = (action === "buy" ? bid : ask).toFixed(2);
+      const limitPrice   = roundToTick(action === "buy" ? bid : ask, tickSize);
       console.log(`  🎯 Chase Limit @ $${limitPrice} (${action === "buy" ? "bid" : "ask"}) — aguarda ${CONFIG.chaseLimitTimeoutMs}ms`);
 
       const limitBody = JSON.stringify({
@@ -1038,7 +1043,8 @@ async function closeHalfPosition(symbol, position) {
 }
 
 async function setBreakEvenStop(symbol, entryPrice) {
-  const slPrice    = parseFloat(entryPrice).toFixed(2);
+  const { tickSize } = await getInstrumentInfo(symbol);
+  const slPrice    = roundToTick(parseFloat(entryPrice), tickSize);
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
   const body       = JSON.stringify({ category: "linear", symbol, stopLoss: slPrice, slTriggerBy: "LastPrice", positionIdx: 0 });
@@ -1093,6 +1099,18 @@ function formatPrice(value) {
   return value.toFixed(decimals);
 }
 
+// Round a price (or price-distance) to the instrument's tick size and format with
+// matching decimals. Bybit rejects SL / activePrice values that aren't exact multiples
+// of tickSize — toFixed(2) silently corrupts them for sub-$1 or fine-tick assets.
+// Falls back to formatPrice (decimal-count heuristic) when tickSize is unknown.
+function roundToTick(price, tickSize) {
+  if (!price || price <= 0) return "0";
+  if (!tickSize || tickSize <= 0) return formatPrice(price);
+  const decimals = (tickSize.toString().split(".")[1] || "").length;
+  const rounded  = Math.round(price / tickSize) * tickSize;
+  return rounded.toFixed(decimals);
+}
+
 // atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
 // Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
 // Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT.
@@ -1108,7 +1126,8 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const rawDistance  = atr
     ? atr * trailMult
     : entryPrice * trailingStopPct;
-  const trailingDistance = formatPrice(rawDistance);
+  const { tickSize } = await getInstrumentInfo(symbol);
+  const trailingDistance = roundToTick(rawDistance, tickSize);
   const distanceNum = parseFloat(trailingDistance);
 
   // Guard: if distance rounds to zero Bybit will reject the request
@@ -1132,16 +1151,16 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
 
   const src = atr ? `${trailMult}×ATR($${parseFloat(atr).toFixed(4)})` : `${(trailingStopPct * 100).toFixed(1)}% fixo${isStable ? " (stable)" : ""}`;
   if (alreadyActivated) {
-    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${activePriceNum.toFixed(2)})`);
+    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${formatPrice(activePriceNum)})`);
   } else {
-    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePriceNum.toFixed(2)} (breakeven garantido)`);
+    console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${formatPrice(activePriceNum)} (breakeven garantido)`);
   }
 
   const timestamp  = Date.now().toString();
   const recvWindow = "5000";
   const orderBody  = alreadyActivated
     ? { category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 }
-    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: formatPrice(activePriceNum), positionIdx: 0 };
+    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: roundToTick(activePriceNum, tickSize), positionIdx: 0 };
   const body = JSON.stringify(orderBody);
   const sig  = sign(timestamp, recvWindow, body);
   const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
@@ -1331,8 +1350,8 @@ async function handleWebhook(body) {
 
           if (breakEvenSet) {
             // TP2+ — move SL halfway between current SL and this TP price
-            newSl = parseFloat(((currentSl + priceNum) / 2).toFixed(2));
-            console.log(`  ✅ SL progressivo (TP2+): $${currentSl} → $${newSl} (meio entre $${currentSl} e $${priceNum})`);
+            newSl = (currentSl + priceNum) / 2;  // tick-rounded inside setBreakEvenStop
+            console.log(`  ✅ SL progressivo (TP2+): $${currentSl} → $${formatPrice(newSl)} (meio entre $${currentSl} e $${priceNum})`);
           } else {
             // TP1 — move SL to entry ± ATR buffer (avoids micro-retracções a bater no SL)
             let beBuffer = 0;
@@ -1345,11 +1364,11 @@ async function handleWebhook(body) {
             const beSl = openPos.side === "Buy"
               ? entryNum - beBuffer   // long: SL ligeiramente abaixo da entrada
               : entryNum + beBuffer;  // short: SL ligeiramente acima da entrada
-            newSl = parseFloat(beSl.toFixed(2));
+            newSl = beSl;  // tick-rounded inside setBreakEvenStop
             const bufLabel = beBuffer > 0
               ? ` (entry $${entryNum} ${openPos.side === "Buy" ? "-" : "+"} ${CONFIG.breakEvenBufferAtr}×ATR=$${beBuffer.toFixed(2)})`
               : "";
-            console.log(`  ✅ SL break-even (TP1): → $${newSl}${bufLabel}`);
+            console.log(`  ✅ SL break-even (TP1): → $${formatPrice(newSl)}${bufLabel}`);
           }
 
           // Validate SL is on the correct side of current price before submitting.
@@ -1377,7 +1396,7 @@ async function handleWebhook(body) {
       await sendTelegram(
         `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
-        (newSl !== null ? `🛡 Novo SL: $${newSl}\n` : "") +
+        (newSl !== null ? `🛡 Novo SL: $${formatPrice(newSl)}\n` : "") +
         (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
         (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "")
       );
