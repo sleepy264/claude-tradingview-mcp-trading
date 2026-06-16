@@ -22,6 +22,12 @@ const CONFIG = {
   stopLossPct:      parseFloat(process.env.STOP_LOSS_PCT       || "0.002"),
   takeProfitPct:    parseFloat(process.env.TAKE_PROFIT_PCT     || "0.004"),
   trailingStopPct:        parseFloat(process.env.TRAILING_STOP_PCT        || "0.03"),
+  // Trailing-stop distance multiplier — applied to ATR for the trailing distance,
+  // independent of ATR_MULTIPLIER (which sets the SL). A smaller value locks profit
+  // tighter once the trail activates (gives back less of the move) at the cost of
+  // being stopped out by noise more easily. Breakeven guarantee is preserved either
+  // way (activation = entry ± distance → initial stop = entry). 0 = use ATR_MULTIPLIER.
+  trailingAtrMult:        parseFloat(process.env.TRAILING_ATR_MULT        || "0"),
   // Stable coins (e.g. BTC, SOL, ETH): wider trailing to avoid early stop-outs.
   // STABLE_SYMBOLS = comma-separated list of symbols (e.g. BTCUSDT,SOLUSDT,ETHUSDT)
   // Leave empty to disable the feature (all symbols use the defaults above).
@@ -75,6 +81,12 @@ const CONFIG = {
   // exceeds this threshold in USD. 0 = always reverse (no protection).
   // Example: MAX_REVERSAL_LOSS_USD=5 → only reverse if open position loss ≤ $5
   maxReversalLossUSD:   parseFloat(process.env.MAX_REVERSAL_LOSS_USD || "0"),
+  // Reversal hard cap: if an opposite signal arrives while the open position's
+  // unrealized loss exceeds this many USD, force-close it (cut the loss) and skip
+  // the new entry — overrides the MAX_REVERSAL_LOSS_USD "hold for recovery" guard.
+  // Caps tail risk under Cross margin, where a runaway loser drains the shared balance.
+  // 0 = disabled.
+  maxReversalHardCapUSD: parseFloat(process.env.MAX_REVERSAL_HARD_CAP_USD || "0"),
   // Dynamic leverage: reduce leverage when ATR is elevated vs its 50-bar average.
   //   ATR ≤ avg        → full leverage
   //   ATR 1.0–1.5× avg → 75% of base leverage
@@ -176,9 +188,12 @@ function recordTpReceived(symbol) {
 // Check if a new entry should be blocked due to cooldown or daily SL limit.
 // Logic:
 //   SL inferred when: no open position + recently placed same-dir signal + no TP received after it.
-//   If SL inferred → increment daily counter → check cooldown and daily limit.
-// Returns { blocked, reason } — side-effect: persists SL count if SL is inferred.
-function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
+//   Then confirmed against the actual closed-pnl: a breakeven/profit exit (trailing-stop)
+//   is NOT an SL and must not trigger cooldown — otherwise winning trailing exits would
+//   block the very re-entry the re-entry watcher wants to make.
+//   If SL confirmed → increment daily counter → check cooldown and daily limit.
+// Returns { blocked, reason } — side-effect: persists SL count if SL is confirmed.
+async function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
   const s     = _getSymState(symbol);
   const today = _todayUTC();
   const now   = Date.now();
@@ -195,6 +210,20 @@ function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
   // SL inferred: no open position + same-dir signal within 24h + no TP received after it
   const slInferred = !hasOpenPosition && elapsed < 24 * 60 * 60 * 1000 && !tpAfterSignal;
   if (!slInferred) return { blocked: false };
+
+  // Confirm against actual closed PnL: if the position that followed lastSameDir was
+  // closed at breakeven/profit (closedPnl ≥ 0 → trailing-stop, not an SL), do NOT count
+  // it as an SL and do NOT apply cooldown. (Fee-sized negative closes may still be read
+  // as SL — acceptable, as a real ATR×mult SL loss is far larger than round-trip fees.)
+  try {
+    const last = await getLastClosedPnl(symbol);
+    if (last && parseFloat(last.updatedTime) >= lastSameDir && parseFloat(last.closedPnl) >= 0) {
+      console.log(`  ✅ ${symbol} (${action}): última saída foi ganho/breakeven ($${parseFloat(last.closedPnl).toFixed(2)}) — trailing-stop, não SL → sem cooldown`);
+      return { blocked: false };
+    }
+  } catch (e) {
+    console.log(`  ⚠️  ${symbol}: verificação closed-pnl falhou (${e.message}) — a assumir SL`);
+  }
 
   // Increment SL counter
   s.slCountToday = (s.slCountToday || 0) + 1;
@@ -1074,8 +1103,10 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const isStable = CONFIG.stableSymbols.includes(symbol.toUpperCase());
   const trailingStopPct      = isStable ? CONFIG.stableTrailingStopPct      : CONFIG.trailingStopPct;
 
+  // Trailing distance uses TRAILING_ATR_MULT if set, else falls back to ATR_MULTIPLIER (= SL distance)
+  const trailMult = CONFIG.trailingAtrMult > 0 ? CONFIG.trailingAtrMult : CONFIG.atrMultiplier;
   const rawDistance  = atr
-    ? atr * CONFIG.atrMultiplier
+    ? atr * trailMult
     : entryPrice * trailingStopPct;
   const trailingDistance = formatPrice(rawDistance);
   const distanceNum = parseFloat(trailingDistance);
@@ -1099,7 +1130,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
                         currentPrice <= activePriceNum
   );
 
-  const src = atr ? `${CONFIG.atrMultiplier}×ATR($${parseFloat(atr).toFixed(4)})` : `${(trailingStopPct * 100).toFixed(1)}% fixo${isStable ? " (stable)" : ""}`;
+  const src = atr ? `${trailMult}×ATR($${parseFloat(atr).toFixed(4)})` : `${(trailingStopPct * 100).toFixed(1)}% fixo${isStable ? " (stable)" : ""}`;
   if (alreadyActivated) {
     console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa imediatamente (preço já passou $${activePriceNum.toFixed(2)})`);
   } else {
@@ -1405,7 +1436,7 @@ async function handleWebhook(body) {
       const openPos = await getOpenPosition(sym);
 
       // ── Cooldown + daily SL limit ───────────────────────────────────────────
-      const cooldownCheck = checkCooldownAndSlLimit(sym, actionLower, !!openPos);
+      const cooldownCheck = await checkCooldownAndSlLimit(sym, actionLower, !!openPos);
       if (cooldownCheck.blocked) {
         console.log(`  ${cooldownCheck.reason}`);
         logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "BLOCKED", cooldownCheck.reason);
@@ -1467,8 +1498,27 @@ async function handleWebhook(body) {
 
       // ── Close opposite position (normal reversal) ───────────────────────────
       if (openPos) {
-        // Reversal loss guard: block if existing position loss exceeds threshold
-        if (CONFIG.maxReversalLossUSD > 0 && openPos.unrealizedPnl < -CONFIG.maxReversalLossUSD) {
+        // Reversal loss guard — two tiers:
+        //   loss > MAX_REVERSAL_HARD_CAP_USD → force-close the loser (cut the loss),
+        //     skip the new entry. Caps tail risk under Cross margin.
+        //   MAX_REVERSAL_LOSS_USD < loss ≤ hard cap → hold for recovery (no reversal).
+        //   loss ≤ MAX_REVERSAL_LOSS_USD → reverse normally (falls through below).
+        const loss = -openPos.unrealizedPnl; // positive = magnitude of the unrealized loss
+
+        if (CONFIG.maxReversalHardCapUSD > 0 && loss > CONFIG.maxReversalHardCapUSD) {
+          console.log(`  🛑 ${sym}: ${openPos.side} com perda $${openPos.unrealizedPnl.toFixed(2)} > teto $${CONFIG.maxReversalHardCapUSD} — a fechar (cortar perda), sem nova entrada`);
+          const closeResult = await closePosition(sym, openPos);
+          console.log(`  ✅ POSITION CLOSED (hard cap) — ${closeResult.orderId}`);
+          logTrade(sym, openPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Hard-cap close: perda $${openPos.unrealizedPnl.toFixed(2)} > teto $${CONFIG.maxReversalHardCapUSD}`);
+          await sendTelegram(
+            `🛑 <b>Bot v2 ${sym}</b> — Perdedor fechado (teto de perda)\n` +
+            `${openPos.side} PnL $${openPos.unrealizedPnl.toFixed(2)} > teto -$${CONFIG.maxReversalHardCapUSD}\n` +
+            `Perda cortada — nova entrada ${actionLower.toUpperCase()} ignorada`
+          );
+          return;
+        }
+
+        if (CONFIG.maxReversalLossUSD > 0 && loss > CONFIG.maxReversalLossUSD) {
           const pnlDisplay = `$${openPos.unrealizedPnl.toFixed(2)}`;
           const msg = `⏸ Reversão bloqueada — ${openPos.side} tem PnL não realizado ${pnlDisplay} (limite: -$${CONFIG.maxReversalLossUSD})\nA aguardar recuperação antes de reverter para ${actionLower.toUpperCase()}`;
           console.log(`  ${msg}`);
@@ -1657,6 +1707,7 @@ app.listen(PORT, () => {
   console.log(`  Leverage : ${CONFIG.leverage}x`);
   console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
   console.log(`  SL       : ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m) × ${CONFIG.atrMultiplier} | fallback ${CONFIG.stopLossPct * 100}%`);
+  console.log(`  Trailing : ${CONFIG.trailingAtrMult > 0 ? `${CONFIG.trailingAtrMult}×ATR (distinto do SL)` : `${CONFIG.atrMultiplier}×ATR (= SL, TRAILING_ATR_MULT para separar)`} | breakeven garantido`);
   console.log(`  Vol.filter: ${CONFIG.maxSlPct > 0 ? `skip se SL > ${(CONFIG.maxSlPct * 100).toFixed(1)}%` : "desativado (MAX_SL_PCT=0)"}`);
   console.log(`  Tendência : ${CONFIG.trendMarginPct > 0 ? `EMA${CONFIG.trendEmaPeriod}(${CONFIG.trendInterval}m) | margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%` : "desativado (TREND_MARGIN_PCT=0)"}`);
   console.log(`  Chase Limit: ${CONFIG.chaseLimitEnabled ? `ativo — timeout ${CONFIG.chaseLimitTimeoutMs}ms → fallback Market` : "desativado (sempre Market)"}`);
@@ -1664,7 +1715,7 @@ app.listen(PORT, () => {
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} — TP implícito=SL×${CONFIG.minRR}${CONFIG.maxTpPct > 0 ? ` | bloq. se TP implícito > ${(CONFIG.maxTpPct*100).toFixed(2)}%` : " | sem cap (MAX_TP_PCT=0)"}` : "desativado (MIN_RR=0)"}`);
   console.log(`  TP guard  : ${CONFIG.minTpPnlUSD !== 0 ? `skip TP se PnL < $${CONFIG.minTpPnlUSD}` : "desativado — TP sempre executa (MIN_TP_PNL_USD para ativar)"}`);
-  console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `bloqueada se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}`);
+  console.log(`  Reversão  : ${CONFIG.maxReversalLossUSD > 0 ? `segura se perda > $${CONFIG.maxReversalLossUSD}` : "sempre permitida (MAX_REVERSAL_LOSS_USD=0)"}${CONFIG.maxReversalHardCapUSD > 0 ? ` | fecha sempre se perda > $${CONFIG.maxReversalHardCapUSD} (teto)` : " | sem teto (MAX_REVERSAL_HARD_CAP_USD=0)"}`);
   console.log(`  Lev.dinâm : ${CONFIG.dynamicLeverage ? "ativo (ATR>avg→75% | ATR>1.5×avg→50%)" : "desativado (DYNAMIC_LEVERAGE=true para ativar)"}`);
   console.log(`  Horário   : ${CONFIG.tradeHoursStart !== null ? `${String(CONFIG.tradeHoursStart).padStart(2,"0")}:00–${String(CONFIG.tradeHoursEnd).padStart(2,"0")}:00 UTC` : "24/7 (TRADE_HOURS_START/END para limitar)"}`);
   console.log(`  Volume    : ${CONFIG.volumeFilterMult > 0 ? `skip se vol < ${CONFIG.volumeFilterMult}× média(${CONFIG.volumeFilterPeriods})` : "desativado (VOLUME_FILTER_MULT para ativar)"}`);
