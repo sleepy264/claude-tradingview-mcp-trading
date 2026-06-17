@@ -475,30 +475,40 @@ async function commitSymbol(argSym, chatId) {
       : `${(CONFIG.commitPullbackPct * 100).toFixed(2)}% fixo`;
     const pullbackPctShown = (pullbackDist / exitPrice) * 100;
 
-    // Arm a pullback re-entry. positionOpenTime is cleared so the breakout auto-detector
-    // (checkTrailingReentries part 1) does NOT also arm a competing breakout watch.
-    const s = _getSymState(argSym);
-    s.positionOpenTime = null;
-    s.lastAction       = sideAction;
     const triggerLevel = sideAction === "buy"
       ? exitPrice - pullbackDist
       : exitPrice + pullbackDist;
+
+    // Place a real GTC limit order on Bybit at the dip/rip level. Unlike an in-memory
+    // watch, this survives bot restarts/redeploys (it lives on the exchange).
+    let dynLev = CONFIG.leverage;
+    if (CONFIG.dynamicLeverage && pullbackAtr) {
+      try { dynLev = calcDynamicLeverage(pullbackAtr, await fetchATRAvg50(argSym, CONFIG.candleInterval), CONFIG.leverage); } catch {}
+    }
+    await setLeverage(argSym, dynLev);
+    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, dynLev, pullbackAtr);
+
+    // Track the order so it can be cancelled by an opposite signal / expiry, and so the
+    // poller can detect the fill. positionOpenTime stays null until the limit fills.
+    const s = _getSymState(argSym);
+    s.positionOpenTime = null;
+    s.lastAction       = sideAction;
     s.reentry = {
-      type:            "pullback",
-      action:          sideAction,
-      level:           exitPrice,
-      triggerLevel,
-      createdAt:       Date.now(),
-      lastAttemptTime: 0,
+      type:      "limit",
+      action:    sideAction,
+      orderId:   lim.orderId,
+      price:     parseFloat(lim.priceStr),
+      createdAt: Date.now(),
     };
     saveSymbolState();
 
-    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada pullback @ $${formatPrice(triggerLevel)}`);
+    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, ordem limite re-entrada @ $${lim.priceStr}`);
     const emoji = pnl >= 0 ? "🟢" : "🔴";
     await sendTelegram(
       `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-      `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
+      `🔁 Ordem limite ${sideAction.toUpperCase()} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
+      (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
     );
@@ -858,10 +868,46 @@ async function checkTrailingReentries() {
         }
       }
 
-      // ── 2) Check armed re-entry watches (breakout or pullback) ────────────
+      // ── 2) Check armed re-entry watches ──────────────────────────────────
       if (state.reentry) {
         const r = state.reentry;
         const kind = r.type || "breakout";
+
+        // ── 2a) Bybit limit re-entry (/commit2) — poll status ───────────────
+        if (kind === "limit") {
+          const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
+          let status = null;
+          try { status = await getOrderStatus(sym, r.orderId); } catch {}
+
+          if (status === "Filled") {
+            console.log(`  ✅ ${sym}: ordem limite de re-entrada encheu @ $${r.price}`);
+            state.positionOpenTime = now;   // hand the position to timeout/trailing tracking
+            state.lastAction       = r.action;
+            delete state.reentry;
+            saveSymbolState();
+            try {
+              let atr = null; try { atr = await fetchATR(sym, CONFIG.candleInterval); } catch {}
+              if (CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, r.price, atr);
+            } catch (e) { console.log(`  ⚠️  Trailing pós-fill ${sym}: ${e.message}`); }
+            await sendTelegram(`🔁 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
+            continue;
+          }
+          if (status === "Cancelled" || status === "Rejected" || status === "Deactivated") {
+            console.log(`  ✖ ${sym}: ordem limite de re-entrada ${status} — watch removida`);
+            delete state.reentry;
+            saveSymbolState();
+            continue;
+          }
+          if (now - r.createdAt > expiryMs) {
+            console.log(`  ⌛ ${sym}: re-entrada limite expirou (${CONFIG.reentryExpiryHours}h) — a cancelar ordem`);
+            try { await cancelOrder(sym, r.orderId); } catch {}
+            delete state.reentry;
+            saveSymbolState();
+          }
+          continue; // limit watches are fully handled here
+        }
+
+        // ── 2b) Software watches (breakout / legacy pullback) ───────────────
         const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
         if (now - r.createdAt > expiryMs) {
           console.log(`  ⌛ ${sym}: watch de re-entrada (${kind}) expirou (${CONFIG.reentryExpiryHours}h sem gatilho)`);
@@ -960,6 +1006,44 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
     console.log(`  ❌ Re-entrada falhou: ${e.message}`);
     await sendTelegram(`❌ <b>Bot v2 ${symbol}</b> — Re-entrada falhou\n${e.message}`);
   }
+}
+
+// Places a resting GTC limit order at a specific price (the /commit2 dip/rip level),
+// with an ATR-based SL attached (activates on fill). Returns { orderId, slPrice, priceStr, qty }.
+// Unlike placeOrder's chase-limit→market flow, this never falls back to market — it must
+// rest in the book until price reaches the level (or it's cancelled).
+async function placeReentryLimit(symbol, action, limitPrice, lev, atr) {
+  const side = action === "buy" ? "Buy" : "Sell";
+  const { minQty, qtyStep, maxLeverage, tickSize } = await getInstrumentInfo(symbol);
+  if (maxLeverage > 0 && lev > maxLeverage) lev = maxLeverage;
+
+  const priceStr = roundToTick(limitPrice, tickSize);
+  const priceNum = parseFloat(priceStr);
+
+  let slPrice = null;
+  if (atr) {
+    const slDist = atr * CONFIG.atrMultiplier;
+    slPrice = roundToTick(action === "buy" ? priceNum - slDist : priceNum + slDist, tickSize);
+  }
+
+  const qty  = calcQty(CONFIG.tradeSize, lev, priceNum, minQty, qtyStep);
+  const body = JSON.stringify({
+    category: "linear", symbol, side, orderType: "Limit",
+    price: priceStr, qty, timeInForce: "GTC", positionIdx: 0,
+    ...(slPrice ? { stopLoss: slPrice, slTriggerBy: "LastPrice" } : {}),
+  });
+  const ts  = (Date.now() - 1500).toString();
+  const rw  = "10000";
+  const sig = sign(ts, rw, body);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": rw },
+    body,
+  });
+  const data = await res.json();
+  if (data.retCode !== 0) throw new Error(`Limit re-entry failed: ${data.retMsg}`);
+  console.log(`  📌 Ordem limite de re-entrada @ $${priceStr} | qty=${qty} | SL=${slPrice ?? "—"} | ${data.result?.orderId}`);
+  return { orderId: data.result?.orderId, slPrice, priceStr, qty };
 }
 
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
@@ -1440,13 +1524,20 @@ async function handleWebhook(body) {
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${effectiveLev}x${leverage ? " (payload)" : " (default)"} | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
 
-  // Cancel a pending re-entry watch (breakout or pullback) on an opposite-direction signal.
-  // Done here (not only via recordSignalPlaced) so the watch is dropped even if the new
-  // order is later blocked by a filter.
+  // Cancel a pending re-entry on a new signal. Opposite signals cancel any watch; a resting
+  // Bybit limit re-entry (from /commit2) is cancelled by ANY new signal (same or opposite)
+  // so a fresh entry can't leave an orphan limit order behind. Done here (not only via
+  // recordSignalPlaced) so it happens even if the new order is later blocked by a filter.
   if (actionLower !== "tp") {
     const stCancel = symbolState[sym];
-    if (stCancel?.reentry && stCancel.reentry.action !== actionLower) {
-      console.log(`  ✖ ${sym}: watch de re-entrada (${stCancel.reentry.type || "breakout"}) cancelada — sinal contrário ${actionLower.toUpperCase()}`);
+    const rc = stCancel?.reentry;
+    if (rc && (rc.action !== actionLower || rc.type === "limit")) {
+      if (rc.type === "limit" && rc.orderId) {
+        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym}: ordem limite de re-entrada ${rc.orderId} cancelada na Bybit`); }
+        catch (e) { console.log(`  ⚠️  ${sym}: cancelar ordem de re-entrada falhou: ${e.message}`); }
+      } else {
+        console.log(`  ✖ ${sym}: watch de re-entrada (${rc.type || "breakout"}) cancelada — sinal ${actionLower.toUpperCase()}`);
+      }
       delete stCancel.reentry;
       saveSymbolState();
     }
@@ -1915,7 +2006,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
-  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} (COMMIT_MIN_GAIN_USD) | pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h`);
+  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
