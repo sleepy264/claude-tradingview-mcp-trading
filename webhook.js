@@ -122,6 +122,11 @@ const CONFIG = {
   trailingReentryEnabled: process.env.TRAILING_REENTRY_ENABLED === "true",
   reentryCooldownMs:      parseInt(process.env.REENTRY_COOLDOWN_MS || "3600000"),  // 1h
   reentryExpiryHours:     parseFloat(process.env.REENTRY_EXPIRY_HOURS || "6"),
+  // Manual /commit2 Telegram command: close a position (bank the gain) and arm a
+  // PULLBACK re-entry — re-enter the same direction once price retraces this % from the
+  // exit (buy the dip for a long / sell the rip for a short). Cancelled by an opposite
+  // signal; expires after REENTRY_EXPIRY_HOURS (shared with the breakout re-entry).
+  commitPullbackPct:      parseFloat(process.env.COMMIT_PULLBACK_PCT || "0.003"),  // 0.3%
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -356,6 +361,64 @@ async function handleTelegramCommand(text, chatId) {
     }
     return;
   }
+
+  // /commit2 SYMBOL — close the position now (bank the gain) and arm a pullback re-entry:
+  // re-enter the same direction once price retraces COMMIT_PULLBACK_PCT from the exit.
+  if (cmd === "/commit2") {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(`📋 <b>Bot v2</b> — /commit2 só funciona em modo LIVE (atual: paper)`, chatId);
+      return;
+    }
+    const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+    if (!argSym) {
+      await sendTelegram(`ℹ️ Uso: <code>/commit2 SYMBOL</code> (ex: <code>/commit2 BTCUSDT</code>)`, chatId);
+      return;
+    }
+    try {
+      const pos = await getOpenPosition(argSym);
+      if (!pos) {
+        await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
+        return;
+      }
+      const sideAction = pos.side === "Buy" ? "buy" : "sell";
+      const pnl        = pos.unrealizedPnl;
+      const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
+
+      const result = await closePosition(argSym, pos);
+      console.log(`  💰 /commit2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
+
+      // Arm a pullback re-entry. positionOpenTime is cleared so the breakout auto-detector
+      // (checkTrailingReentries part 1) does NOT also arm a competing breakout watch.
+      const s = _getSymState(argSym);
+      s.positionOpenTime = null;
+      s.lastAction       = sideAction;
+      const triggerLevel = sideAction === "buy"
+        ? exitPrice * (1 - CONFIG.commitPullbackPct)
+        : exitPrice * (1 + CONFIG.commitPullbackPct);
+      s.reentry = {
+        type:            "pullback",
+        action:          sideAction,
+        level:           exitPrice,
+        triggerLevel,
+        createdAt:       Date.now(),
+        lastAttemptTime: 0,
+      };
+      saveSymbolState();
+
+      logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada pullback @ $${formatPrice(triggerLevel)}`);
+      const emoji = pnl >= 0 ? "🟢" : "🔴";
+      await sendTelegram(
+        `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
+        `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+        `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${(CONFIG.commitPullbackPct * 100).toFixed(2)}%)\n` +
+        `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /commit2 falhou\n${e.message}`, chatId);
+    }
+    return;
+  }
 }
 
 async function startTelegramPolling() {
@@ -416,6 +479,7 @@ async function startTelegramPolling() {
     body:    JSON.stringify({ commands: [
       { command: "pnl2", description: "📊 PnL do dia" },
       { command: "pos2", description: "📈 Posições abertas" },
+      { command: "commit2", description: "💰 Encaixar ganho + re-entrada em pullback (ex: /commit2 BTCUSDT)" },
     ]}),
   }).catch(() => {});
 
@@ -675,42 +739,46 @@ async function checkPositionTimeouts() {
   }
 }
 
-// Background re-entry check — runs every 1 min when TRAILING_REENTRY_ENABLED=true.
-// 1) Detects positions closed without a TP signal: if closedPnl ≥ 0 (breakeven/profit,
-//    so it was the trailing-stop — not an SL loss), arms a re-entry watch at the exit price.
-// 2) For armed watches, re-enters the same direction once price breaks back past that
-//    level — at most once per REENTRY_COOLDOWN_MS, expiring after REENTRY_EXPIRY_HOURS.
+// Background re-entry check — runs every 1 min. Handles two kinds of armed watch:
+//   • "breakout" (auto, only when TRAILING_REENTRY_ENABLED=true): a position closed at
+//     breakeven/profit by the trailing-stop arms a watch; re-enters when price breaks
+//     back past the exit level (trend continuation).
+//   • "pullback" (from the manual /commit2 command): re-enters when price retraces to a
+//     target below/above the exit (buy the dip / sell the rip).
+// Both: at most once per REENTRY_COOLDOWN_MS, expire after REENTRY_EXPIRY_HOURS, and are
+// cancelled by an opposite-direction signal (see handleWebhook).
 async function checkTrailingReentries() {
-  if (!CONFIG.trailingReentryEnabled) return;
   const now = Date.now();
 
   for (const [sym, state] of Object.entries(symbolState)) {
     try {
-      // ── 1) Detect trailing-stop closure ──────────────────────────────────
-      if (state.positionOpenTime) {
+      // ── 1) Auto-detect trailing-stop closure → arm breakout watch ─────────
+      if (CONFIG.trailingReentryEnabled && state.positionOpenTime) {
         const pos = await getOpenPosition(sym);
         if (!pos) {
           state.positionOpenTime = null;
           const last = await getLastClosedPnl(sym);
           if (last && parseFloat(last.closedPnl) >= 0 && state.lastAction) {
             state.reentry = {
+              type:            "breakout",
               action:          state.lastAction,
               level:           parseFloat(last.avgExitPrice),
               createdAt:       now,
               lastAttemptTime: 0,
             };
-            console.log(`  🔁 ${sym}: posição fechada por trailing-stop @ $${last.avgExitPrice} (PnL $${parseFloat(last.closedPnl).toFixed(2)}) — a vigiar re-entrada ${state.lastAction.toUpperCase()}`);
+            console.log(`  🔁 ${sym}: posição fechada por trailing-stop @ $${last.avgExitPrice} (PnL $${parseFloat(last.closedPnl).toFixed(2)}) — a vigiar re-entrada ${state.lastAction.toUpperCase()} (breakout)`);
           }
           saveSymbolState();
         }
       }
 
-      // ── 2) Check armed re-entry watches ──────────────────────────────────
+      // ── 2) Check armed re-entry watches (breakout or pullback) ────────────
       if (state.reentry) {
         const r = state.reentry;
+        const kind = r.type || "breakout";
         const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
         if (now - r.createdAt > expiryMs) {
-          console.log(`  ⌛ ${sym}: watch de re-entrada expirou (${CONFIG.reentryExpiryHours}h sem breakout)`);
+          console.log(`  ⌛ ${sym}: watch de re-entrada (${kind}) expirou (${CONFIG.reentryExpiryHours}h sem gatilho)`);
           delete state.reentry;
           saveSymbolState();
           continue;
@@ -720,15 +788,20 @@ async function checkTrailingReentries() {
         const currentPrice = await fetchCurrentPrice(sym);
         if (!currentPrice) continue;
 
-        const breakout = r.action === "buy" ? currentPrice > r.level : currentPrice < r.level;
-        if (!breakout) continue;
+        // Trigger: breakout = price resumes the original direction past the exit level;
+        //          pullback = price retraces to the dip/rip target.
+        const triggered = kind === "pullback"
+          ? (r.action === "buy" ? currentPrice <= r.triggerLevel : currentPrice >= r.triggerLevel)
+          : (r.action === "buy" ? currentPrice >  r.level        : currentPrice <  r.level);
+        if (!triggered) continue;
 
         const openPos = await getOpenPosition(sym);
         if (openPos) { delete state.reentry; saveSymbolState(); continue; } // already has a position — drop watch
 
         r.lastAttemptTime = now;
         saveSymbolState();
-        await executeReentry(sym, r.action, currentPrice, r.level);
+        const refLevel = kind === "pullback" ? r.triggerLevel : r.level;
+        await executeReentry(sym, r.action, currentPrice, refLevel, kind);
       }
     } catch (e) {
       console.log(`  ⚠️  Reentry check ${sym}: ${e.message}`);
@@ -736,12 +809,13 @@ async function checkTrailingReentries() {
   }
 }
 
-// Executes a trailing-stop re-entry: same direction as the position just closed by the
-// trailing-stop, now that price has broken back past the exit level. Applies the same
+// Executes a re-entry: same direction as the position just closed, now that the trigger
+// (breakout past exit, or pullback to the dip/rip) fired. Applies the same
 // time/volatility/fee filters as a normal signal, but skips trend/volume/R:R — those
-// validate TradingView's own signal quality, not this price-confirmed continuation.
-async function executeReentry(symbol, action, priceNum, exitLevel) {
-  console.log(`\n🔁 [Re-entrada] ${symbol} ${action.toUpperCase()} @ $${priceNum} (rompeu nível de saída $${exitLevel})`);
+// validate TradingView's own signal quality, not this price-confirmed re-entry.
+async function executeReentry(symbol, action, priceNum, refLevel, kind = "breakout") {
+  const kindLabel = kind === "pullback" ? "pullback/dip" : "breakout";
+  console.log(`\n🔁 [Re-entrada ${kindLabel}] ${symbol} ${action.toUpperCase()} @ $${priceNum} (nível ref $${refLevel})`);
 
   if (CONFIG.tradeHoursStart !== null && CONFIG.tradeHoursEnd !== null) {
     const hourUTC = new Date().getUTCHours();
@@ -790,10 +864,10 @@ async function executeReentry(symbol, action, priceNum, exitLevel) {
       await setTrailingStop(symbol, action, priceNum, resolvedAtr);
     }
 
-    logTrade(symbol, action, priceNum, order.tradeSize, order.orderId, "LIVE", `Re-entrada após trailing-stop @ $${exitLevel}`);
+    logTrade(symbol, action, priceNum, order.tradeSize, order.orderId, "LIVE", `Re-entrada ${kind} @ $${refLevel}`);
     await sendTelegram(
-      `🔁 <b>Bot v2 ${symbol}</b> — Re-entrada ${action.toUpperCase()}\n` +
-      `Preço: $${priceNum} | Rompeu nível de saída do trailing-stop ($${exitLevel})\n` +
+      `🔁 <b>Bot v2 ${symbol}</b> — Re-entrada ${action.toUpperCase()} (${kindLabel})\n` +
+      `Preço: $${priceNum} | Nível ref: $${refLevel}\n` +
       `SL: $${order.slPrice} (${(order.slPct * 100).toFixed(2)}%)`
     );
   } catch (e) {
@@ -1280,6 +1354,18 @@ async function handleWebhook(body) {
   console.log(`  Signal: ${actionLower.toUpperCase()} ${sym} @ $${priceNum}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${effectiveLev}x${leverage ? " (payload)" : " (default)"} | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
 
+  // Cancel a pending re-entry watch (breakout or pullback) on an opposite-direction signal.
+  // Done here (not only via recordSignalPlaced) so the watch is dropped even if the new
+  // order is later blocked by a filter.
+  if (actionLower !== "tp") {
+    const stCancel = symbolState[sym];
+    if (stCancel?.reentry && stCancel.reentry.action !== actionLower) {
+      console.log(`  ✖ ${sym}: watch de re-entrada (${stCancel.reentry.type || "breakout"}) cancelada — sinal contrário ${actionLower.toUpperCase()}`);
+      delete stCancel.reentry;
+      saveSymbolState();
+    }
+  }
+
   // ── Take-profit: close half the active position ───────────────────────────
   if (actionLower === "tp") {
     console.log(`  🎯 TP signal — a fechar metade da posição em ${sym}...`);
@@ -1742,7 +1828,8 @@ app.listen(PORT, () => {
   console.log(`  Spread    : ${CONFIG.maxSpreadPct > 0 ? `skip se spread > ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%` : "desativado (MAX_SPREAD_PCT para ativar)"}`);
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
-  console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "desativado (TRAILING_REENTRY_ENABLED=true para ativar)"}`);
+  console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
+  console.log(`  /commit2  : encaixa ganho + re-entrada pullback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}% (COMMIT_PULLBACK_PCT) | expira em ${CONFIG.reentryExpiryHours}h`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -1753,11 +1840,10 @@ app.listen(PORT, () => {
     console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
   }
 
-  // Start background trailing-stop re-entry checker (every 1 min)
-  if (CONFIG.trailingReentryEnabled) {
-    setInterval(checkTrailingReentries, 60 * 1000);
-    console.log(`🔁 Trailing re-entry checker ativo — verifica a cada 1min`);
-  }
+  // Start background re-entry checker (every 1 min). Always on so manual /commit2 pullback
+  // watches are serviced; breakout auto-detection is still gated by TRAILING_REENTRY_ENABLED.
+  setInterval(checkTrailingReentries, 60 * 1000);
+  console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit2: on`);
 
   // Start Telegram command polling
   startTelegramPolling();
