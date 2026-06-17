@@ -127,6 +127,9 @@ const CONFIG = {
   // exit (buy the dip for a long / sell the rip for a short). Cancelled by an opposite
   // signal; expires after REENTRY_EXPIRY_HOURS (shared with the breakout re-entry).
   commitPullbackPct:      parseFloat(process.env.COMMIT_PULLBACK_PCT || "0.003"),  // 0.3%
+  // /commit2 with no argument lists one button per open symbol whose unrealized gain
+  // exceeds this many USD, so you can bank it with one tap.
+  commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
 };
 
 const LOG_FILE = "webhook-trades.csv";
@@ -268,6 +271,45 @@ async function sendTelegram(message, chatId = null) {
   }).catch((e) => console.log("Telegram error:", e.message));
 }
 
+// Send a message with a one-time reply keyboard. `rows` is an array of rows, each a
+// list of button labels (strings). Tapping a button sends its label as a normal message,
+// so labels like "/commit2 BTCUSDT" route straight through handleTelegramCommand.
+async function sendTelegramKeyboard(message, rows, chatId = null) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const target = chatId || process.env.TELEGRAM_CHAT_ID;
+  if (!token || !target) return;
+  const keyboard = rows.map(row => row.map(label => ({ text: label })));
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: target, text: message, parse_mode: "HTML",
+      reply_markup: { keyboard, one_time_keyboard: true, resize_keyboard: true },
+    }),
+  }).catch((e) => console.log("Telegram error:", e.message));
+}
+
+// Returns all open linear positions with size > 0 (across all symbols).
+async function getAllOpenPositions() {
+  const timestamp  = (Date.now() - 1500).toString();
+  const recvWindow = "10000";
+  const params     = "category=linear&settleCoin=USDT";
+  const sig        = sign(timestamp, recvWindow, params);
+  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+  });
+  const data = await res.json();
+  return (data.result?.list || [])
+    .filter(p => parseFloat(p.size) > 0)
+    .map(p => ({
+      symbol:        p.symbol,
+      side:          p.side,
+      size:          parseFloat(p.size),
+      avgPrice:      parseFloat(p.avgPrice      || "0"),
+      unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
+    }));
+}
+
 // ─── Telegram Command Polling ─────────────────────────────────────────────────
 // Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
 // Supported commands:
@@ -362,62 +404,91 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
-  // /commit2 SYMBOL — close the position now (bank the gain) and arm a pullback re-entry:
-  // re-enter the same direction once price retraces COMMIT_PULLBACK_PCT from the exit.
+  // /commit2          → list one button per symbol with unrealized gain > COMMIT_MIN_GAIN_USD
+  // /commit2 SYMBOL   → close that position (bank the gain) + arm a pullback re-entry
   if (cmd === "/commit2") {
     if (CONFIG.paperTrading) {
       await sendTelegram(`📋 <b>Bot v2</b> — /commit2 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
     const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
-    if (!argSym) {
-      await sendTelegram(`ℹ️ Uso: <code>/commit2 SYMBOL</code> (ex: <code>/commit2 BTCUSDT</code>)`, chatId);
+
+    if (argSym) {
+      await commitSymbol(argSym, chatId);
       return;
     }
+
+    // No argument → build the dynamic menu of winners above the threshold
     try {
-      const pos = await getOpenPosition(argSym);
-      if (!pos) {
-        await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
+      const positions = await getAllOpenPositions();
+      const winners   = positions
+        .filter(p => p.unrealizedPnl > CONFIG.commitMinGainUSD)
+        .sort((a, b) => b.unrealizedPnl - a.unrealizedPnl);
+
+      if (winners.length === 0) {
+        await sendTelegram(`📭 <b>Bot v2</b> — nenhum símbolo com ganho > $${CONFIG.commitMinGainUSD}`, chatId);
         return;
       }
-      const sideAction = pos.side === "Buy" ? "buy" : "sell";
-      const pnl        = pos.unrealizedPnl;
-      const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
 
-      const result = await closePosition(argSym, pos);
-      console.log(`  💰 /commit2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
-
-      // Arm a pullback re-entry. positionOpenTime is cleared so the breakout auto-detector
-      // (checkTrailingReentries part 1) does NOT also arm a competing breakout watch.
-      const s = _getSymState(argSym);
-      s.positionOpenTime = null;
-      s.lastAction       = sideAction;
-      const triggerLevel = sideAction === "buy"
-        ? exitPrice * (1 - CONFIG.commitPullbackPct)
-        : exitPrice * (1 + CONFIG.commitPullbackPct);
-      s.reentry = {
-        type:            "pullback",
-        action:          sideAction,
-        level:           exitPrice,
-        triggerLevel,
-        createdAt:       Date.now(),
-        lastAttemptTime: 0,
-      };
-      saveSymbolState();
-
-      logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada pullback @ $${formatPrice(triggerLevel)}`);
-      const emoji = pnl >= 0 ? "🟢" : "🔴";
-      await sendTelegram(
-        `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
-        `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-        `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${(CONFIG.commitPullbackPct * 100).toFixed(2)}%)\n` +
-        `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
+      const listText = winners.map(p => `• <b>${p.symbol}</b> ${p.side}: +$${p.unrealizedPnl.toFixed(2)}`).join("\n");
+      const rows     = winners.map(p => [`/commit2 ${p.symbol}`]);
+      await sendTelegramKeyboard(
+        `💰 <b>Encaixar ganho</b> — símbolos com PnL > $${CONFIG.commitMinGainUSD}:\n${listText}\n\nToca para encaixar 👇`,
+        rows,
         chatId
       );
     } catch (e) {
-      await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /commit2 falhou\n${e.message}`, chatId);
+      await sendTelegram(`❌ Erro ao listar ganhos: ${e.message}`, chatId);
     }
     return;
+  }
+}
+
+// Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
+// re-entering once price retraces COMMIT_PULLBACK_PCT from the exit. Used by /commit2 SYMBOL.
+async function commitSymbol(argSym, chatId) {
+  try {
+    const pos = await getOpenPosition(argSym);
+    if (!pos) {
+      await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
+      return;
+    }
+    const sideAction = pos.side === "Buy" ? "buy" : "sell";
+    const pnl        = pos.unrealizedPnl;
+    const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
+
+    const result = await closePosition(argSym, pos);
+    console.log(`  💰 /commit2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
+
+    // Arm a pullback re-entry. positionOpenTime is cleared so the breakout auto-detector
+    // (checkTrailingReentries part 1) does NOT also arm a competing breakout watch.
+    const s = _getSymState(argSym);
+    s.positionOpenTime = null;
+    s.lastAction       = sideAction;
+    const triggerLevel = sideAction === "buy"
+      ? exitPrice * (1 - CONFIG.commitPullbackPct)
+      : exitPrice * (1 + CONFIG.commitPullbackPct);
+    s.reentry = {
+      type:            "pullback",
+      action:          sideAction,
+      level:           exitPrice,
+      triggerLevel,
+      createdAt:       Date.now(),
+      lastAttemptTime: 0,
+    };
+    saveSymbolState();
+
+    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada pullback @ $${formatPrice(triggerLevel)}`);
+    const emoji = pnl >= 0 ? "🟢" : "🔴";
+    await sendTelegram(
+      `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
+      `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+      `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${(CONFIG.commitPullbackPct * 100).toFixed(2)}%)\n` +
+      `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
+      chatId
+    );
+  } catch (e) {
+    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /commit2 falhou\n${e.message}`, chatId);
   }
 }
 
@@ -479,7 +550,7 @@ async function startTelegramPolling() {
     body:    JSON.stringify({ commands: [
       { command: "pnl2", description: "📊 PnL do dia" },
       { command: "pos2", description: "📈 Posições abertas" },
-      { command: "commit2", description: "💰 Encaixar ganho + re-entrada em pullback (ex: /commit2 BTCUSDT)" },
+      { command: "commit2", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit2 SYMBOL)" },
     ]}),
   }).catch(() => {});
 
@@ -1829,7 +1900,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
-  console.log(`  /commit2  : encaixa ganho + re-entrada pullback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}% (COMMIT_PULLBACK_PCT) | expira em ${CONFIG.reentryExpiryHours}h`);
+  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} (COMMIT_MIN_GAIN_USD) | re-entrada pullback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}% | expira em ${CONFIG.reentryExpiryHours}h`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
