@@ -1451,6 +1451,20 @@ app.get("/api/status", (req, res) => {
   res.json({ status: "ok", mode: CONFIG.paperTrading ? "paper" : "live", leverage: CONFIG.leverage });
 });
 
+// Download the trade log CSV. Protected by the webhook secret (same as /webhook):
+//   GET /trades?secret=YOUR_WEBHOOK_SECRET
+app.get("/trades", (req, res) => {
+  if (CONFIG.webhookSecret && req.query.secret !== CONFIG.webhookSecret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  if (!existsSync(LOG_FILE)) {
+    return res.status(404).json({ error: "Nenhum trade registado ainda (CSV não existe)" });
+  }
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="webhook-trades.csv"');
+  res.send(readFileSync(LOG_FILE, "utf8"));
+});
+
 // TradingView alert endpoint
 // Expected payload: { "secret": "...", "action": "buy"|"sell", "symbol": "BTCUSDT", "price": 75000 }
 app.post("/webhook", (req, res) => {
