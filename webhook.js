@@ -1,7 +1,14 @@
 import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
+import path from "path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+
+// Persisted state/log live under DATA_DIR. Set DATA_DIR to a mounted Railway Volume path
+// (e.g. /data) so symbol-state.json and the trade log survive redeploys/restarts.
+// Default "." keeps the old behaviour (current working dir) for local runs.
+const DATA_DIR = process.env.DATA_DIR || ".";
+try { if (DATA_DIR !== "." && !existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); } catch {}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -136,7 +143,7 @@ const CONFIG = {
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
 };
 
-const LOG_FILE = "webhook-trades.csv";
+const LOG_FILE = path.join(DATA_DIR, "webhook-trades.csv");
 const CSV_HEADERS = "Timestamp,Symbol,Action,Price,Size USD,Order ID,Mode,Notes";
 
 function initCsv() {
@@ -156,7 +163,7 @@ function logTrade(symbol, action, price, sizeUSD, orderId, mode, notes) {
 // Tracks per-symbol: last buy/sell signal time, last TP time, daily SL count.
 // Persisted to disk so Railway restarts don't reset the state.
 
-const SYMBOL_STATE_FILE = "symbol-state.json";
+const SYMBOL_STATE_FILE = path.join(DATA_DIR, "symbol-state.json");
 let symbolState = {};
 
 function loadSymbolState() {
@@ -1985,6 +1992,7 @@ app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  TradingView Webhook Bot v2");
   console.log(`  Port     : ${PORT}`);
+  console.log(`  Data dir : ${DATA_DIR}${DATA_DIR === "." ? " (efémero — define DATA_DIR p/ Volume Railway)" : " (persistente)"} | estado: ${SYMBOL_STATE_FILE}`);
   console.log(`  Mode     : ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log(`  Leverage : ${CONFIG.leverage}x`);
   console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
