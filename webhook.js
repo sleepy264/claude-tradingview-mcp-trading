@@ -126,7 +126,11 @@ const CONFIG = {
   // PULLBACK re-entry — re-enter the same direction once price retraces this % from the
   // exit (buy the dip for a long / sell the rip for a short). Cancelled by an opposite
   // signal; expires after REENTRY_EXPIRY_HOURS (shared with the breakout re-entry).
-  commitPullbackPct:      parseFloat(process.env.COMMIT_PULLBACK_PCT || "0.003"),  // 0.3%
+  // Pullback distance for the /commit2 re-entry. Dynamic: ATR × COMMIT_PULLBACK_ATR_MULT
+  // (adapts to each pair's volatility — "half an average candle" of retrace by default).
+  // Falls back to the fixed COMMIT_PULLBACK_PCT when ATR can't be fetched.
+  commitPullbackAtrMult:  parseFloat(process.env.COMMIT_PULLBACK_ATR_MULT || "0.5"),
+  commitPullbackPct:      parseFloat(process.env.COMMIT_PULLBACK_PCT || "0.003"),  // 0.3% fallback
   // /commit2 with no argument lists one button per open symbol whose unrealized gain
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
@@ -460,14 +464,25 @@ async function commitSymbol(argSym, chatId) {
     const result = await closePosition(argSym, pos);
     console.log(`  💰 /commit2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
 
+    // Pullback distance: dynamic ATR × COMMIT_PULLBACK_ATR_MULT, fallback to fixed %.
+    let pullbackAtr = null;
+    try { pullbackAtr = await fetchATR(argSym, CONFIG.candleInterval); } catch {}
+    const pullbackDist = pullbackAtr
+      ? pullbackAtr * CONFIG.commitPullbackAtrMult
+      : exitPrice * CONFIG.commitPullbackPct;
+    const pullbackSrc  = pullbackAtr
+      ? `${CONFIG.commitPullbackAtrMult}×ATR`
+      : `${(CONFIG.commitPullbackPct * 100).toFixed(2)}% fixo`;
+    const pullbackPctShown = (pullbackDist / exitPrice) * 100;
+
     // Arm a pullback re-entry. positionOpenTime is cleared so the breakout auto-detector
     // (checkTrailingReentries part 1) does NOT also arm a competing breakout watch.
     const s = _getSymState(argSym);
     s.positionOpenTime = null;
     s.lastAction       = sideAction;
     const triggerLevel = sideAction === "buy"
-      ? exitPrice * (1 - CONFIG.commitPullbackPct)
-      : exitPrice * (1 + CONFIG.commitPullbackPct);
+      ? exitPrice - pullbackDist
+      : exitPrice + pullbackDist;
     s.reentry = {
       type:            "pullback",
       action:          sideAction,
@@ -483,7 +498,7 @@ async function commitSymbol(argSym, chatId) {
     await sendTelegram(
       `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-      `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${(CONFIG.commitPullbackPct * 100).toFixed(2)}%)\n` +
+      `🔁 Re-entrada ${sideAction.toUpperCase()} armada em pullback @ $${formatPrice(triggerLevel)} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
     );
@@ -1900,7 +1915,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
-  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} (COMMIT_MIN_GAIN_USD) | re-entrada pullback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}% | expira em ${CONFIG.reentryExpiryHours}h`);
+  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} (COMMIT_MIN_GAIN_USD) | pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
