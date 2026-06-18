@@ -301,24 +301,33 @@ async function sendTelegramKeyboard(message, rows, chatId = null) {
 }
 
 // Returns all open linear positions with size > 0 (across all symbols).
+// Bybit's position/list requires a settleCoin filter, and USDT- vs USDC-settled perps
+// (e.g. SOLUSDT vs SOLUSDC) are returned separately — so we query both and merge.
 async function getAllOpenPositions() {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = "category=linear&settleCoin=USDT";
-  const sig        = sign(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-  });
-  const data = await res.json();
-  return (data.result?.list || [])
-    .filter(p => parseFloat(p.size) > 0)
-    .map(p => ({
-      symbol:        p.symbol,
-      side:          p.side,
-      size:          parseFloat(p.size),
-      avgPrice:      parseFloat(p.avgPrice      || "0"),
-      unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
-    }));
+  const out = [];
+  for (const settleCoin of ["USDT", "USDC"]) {
+    const timestamp  = (Date.now() - 1500).toString();
+    const recvWindow = "10000";
+    const params     = `category=linear&settleCoin=${settleCoin}`;
+    const sig        = sign(timestamp, recvWindow, params);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
+      headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    });
+    const data = await res.json();
+    for (const p of (data.result?.list || [])) {
+      if (parseFloat(p.size) > 0) {
+        out.push({
+          symbol:        p.symbol,
+          side:          p.side,
+          size:          parseFloat(p.size),
+          avgPrice:      parseFloat(p.avgPrice      || "0"),
+          unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
+          stopLoss:      p.stopLoss || "",
+        });
+      }
+    }
+  }
+  return out;
 }
 
 // ─── Telegram Command Polling ─────────────────────────────────────────────────
@@ -382,20 +391,7 @@ async function handleTelegramCommand(text, chatId) {
 
   if (cmd === "/pos2") {
     try {
-      const timestamp  = (Date.now() - 1500).toString();
-      const recvWindow = "10000";
-      const params     = "category=linear&settleCoin=USDT";
-      const sig        = sign(timestamp, recvWindow, params);
-      const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
-        headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      });
-      const rawText = await res.text();
-      let data;
-      try { data = JSON.parse(rawText); }
-      catch (e) {
-        throw new Error(`Bybit devolveu resposta inválida (HTTP ${res.status}): ${rawText.substring(0, 300)}`);
-      }
-      const positions = (data.result?.list || []).filter(p => parseFloat(p.size) > 0);
+      const positions = await getAllOpenPositions(); // USDT + USDC settled
 
       if (positions.length === 0) {
         await sendTelegram(`📭 <b>Bot v2</b> — Sem posições abertas`, chatId);
@@ -403,9 +399,8 @@ async function handleTelegramCommand(text, chatId) {
       }
 
       const lines = positions.map(p => {
-        const pnl    = parseFloat(p.unrealisedPnl || 0);
-        const emoji  = pnl >= 0 ? "🟢" : "🔴";
-        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${parseFloat(p.avgPrice).toFixed(4)}\n   PnL: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
+        const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${p.avgPrice.toFixed(4)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
       });
 
       await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}`, chatId);
