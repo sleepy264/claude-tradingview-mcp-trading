@@ -185,13 +185,14 @@ function _getSymState(symbol) {
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
 // Called after a BUY/SELL order is successfully placed.
-function recordSignalPlaced(symbol, action, price = null) {
+function recordSignalPlaced(symbol, action, price = null, leverage = null) {
   const s = _getSymState(symbol);
   if (action === "buy") s.lastBuyTime = Date.now();
   else                  s.lastSellTime = Date.now();
   s.positionOpenTime = Date.now(); // for position timeout tracking
   s.lastAction       = action;     // for trailing-stop re-entry direction
   s.lastEntryPrice   = price;
+  if (leverage != null && leverage > 0) s.lastLeverage = leverage; // so a re-entry mirrors this leverage
   delete s.reentry;                 // a fresh entry supersedes any pending re-entry watch
   saveSymbolState();
 }
@@ -483,23 +484,24 @@ async function commitSymbol(argSym, chatId) {
 
     // Place a real GTC limit order on Bybit at the dip/rip level. Unlike an in-memory
     // watch, this survives bot restarts/redeploys (it lives on the exchange).
-    let dynLev = CONFIG.leverage;
-    if (CONFIG.dynamicLeverage && pullbackAtr) {
-      try { dynLev = calcDynamicLeverage(pullbackAtr, await fetchATRAvg50(argSym, CONFIG.candleInterval), CONFIG.leverage); } catch {}
-    }
-    await setLeverage(argSym, dynLev);
-    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, dynLev, pullbackAtr);
+    // Re-enter with the SAME leverage the closed position used (read from Bybit), not the
+    // env default / dynamic leverage — otherwise a 100x trade re-opens at a lower leverage.
+    const reLev = pos.leverage > 0 ? pos.leverage : CONFIG.leverage;
+    await setLeverage(argSym, reLev);
+    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, reLev, pullbackAtr);
 
     // Track the order so it can be cancelled by an opposite signal / expiry, and so the
     // poller can detect the fill. positionOpenTime stays null until the limit fills.
     const s = _getSymState(argSym);
     s.positionOpenTime = null;
     s.lastAction       = sideAction;
+    s.lastLeverage = reLev;
     s.reentry = {
       type:      "limit",
       action:    sideAction,
       orderId:   lim.orderId,
       price:     parseFloat(lim.priceStr),
+      leverage:  reLev,
       createdAt: Date.now(),
     };
     saveSymbolState();
@@ -509,7 +511,7 @@ async function commitSymbol(argSym, chatId) {
     await sendTelegram(
       `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-      `🔁 Ordem limite ${sideAction.toUpperCase()} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
+      `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
@@ -885,6 +887,7 @@ async function checkTrailingReentries() {
             console.log(`  ✅ ${sym}: ordem limite de re-entrada encheu @ $${r.price}`);
             state.positionOpenTime = now;   // hand the position to timeout/trailing tracking
             state.lastAction       = r.action;
+            if (r.leverage > 0) state.lastLeverage = r.leverage; // keep leverage for future re-entries
             delete state.reentry;
             saveSymbolState();
             try {
@@ -964,13 +967,10 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
     try { resolvedAtr = await fetchATR(symbol, CONFIG.candleInterval); }
     catch (e) { console.log(`  ⚠️  ATR fetch falhou: ${e.message} — SL fixo será usado`); }
 
-    let dynLev = CONFIG.leverage;
-    if (CONFIG.dynamicLeverage && resolvedAtr) {
-      try {
-        const avg50 = await fetchATRAvg50(symbol, CONFIG.candleInterval);
-        dynLev      = calcDynamicLeverage(resolvedAtr, avg50, CONFIG.leverage);
-      } catch {}
-    }
+    // Mirror the leverage the original (now-closed) position used, stored at its entry.
+    // Falls back to the env default if unknown.
+    const st    = _getSymState(symbol);
+    const reLev = st.lastLeverage > 0 ? st.lastLeverage : CONFIG.leverage;
 
     const effectiveSlPct = resolvedAtr ? (resolvedAtr * CONFIG.atrMultiplier) / priceNum : CONFIG.stopLossPct;
 
@@ -980,7 +980,7 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
     }
 
     if (CONFIG.feeViabilityThreshold > 0 && resolvedAtr) {
-      const notional      = CONFIG.tradeSize * dynLev;
+      const notional      = CONFIG.tradeSize * reLev;
       const feesRoundTrip = notional * 0.00055 * 2;
       const expectedTp1   = notional * effectiveSlPct * 0.5;
       if (expectedTp1 < feesRoundTrip * CONFIG.feeViabilityThreshold) {
@@ -989,10 +989,10 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
       }
     }
 
-    await setLeverage(symbol, dynLev);
-    const order = await placeOrder(symbol, action, priceNum, dynLev, resolvedAtr, null);
-    console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${order.filledAs === "maker" ? "maker 0.02%" : "taker 0.055%"}`);
-    recordSignalPlaced(symbol, action, priceNum);
+    await setLeverage(symbol, reLev);
+    const order = await placeOrder(symbol, action, priceNum, reLev, resolvedAtr, null);
+    console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${reLev}x | ${order.filledAs === "maker" ? "maker 0.02%" : "taker 0.055%"}`);
+    recordSignalPlaced(symbol, action, priceNum, reLev);
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(symbol, action, priceNum, resolvedAtr);
@@ -1246,6 +1246,7 @@ async function getOpenPosition(symbol) {
     stopLoss:       parseFloat(position.stopLoss      || "0"),
     avgPrice:       parseFloat(position.avgPrice      || "0"),  // entry price from Bybit — reliable even after partial closes
     unrealizedPnl:  parseFloat(position.unrealisedPnl || "0"),  // Bybit field name: unrealisedPnl
+    leverage:       parseFloat(position.leverage      || "0"),  // so a re-entry can mirror the original leverage
   } : null;
 }
 
@@ -1964,7 +1965,7 @@ async function handleWebhook(body) {
     const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
-    recordSignalPlaced(sym, actionLower, priceNum);
+    recordSignalPlaced(sym, actionLower, priceNum, effectiveLev); // store actual Bybit leverage for re-entries
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(sym, actionLower, priceNum, resolvedAtr);
