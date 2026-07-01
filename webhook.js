@@ -141,6 +141,10 @@ const CONFIG = {
   // /commit2 with no argument lists one button per open symbol whose unrealized gain
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
+  // Auto-commit: automatically bank a position (same flow as /commit2 — close + pullback
+  // limit re-entry) once its unrealized gain reaches this many USD. Checked every 1 min.
+  // 0 = disabled (manual /commit2 only).
+  autoCommitGainUSD:      parseFloat(process.env.AUTO_COMMIT_GAIN_USD || "0"),
 };
 
 const LOG_FILE = path.join(DATA_DIR, "webhook-trades.csv");
@@ -185,7 +189,7 @@ function _getSymState(symbol) {
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
 // Called after a BUY/SELL order is successfully placed.
-function recordSignalPlaced(symbol, action, price = null, leverage = null) {
+function recordSignalPlaced(symbol, action, price = null, leverage = null, interval = null) {
   const s = _getSymState(symbol);
   if (action === "buy") s.lastBuyTime = Date.now();
   else                  s.lastSellTime = Date.now();
@@ -193,6 +197,7 @@ function recordSignalPlaced(symbol, action, price = null, leverage = null) {
   s.lastAction       = action;     // for trailing-stop re-entry direction
   s.lastEntryPrice   = price;
   if (leverage != null && leverage > 0) s.lastLeverage = leverage; // so a re-entry mirrors this leverage
+  if (interval) s.lastInterval = interval; // so re-entry ATR uses the same candle interval as the entry
   delete s.reentry;                 // a fresh entry supersedes any pending re-entry watch
   saveSymbolState();
 }
@@ -452,8 +457,9 @@ async function handleTelegramCommand(text, chatId) {
 }
 
 // Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
-// re-entering once price retraces COMMIT_PULLBACK_PCT from the exit. Used by /commit2 SYMBOL.
-async function commitSymbol(argSym, chatId) {
+// re-entering once price retraces the pullback distance from the exit.
+// Used by /commit2 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
+async function commitSymbol(argSym, chatId, source = "/commit2") {
   try {
     const pos = await getOpenPosition(argSym);
     if (!pos) {
@@ -465,11 +471,13 @@ async function commitSymbol(argSym, chatId) {
     const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
 
     const result = await closePosition(argSym, pos);
-    console.log(`  💰 /commit2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
+    console.log(`  💰 ${source} ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
 
     // Pullback distance: dynamic ATR × COMMIT_PULLBACK_ATR_MULT, fallback to fixed %.
+    // ATR uses the same candle interval as the original entry when known.
+    const cInterval = symbolState[argSym]?.lastInterval || CONFIG.candleInterval;
     let pullbackAtr = null;
-    try { pullbackAtr = await fetchATR(argSym, CONFIG.candleInterval); } catch {}
+    try { pullbackAtr = await fetchATR(argSym, cInterval); } catch {}
     const pullbackDist = pullbackAtr
       ? pullbackAtr * CONFIG.commitPullbackAtrMult
       : exitPrice * CONFIG.commitPullbackPct;
@@ -481,6 +489,30 @@ async function commitSymbol(argSym, chatId) {
     const triggerLevel = sideAction === "buy"
       ? exitPrice - pullbackDist
       : exitPrice + pullbackDist;
+
+    // Volatility filter (same MAX_SL_PCT rule as normal entries): if the implied ATR-based
+    // SL is too wide, bank the gain but do NOT re-enter — a wide SL at high leverage is
+    // decorative (real loss ≈ notional × SL%, which can approach the whole account in Cross).
+    // positionOpenTime stays cleared so the breakout auto-detector doesn't arm a watch either.
+    if (CONFIG.maxSlPct > 0 && pullbackAtr) {
+      const impliedSlPct = (pullbackAtr * CONFIG.atrMultiplier) / triggerLevel;
+      if (impliedSlPct > CONFIG.maxSlPct) {
+        const s0 = _getSymState(argSym);
+        s0.positionOpenTime = null;
+        delete s0.reentry;
+        saveSymbolState();
+        const msg = `SL implícito ${(impliedSlPct * 100).toFixed(2)}% > limite ${(CONFIG.maxSlPct * 100).toFixed(1)}% — volatilidade alta, sem re-entrada`;
+        console.log(`  ⏸ ${argSym}: ${msg}`);
+        logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada bloqueada (SL ${(impliedSlPct * 100).toFixed(2)}%)`);
+        await sendTelegram(
+          `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v2 ${argSym}</b> — Ganho encaixado (${source})\n` +
+          `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+          `⏸ Sem re-entrada: ${msg}`,
+          chatId
+        );
+        return;
+      }
+    }
 
     // Place a real GTC limit order on Bybit at the dip/rip level. Unlike an in-memory
     // watch, this survives bot restarts/redeploys (it lives on the exchange).
@@ -506,10 +538,10 @@ async function commitSymbol(argSym, chatId) {
     };
     saveSymbolState();
 
-    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/commit2 — encaixou PnL ~$${pnl.toFixed(2)}, ordem limite re-entrada @ $${lim.priceStr}`);
+    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, ordem limite re-entrada @ $${lim.priceStr}`);
     const emoji = pnl >= 0 ? "🟢" : "🔴";
     await sendTelegram(
-      `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (/commit2)\n` +
+      `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (${source})\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
@@ -517,7 +549,25 @@ async function commitSymbol(argSym, chatId) {
       chatId
     );
   } catch (e) {
-    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /commit2 falhou\n${e.message}`, chatId);
+    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — ${source} falhou\n${e.message}`, chatId);
+  }
+}
+
+// Background auto-commit — runs every 1 min when AUTO_COMMIT_GAIN_USD > 0.
+// Banks any position whose unrealized gain reached the threshold, using the exact same
+// flow as the manual /commit2 (close + pullback limit re-entry, volatility-filtered).
+async function checkAutoCommit() {
+  if (!(CONFIG.autoCommitGainUSD > 0) || CONFIG.paperTrading) return;
+  try {
+    const positions = await getAllOpenPositions();
+    for (const p of positions) {
+      if (p.unrealizedPnl >= CONFIG.autoCommitGainUSD) {
+        console.log(`\n💰 [Auto-commit] ${p.symbol}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ $${CONFIG.autoCommitGainUSD} — a encaixar`);
+        await commitSymbol(p.symbol, null, "auto-commit");
+      }
+    }
+  } catch (e) {
+    console.log(`  ⚠️  Auto-commit check: ${e.message}`);
   }
 }
 
@@ -891,7 +941,7 @@ async function checkTrailingReentries() {
             delete state.reentry;
             saveSymbolState();
             try {
-              let atr = null; try { atr = await fetchATR(sym, CONFIG.candleInterval); } catch {}
+              let atr = null; try { atr = await fetchATR(sym, state.lastInterval || CONFIG.candleInterval); } catch {}
               if (CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, r.price, atr);
             } catch (e) { console.log(`  ⚠️  Trailing pós-fill ${sym}: ${e.message}`); }
             await sendTelegram(`🔁 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
@@ -963,13 +1013,17 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
   }
 
   try {
+    // Use the same candle interval as the original entry (payload interval), so the
+    // re-entry's ATR-based SL/trailing width matches the strategy's timeframe.
+    const st         = _getSymState(symbol);
+    const reInterval = st.lastInterval || CONFIG.candleInterval;
+
     let resolvedAtr = null;
-    try { resolvedAtr = await fetchATR(symbol, CONFIG.candleInterval); }
+    try { resolvedAtr = await fetchATR(symbol, reInterval); }
     catch (e) { console.log(`  ⚠️  ATR fetch falhou: ${e.message} — SL fixo será usado`); }
 
     // Mirror the leverage the original (now-closed) position used, stored at its entry.
     // Falls back to the env default if unknown.
-    const st    = _getSymState(symbol);
     const reLev = st.lastLeverage > 0 ? st.lastLeverage : CONFIG.leverage;
 
     const effectiveSlPct = resolvedAtr ? (resolvedAtr * CONFIG.atrMultiplier) / priceNum : CONFIG.stopLossPct;
@@ -992,7 +1046,7 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
     await setLeverage(symbol, reLev);
     const order = await placeOrder(symbol, action, priceNum, reLev, resolvedAtr, null);
     console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${reLev}x | ${order.filledAs === "maker" ? "maker 0.02%" : "taker 0.055%"}`);
-    recordSignalPlaced(symbol, action, priceNum, reLev);
+    recordSignalPlaced(symbol, action, priceNum, reLev, reInterval);
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(symbol, action, priceNum, resolvedAtr);
@@ -1022,11 +1076,10 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr) {
   const priceStr = roundToTick(limitPrice, tickSize);
   const priceNum = parseFloat(priceStr);
 
-  let slPrice = null;
-  if (atr) {
-    const slDist = atr * CONFIG.atrMultiplier;
-    slPrice = roundToTick(action === "buy" ? priceNum - slDist : priceNum + slDist, tickSize);
-  }
+  // SL: ATR-based, falling back to the fixed STOP_LOSS_PCT — the resting order must
+  // never sit in the book without a stop attached.
+  const slDist  = atr ? atr * CONFIG.atrMultiplier : priceNum * CONFIG.stopLossPct;
+  const slPrice = roundToTick(action === "buy" ? priceNum - slDist : priceNum + slDist, tickSize);
 
   const qty  = calcQty(CONFIG.tradeSize, lev, priceNum, minQty, qtyStep);
   const body = JSON.stringify({
@@ -1965,7 +2018,7 @@ async function handleWebhook(body) {
     const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
     const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
-    recordSignalPlaced(sym, actionLower, priceNum, effectiveLev); // store actual Bybit leverage for re-entries
+    recordSignalPlaced(sym, actionLower, priceNum, effectiveLev, candleInterval); // store leverage+interval for re-entries
 
     if (CONFIG.tradeMode === "futures") {
       await setTrailingStop(sym, actionLower, priceNum, resolvedAtr);
@@ -2025,6 +2078,7 @@ app.listen(PORT, () => {
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
   console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h`);
+  console.log(`  Auto-commit: ${CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_USD para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -2039,6 +2093,12 @@ app.listen(PORT, () => {
   // watches are serviced; breakout auto-detection is still gated by TRAILING_REENTRY_ENABLED.
   setInterval(checkTrailingReentries, 60 * 1000);
   console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit2: on`);
+
+  // Start background auto-commit checker (every 1 min)
+  if (CONFIG.autoCommitGainUSD > 0) {
+    setInterval(checkAutoCommit, 60 * 1000);
+    console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}`);
+  }
 
   // Start Telegram command polling
   startTelegramPolling();
