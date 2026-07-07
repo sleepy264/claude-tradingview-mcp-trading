@@ -920,20 +920,37 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
     console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${activePriceNum.toFixed(2)} (${(CONFIG.trailingActivationPct * 100).toFixed(2)}% de lucro)`);
   }
 
-  const timestamp  = Date.now().toString();
-  const recvWindow = "5000";
   const orderBody  = alreadyActivated
     ? { category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 }
     : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: formatPrice(activePriceNum), positionIdx: 0 };
-  const body = JSON.stringify(orderBody);
-  const sig  = sign(timestamp, recvWindow, body);
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) console.log(`  ⚠️  Trailing stop falhou: ${data.retMsg}`);
+
+  // Retry logic: Bybit may return "zero position" if the fill hasn't propagated yet.
+  // Retry up to 3 times with increasing delays (1s, 2s, 3s).
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const timestamp  = Date.now().toString();
+    const recvWindow = "5000";
+    const body = JSON.stringify(orderBody);
+    const sig  = sign(timestamp, recvWindow, body);
+    const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+      body,
+    });
+    const data = await res.json();
+    if (data.retCode === 0) {
+      if (attempt > 1) console.log(`  ✅ Trailing stop colocado com sucesso (tentativa ${attempt})`);
+      return;
+    }
+    const isZeroPos = data.retMsg && data.retMsg.toLowerCase().includes("zero position");
+    if (isZeroPos && attempt < maxRetries) {
+      console.log(`  ⚠️  Trailing stop falhou (tentativa ${attempt}/${maxRetries}): ${data.retMsg} — a tentar novamente em ${attempt}s...`);
+      await new Promise(r => setTimeout(r, attempt * 1000));
+    } else {
+      console.log(`  ⚠️  Trailing stop falhou: ${data.retMsg}`);
+      return;
+    }
+  }
 }
 
 // ─── Webhook endpoint ─────────────────────────────────────────────────────────
