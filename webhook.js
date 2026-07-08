@@ -520,7 +520,9 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     // env default / dynamic leverage — otherwise a 100x trade re-opens at a lower leverage.
     const reLev = pos.leverage > 0 ? pos.leverage : CONFIG.leverage;
     await setLeverage(argSym, reLev);
-    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, reLev, pullbackAtr);
+    // Mirror the closed position's contract quantity too — a fresh CONFIG.tradeSize sizing
+    // would re-open at full size even when banking a half position left over from a TP.
+    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, reLev, pullbackAtr, pos.size);
 
     // Track the order so it can be cancelled by an opposite signal / expiry, and so the
     // poller can detect the fill. positionOpenTime stays null until the limit fills.
@@ -543,7 +545,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     await sendTelegram(
       `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (${source})\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-      `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
+      `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
@@ -1068,7 +1070,9 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
 // with an ATR-based SL attached (activates on fill). Returns { orderId, slPrice, priceStr, qty }.
 // Unlike placeOrder's chase-limit→market flow, this never falls back to market — it must
 // rest in the book until price reaches the level (or it's cancelled).
-async function placeReentryLimit(symbol, action, limitPrice, lev, atr) {
+// qtyOverride: mirror the closed position's contract quantity (e.g. after a TP half-close)
+// instead of sizing a fresh CONFIG.tradeSize × lev position.
+async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverride = null) {
   const side = action === "buy" ? "Buy" : "Sell";
   const { minQty, qtyStep, maxLeverage, tickSize } = await getInstrumentInfo(symbol);
   if (maxLeverage > 0 && lev > maxLeverage) lev = maxLeverage;
@@ -1081,7 +1085,13 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr) {
   const slDist  = atr ? atr * CONFIG.atrMultiplier : priceNum * CONFIG.stopLossPct;
   const slPrice = roundToTick(action === "buy" ? priceNum - slDist : priceNum + slDist, tickSize);
 
-  const qty  = calcQty(CONFIG.tradeSize, lev, priceNum, minQty, qtyStep);
+  let qty;
+  if (qtyOverride > 0) {
+    const decimals = (qtyStep.toString().split(".")[1] || "").length;
+    qty = Math.max(Math.floor(qtyOverride / qtyStep) * qtyStep, minQty).toFixed(decimals);
+  } else {
+    qty = calcQty(CONFIG.tradeSize, lev, priceNum, minQty, qtyStep);
+  }
   const body = JSON.stringify({
     category: "linear", symbol, side, orderType: "Limit",
     price: priceStr, qty, timeInForce: "GTC", positionIdx: 0,
