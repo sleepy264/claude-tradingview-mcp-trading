@@ -455,6 +455,82 @@ async function handleTelegramCommand(text, chatId) {
     }
     return;
   }
+
+  // /close2          → list one button per open position (any PnL)
+  // /close2 SYMBOL   → close that position, NO re-entry (also cancels any pending
+  //                    re-entry watch/limit order for the symbol)
+  if (cmd === "/close2") {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(`📋 <b>Bot v2</b> — /close2 só funciona em modo LIVE (atual: paper)`, chatId);
+      return;
+    }
+    const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+
+    if (argSym) {
+      await closeSymbol(argSym, chatId);
+      return;
+    }
+
+    // No argument → list ALL open positions (closing a loser is a valid use here)
+    try {
+      const positions = (await getAllOpenPositions()).sort((a, b) => b.unrealizedPnl - a.unrealizedPnl);
+      if (positions.length === 0) {
+        await sendTelegram(`📭 <b>Bot v2</b> — Sem posições abertas para fechar`, chatId);
+        return;
+      }
+      const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
+      const rows     = positions.map(p => [`/close2 ${p.symbol}`]);
+      await sendTelegramKeyboard(
+        `✂️ <b>Fechar posição</b> (sem re-entrada):\n${listText}\n\nToca para fechar 👇`,
+        rows,
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao listar posições: ${e.message}`, chatId);
+    }
+    return;
+  }
+}
+
+// Close a symbol's position with NO re-entry — /close2. Also cancels any pending
+// re-entry (software watch or resting Bybit limit order) and clears positionOpenTime
+// so the breakout auto-detector doesn't re-arm a watch for this closure.
+async function closeSymbol(argSym, chatId) {
+  try {
+    const pos = await getOpenPosition(argSym);
+    if (!pos) {
+      await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para fechar`, chatId);
+      return;
+    }
+    const pnl       = pos.unrealizedPnl;
+    const exitPrice = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
+
+    const result = await closePosition(argSym, pos);
+    console.log(`  ✂️ /close2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
+
+    const s = _getSymState(argSym);
+    s.positionOpenTime = null; // prevents the breakout auto-detector from arming a watch
+    let cancelledReentry = false;
+    if (s.reentry) {
+      if (s.reentry.type === "limit" && s.reentry.orderId) {
+        try { await cancelOrder(argSym, s.reentry.orderId); cancelledReentry = true; } catch {}
+      } else {
+        cancelledReentry = true;
+      }
+      delete s.reentry;
+    }
+    saveSymbolState();
+
+    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close2 — fechado sem re-entrada (PnL ~$${pnl.toFixed(2)})`);
+    await sendTelegram(
+      `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v2 ${argSym}</b> — Posição fechada (/close2)\n` +
+      `${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+      `Sem re-entrada${cancelledReentry ? " | re-entrada pendente cancelada" : ""}`,
+      chatId
+    );
+  } catch (e) {
+    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /close2 falhou\n${e.message}`, chatId);
+  }
 }
 
 // Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
@@ -633,6 +709,7 @@ async function startTelegramPolling() {
       { command: "pnl2", description: "📊 PnL do dia" },
       { command: "pos2", description: "📈 Posições abertas" },
       { command: "commit2", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit2 SYMBOL)" },
+      { command: "close2", description: "✂️ Fechar posição sem re-entrada (ou /close2 SYMBOL)" },
     ]}),
   }).catch(() => {});
 
