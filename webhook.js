@@ -407,7 +407,7 @@ async function handleTelegramCommand(text, chatId) {
 
       const lines = positions.map(p => {
         const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
-        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${p.avgPrice.toFixed(4)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
       });
 
       await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}`, chatId);
