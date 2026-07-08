@@ -327,6 +327,7 @@ async function getAllOpenPositions() {
           side:          p.side,
           size:          parseFloat(p.size),
           avgPrice:      parseFloat(p.avgPrice      || "0"),
+          markPrice:     parseFloat(p.markPrice     || "0"),  // current price
           unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
           stopLoss:      p.stopLoss || "",
         });
@@ -442,7 +443,7 @@ async function handleTelegramCommand(text, chatId) {
         return;
       }
 
-      const listText = winners.map(p => `• <b>${p.symbol}</b> ${p.side}: +$${p.unrealizedPnl.toFixed(2)}`).join("\n");
+      const listText = winners.map(p => `• <b>${p.symbol}</b> ${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
       const rows     = winners.map(p => [`/commit2 ${p.symbol}`]);
       await sendTelegramKeyboard(
         `💰 <b>Encaixar ganho</b> — símbolos com PnL > $${CONFIG.commitMinGainUSD}:\n${listText}\n\nToca para encaixar 👇`,
