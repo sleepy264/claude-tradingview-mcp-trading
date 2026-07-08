@@ -138,6 +138,11 @@ const CONFIG = {
   // Falls back to the fixed COMMIT_PULLBACK_PCT when ATR can't be fetched.
   commitPullbackAtrMult:  parseFloat(process.env.COMMIT_PULLBACK_ATR_MULT || "0.5"),
   commitPullbackPct:      parseFloat(process.env.COMMIT_PULLBACK_PCT || "0.003"),  // 0.3% fallback
+  // Breakout fallback for the commit re-entry: if the resting pullback limit never fills
+  // and price instead breaks ATR × this multiplier PAST the exit in the original direction,
+  // cancel the limit and re-enter at market (mirroring qty/leverage) so the move isn't lost.
+  // 0 = disabled (limit-only, may expire unfilled).
+  commitBreakoutAtrMult:  parseFloat(process.env.COMMIT_BREAKOUT_ATR_MULT || "0.5"),
   // /commit2 with no argument lists one button per open symbol whose unrealized gain
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
@@ -606,12 +611,23 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     const s = _getSymState(argSym);
     s.positionOpenTime = null;
     s.lastAction       = sideAction;
+    // Breakout fallback level: if price runs this far PAST the exit without dipping,
+    // the poller cancels the limit and re-enters at market instead.
+    const breakoutDist  = pullbackAtr
+      ? pullbackAtr * CONFIG.commitBreakoutAtrMult
+      : exitPrice * CONFIG.commitPullbackPct;
+    const breakoutLevel = CONFIG.commitBreakoutAtrMult > 0
+      ? (sideAction === "buy" ? exitPrice + breakoutDist : exitPrice - breakoutDist)
+      : null;
+
     s.lastLeverage = reLev;
     s.reentry = {
       type:      "limit",
       action:    sideAction,
       orderId:   lim.orderId,
       price:     parseFloat(lim.priceStr),
+      qty:       lim.qty,
+      breakoutLevel,
       leverage:  reLev,
       createdAt: Date.now(),
     };
@@ -624,6 +640,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
+      (breakoutLevel ? `🚀 Fallback: entra a mercado se romper $${formatPrice(breakoutLevel)} sem dar o pullback\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
     );
@@ -1033,6 +1050,57 @@ async function checkTrailingReentries() {
             saveSymbolState();
             continue;
           }
+
+          // Breakout fallback: price resumed the original direction without ever giving
+          // the pullback — cancel the resting limit and enter at market (same qty/leverage)
+          // so the continuation isn't lost. Respects the trading-hours window.
+          if (status === "New" && r.breakoutLevel && r.qty) {
+            const cur = await fetchCurrentPrice(sym);
+            const broke = cur > 0 && (r.action === "buy" ? cur >= r.breakoutLevel : cur <= r.breakoutLevel);
+            const hoursOk = CONFIG.tradeHoursStart === null || CONFIG.tradeHoursEnd === null ||
+              isInTimeWindow(new Date().getUTCHours(), CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd);
+            if (broke && hoursOk) {
+              console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel)} sem dar pullback — a cancelar limite e entrar a mercado`);
+              await cancelOrder(sym, r.orderId);
+              try {
+                const side = r.action === "buy" ? "Buy" : "Sell";
+                const { tickSize } = await getInstrumentInfo(sym);
+                let atr = null;
+                try { atr = await fetchATR(sym, state.lastInterval || CONFIG.candleInterval); } catch {}
+                const slDist   = atr ? atr * CONFIG.atrMultiplier : cur * CONFIG.stopLossPct;
+                const stopLoss = roundToTick(r.action === "buy" ? cur - slDist : cur + slDist, tickSize);
+                const body = JSON.stringify({ category: "linear", symbol: sym, side, orderType: "Market", qty: String(r.qty), positionIdx: 0, stopLoss, slTriggerBy: "LastPrice" });
+                const ts = (Date.now() - 1500).toString();
+                const rw = "10000";
+                const sg = sign(ts, rw, body);
+                const resM = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sg, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": rw },
+                  body,
+                });
+                const dM = await resM.json();
+                if (dM.retCode !== 0) throw new Error(dM.retMsg);
+                state.positionOpenTime = now;
+                state.lastAction       = r.action;
+                delete state.reentry;
+                saveSymbolState();
+                if (CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, cur, atr);
+                logTrade(sym, r.action, cur, "", dM.result?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel)} (limite não encheu)`);
+                await sendTelegram(
+                  `🚀 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} a mercado (fallback)\n` +
+                  `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel)}\n` +
+                  `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: $${stopLoss}`
+                );
+              } catch (e) {
+                console.log(`  ❌ Fallback breakout ${sym} falhou: ${e.message}`);
+                delete state.reentry;
+                saveSymbolState();
+                await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Fallback breakout falhou\n${e.message}`);
+              }
+              continue;
+            }
+          }
+
           if (now - r.createdAt > expiryMs) {
             console.log(`  ⌛ ${sym}: re-entrada limite expirou (${CONFIG.reentryExpiryHours}h) — a cancelar ordem`);
             try { await cancelOrder(sym, r.orderId); } catch {}
@@ -2165,7 +2233,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
-  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h`);
+  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_USD para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
