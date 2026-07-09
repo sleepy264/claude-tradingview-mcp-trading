@@ -558,9 +558,11 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     const pnl        = pos.unrealizedPnl;
     const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
     // Mirror protection presence: if the original position ran without SL / trailing
-    // (deliberate user choice), the re-entry must not add them either.
+    // (deliberate user choice), the re-entry must not add them either. A configured TP
+    // level (a market target) is inherited as-is.
     const hadSL    = pos.stopLoss > 0;
     const hadTrail = pos.trailingStop > 0;
+    const tpPrice  = pos.takeProfit > 0 ? pos.takeProfit : null;
 
     const result = await closePosition(argSym, pos);
     console.log(`  💰 ${source} ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
@@ -615,7 +617,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     await setLeverage(argSym, reLev);
     // Mirror the closed position's contract quantity too — a fresh CONFIG.tradeSize sizing
     // would re-open at full size even when banking a half position left over from a TP.
-    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, reLev, pullbackAtr, pos.size, hadSL);
+    const lim = await placeReentryLimit(argSym, sideAction, triggerLevel, reLev, pullbackAtr, pos.size, hadSL, tpPrice);
 
     // Track the order so it can be cancelled by an opposite signal / expiry, and so the
     // poller can detect the fill. positionOpenTime stays null until the limit fills.
@@ -642,6 +644,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
       leverage:  reLev,
       hadSL,               // fallback market entry mirrors SL presence
       hadTrail,            // fill handler mirrors trailing presence
+      tpPrice,             // inherited TP level (fallback market entry re-attaches it)
       createdAt: Date.now(),
     };
     saveSymbolState();
@@ -653,6 +656,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
+      (lim.tpPrice ? `🎯 TP herdado: $${lim.tpPrice}\n` : "") +
       (!hadSL || !hadTrail ? `⚠️ Sem ${!hadSL && !hadTrail ? "SL nem trailing" : !hadSL ? "SL" : "trailing"} (a posição original não tinha)\n` : "") +
       (breakoutLevel ? `🚀 Fallback: entra a mercado se romper $${formatPrice(breakoutLevel)} sem dar o pullback\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
@@ -1106,8 +1110,12 @@ async function checkTrailingReentries() {
                   const slDist = atr ? atr * CONFIG.atrMultiplier : cur * CONFIG.stopLossPct;
                   stopLoss = roundToTick(r.action === "buy" ? cur - slDist : cur + slDist, tickSize);
                 }
+                // Inherited TP — only if still on the correct side of the current price
+                const tpOk = r.tpPrice > 0 && (r.action === "buy" ? r.tpPrice > cur : r.tpPrice < cur);
+                const takeProfit = tpOk ? roundToTick(r.tpPrice, tickSize) : null;
                 const body = JSON.stringify({ category: "linear", symbol: sym, side, orderType: "Market", qty: String(r.qty), positionIdx: 0,
-                  ...(stopLoss ? { stopLoss, slTriggerBy: "LastPrice" } : {}) });
+                  ...(stopLoss ? { stopLoss, slTriggerBy: "LastPrice" } : {}),
+                  ...(takeProfit ? { takeProfit, tpTriggerBy: "LastPrice" } : {}) });
                 const ts = (Date.now() - 1500).toString();
                 const rw = "10000";
                 const sg = sign(ts, rw, body);
@@ -1127,7 +1135,7 @@ async function checkTrailingReentries() {
                 await sendTelegram(
                   `🚀 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} a mercado (fallback)\n` +
                   `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel)}\n` +
-                  `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}`
+                  `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}${takeProfit ? ` | TP herdado: $${takeProfit}` : ""}`
                 );
               } catch (e) {
                 console.log(`  ❌ Fallback breakout ${sym} falhou: ${e.message}`);
@@ -1257,7 +1265,9 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
 // qtyOverride: mirror the closed position's contract quantity (e.g. after a TP half-close)
 // instead of sizing a fresh CONFIG.tradeSize × lev position.
 // attachSL: false mirrors an original position that had no SL — the re-entry gets none either.
-async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverride = null, attachSL = true) {
+// tpPrice: TP level inherited from the original position (attached only if still valid
+// relative to the limit price — e.g. above it for a buy).
+async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverride = null, attachSL = true, tpPrice = null) {
   const side = action === "buy" ? "Buy" : "Sell";
   const { minQty, qtyStep, maxLeverage, tickSize } = await getInstrumentInfo(symbol);
   if (maxLeverage > 0 && lev > maxLeverage) lev = maxLeverage;
@@ -1273,6 +1283,10 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverri
     slPrice = roundToTick(action === "buy" ? priceNum - slDist : priceNum + slDist, tickSize);
   }
 
+  // TP: inherit the original position's target if it's on the correct side of the entry
+  const tpValid = tpPrice > 0 && (action === "buy" ? tpPrice > priceNum : tpPrice < priceNum);
+  const tpStr   = tpValid ? roundToTick(tpPrice, tickSize) : null;
+
   let qty;
   if (qtyOverride > 0) {
     const decimals = (qtyStep.toString().split(".")[1] || "").length;
@@ -1284,6 +1298,7 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverri
     category: "linear", symbol, side, orderType: "Limit",
     price: priceStr, qty, timeInForce: "GTC", positionIdx: 0,
     ...(slPrice ? { stopLoss: slPrice, slTriggerBy: "LastPrice" } : {}),
+    ...(tpStr   ? { takeProfit: tpStr, tpTriggerBy: "LastPrice" } : {}),
   });
   const ts  = (Date.now() - 1500).toString();
   const rw  = "10000";
@@ -1295,8 +1310,8 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverri
   });
   const data = await res.json();
   if (data.retCode !== 0) throw new Error(`Limit re-entry failed: ${data.retMsg}`);
-  console.log(`  📌 Ordem limite de re-entrada @ $${priceStr} | qty=${qty} | SL=${slPrice ?? "—"} | ${data.result?.orderId}`);
-  return { orderId: data.result?.orderId, slPrice, priceStr, qty };
+  console.log(`  📌 Ordem limite de re-entrada @ $${priceStr} | qty=${qty} | SL=${slPrice ?? "—"} | TP=${tpStr ?? "—"} | ${data.result?.orderId}`);
+  return { orderId: data.result?.orderId, slPrice, tpPrice: tpStr, priceStr, qty };
 }
 
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
@@ -1499,6 +1514,7 @@ async function getOpenPosition(symbol) {
     unrealizedPnl:  parseFloat(position.unrealisedPnl || "0"),  // Bybit field name: unrealisedPnl
     leverage:       parseFloat(position.leverage      || "0"),  // so a re-entry can mirror the original leverage
     trailingStop:   parseFloat(position.trailingStop  || "0"),  // so a re-entry can mirror SL/trailing presence
+    takeProfit:     parseFloat(position.takeProfit    || "0"),  // so a re-entry can inherit the TP level
   } : null;
 }
 
