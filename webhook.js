@@ -147,8 +147,13 @@ const CONFIG = {
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
   // Auto-commit: automatically bank a position (same flow as /commit2 — close + pullback
-  // limit re-entry) once its unrealized gain reaches this many USD. Checked every 1 min.
-  // 0 = disabled (manual /commit2 only).
+  // limit re-entry) once its unrealized gain reaches the threshold. Checked every 1 min.
+  // AUTO_COMMIT_GAIN_PCT: threshold as % of the position's own margin (ROI — e.g. 100 =
+  //   gain equals the margin). Scales with position size and leverage, so manual positions
+  //   and different leverages are treated proportionally. Takes precedence when > 0.
+  // AUTO_COMMIT_GAIN_USD: fixed-USD alternative, used when PCT is 0.
+  // Both 0 = disabled (manual /commit2 only).
+  autoCommitGainPct:      parseFloat(process.env.AUTO_COMMIT_GAIN_PCT || "0"),
   autoCommitGainUSD:      parseFloat(process.env.AUTO_COMMIT_GAIN_USD || "0"),
 };
 
@@ -334,6 +339,7 @@ async function getAllOpenPositions() {
           avgPrice:      parseFloat(p.avgPrice      || "0"),
           markPrice:     parseFloat(p.markPrice     || "0"),  // current price
           unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
+          leverage:      parseFloat(p.leverage      || "0"),  // for margin/ROI calc
           stopLoss:      p.stopLoss || "",
         });
       }
@@ -657,16 +663,29 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
   }
 }
 
-// Background auto-commit — runs every 1 min when AUTO_COMMIT_GAIN_USD > 0.
+// Background auto-commit — runs every 1 min when a threshold is configured.
 // Banks any position whose unrealized gain reached the threshold, using the exact same
 // flow as the manual /commit2 (close + pullback limit re-entry, volatility-filtered).
+// Threshold: % of the position's own margin (AUTO_COMMIT_GAIN_PCT, ROI-based — scales
+// with size/leverage) or fixed USD (AUTO_COMMIT_GAIN_USD) when PCT is 0.
 async function checkAutoCommit() {
-  if (!(CONFIG.autoCommitGainUSD > 0) || CONFIG.paperTrading) return;
+  const usePct = CONFIG.autoCommitGainPct > 0;
+  if (!(usePct || CONFIG.autoCommitGainUSD > 0) || CONFIG.paperTrading) return;
   try {
     const positions = await getAllOpenPositions();
     for (const p of positions) {
-      if (p.unrealizedPnl >= CONFIG.autoCommitGainUSD) {
-        console.log(`\n💰 [Auto-commit] ${p.symbol}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ $${CONFIG.autoCommitGainUSD} — a encaixar`);
+      let threshold, label;
+      if (usePct) {
+        const margin = p.leverage > 0 ? (p.size * p.avgPrice) / p.leverage : 0;
+        if (!(margin > 0)) continue; // leverage unknown — can't compute ROI, skip
+        threshold = margin * (CONFIG.autoCommitGainPct / 100);
+        label     = `${CONFIG.autoCommitGainPct}% da margem $${margin.toFixed(2)} → $${threshold.toFixed(2)}`;
+      } else {
+        threshold = CONFIG.autoCommitGainUSD;
+        label     = `$${threshold}`;
+      }
+      if (p.unrealizedPnl >= threshold) {
+        console.log(`\n💰 [Auto-commit] ${p.symbol}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ ${label} — a encaixar`);
         await commitSymbol(p.symbol, null, "auto-commit");
       }
     }
@@ -2258,7 +2277,7 @@ app.listen(PORT, () => {
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
   console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
-  console.log(`  Auto-commit: ${CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_USD para ativar)"}`);
+  console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem (verifica 1min)` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -2275,9 +2294,9 @@ app.listen(PORT, () => {
   console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit2: on`);
 
   // Start background auto-commit checker (every 1 min)
-  if (CONFIG.autoCommitGainUSD > 0) {
+  if (CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0) {
     setInterval(checkAutoCommit, 60 * 1000);
-    console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}`);
+    console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}`);
   }
 
   // Start Telegram command polling
