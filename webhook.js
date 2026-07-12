@@ -155,6 +155,9 @@ const CONFIG = {
   // Both 0 = disabled (manual /commit2 only).
   autoCommitGainPct:      parseFloat(process.env.AUTO_COMMIT_GAIN_PCT || "0"),
   autoCommitGainUSD:      parseFloat(process.env.AUTO_COMMIT_GAIN_USD || "0"),
+  // Bybit API keys without an IP whitelist expire every 3 months. Checked daily; a
+  // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
+  apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
 };
 
 const LOG_FILE = path.join(DATA_DIR, "webhook-trades.csv");
@@ -1697,6 +1700,48 @@ async function getLastClosedPnl(symbol) {
   return data.result?.list?.[0] || null;
 }
 
+// Daily API-key expiry check — Bybit keys without an IP whitelist expire every 3 months
+// and the bot dies silently when they do. Queries /v5/user/query-api for the key's own
+// expiry and warns on Telegram each day once ≤ API_KEY_EXPIRY_WARN_DAYS days remain.
+async function checkApiKeyExpiry() {
+  if (!(CONFIG.apiKeyExpiryWarnDays > 0)) return;
+  try {
+    const timestamp  = (Date.now() - 1500).toString();
+    const recvWindow = "10000";
+    const params     = "";
+    const sig        = sign(timestamp, recvWindow, params);
+    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/user/query-api`, {
+      headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+    });
+    const data = await res.json();
+    if (data.retCode !== 0) throw new Error(data.retMsg);
+    const r = data.result || {};
+
+    // deadlineDay = remaining days (only present for keys without IP whitelist);
+    // fall back to computing from expiredAt. Null → key never expires (IP-bound).
+    let daysLeft = null;
+    if (r.deadlineDay != null && parseInt(r.deadlineDay) > 0) {
+      daysLeft = parseInt(r.deadlineDay);
+    } else if (r.expiredAt) {
+      const exp = new Date(r.expiredAt).getTime();
+      if (exp > 0) daysLeft = Math.floor((exp - Date.now()) / 86_400_000);
+    }
+    if (daysLeft == null) return;
+
+    console.log(`🔑 API key Bybit expira em ${daysLeft} dia(s)`);
+    if (daysLeft <= CONFIG.apiKeyExpiryWarnDays) {
+      await sendTelegram(
+        `🔑⚠️ <b>Bot v2</b> — a API key da Bybit expira em <b>${daysLeft} dia(s)</b>!\n` +
+        `1. Bybit → API Management → renovar/criar chave\n` +
+        `2. Railway → atualizar BYBIT_API_KEY e BYBIT_SECRET_KEY\n` +
+        `Sem renovação o bot deixa de conseguir abrir/fechar posições.`
+      );
+    }
+  } catch (e) {
+    console.log(`  ⚠️  Verificação de expiração da API key falhou: ${e.message}`);
+  }
+}
+
 // Format a price/distance value with enough decimal places to avoid rounding to zero.
 // For low-price assets (e.g. HANAUSDT @ $0.0335), toFixed(2) would produce "0.00".
 function formatPrice(value) {
@@ -2405,6 +2450,13 @@ app.listen(PORT, () => {
   if (CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0) {
     setInterval(checkAutoCommit, 60 * 1000);
     console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}`);
+  }
+
+  // API-key expiry check: once shortly after boot, then every 24h
+  if (CONFIG.apiKeyExpiryWarnDays > 0) {
+    setTimeout(checkApiKeyExpiry, 30 * 1000);
+    setInterval(checkApiKeyExpiry, 24 * 3600 * 1000);
+    console.log(`🔑 Aviso de expiração da API key ativo — alerta quando faltarem ≤ ${CONFIG.apiKeyExpiryWarnDays} dias`);
   }
 
   // Start Telegram command polling
