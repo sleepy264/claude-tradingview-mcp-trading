@@ -467,18 +467,43 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
-  // /close2          → list one button per open position (any PnL)
-  // /close2 SYMBOL   → close that position, NO re-entry (also cancels any pending
-  //                    re-entry watch/limit order for the symbol)
+  // /close2                    → list one button per open position (any PnL)
+  // /close2 SYMBOL             → ask for confirmation (guards against accidental taps)
+  // /close2 SYMBOL confirmar   → actually close, NO re-entry (also cancels any pending
+  //                              re-entry watch/limit order for the symbol)
   if (cmd === "/close2") {
     if (CONFIG.paperTrading) {
       await sendTelegram(`📋 <b>Bot v2</b> — /close2 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
-    const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+    const parts  = (text || "").trim().split(/\s+/);
+    const argSym = (parts[1] || "").toUpperCase();
 
     if (argSym) {
-      await closeSymbol(argSym, chatId);
+      // Second step: only close when explicitly confirmed
+      if ((parts[2] || "").toLowerCase() === "confirmar") {
+        await closeSymbol(argSym, chatId);
+        return;
+      }
+      // First step: show the position and ask for confirmation. The "Cancelar" button
+      // sends plain text (no leading /), which the command poller simply ignores.
+      try {
+        const pos = await getOpenPosition(argSym);
+        if (!pos) {
+          await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para fechar`, chatId);
+          return;
+        }
+        await sendTelegramKeyboard(
+          `⚠️ <b>Confirmas fechar ${argSym}?</b>\n` +
+          `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
+          `PnL atual: ${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}\n` +
+          `Fecha a mercado, SEM re-entrada (cancela re-entradas pendentes).`,
+          [[`/close2 ${argSym} confirmar`], ["❌ Cancelar"]],
+          chatId
+        );
+      } catch (e) {
+        await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — erro ao obter posição\n${e.message}`, chatId);
+      }
       return;
     }
 
