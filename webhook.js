@@ -407,6 +407,72 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
+  // /stats7 — total PnL of the last 7 days + per-day bar chart
+  if (cmd === "/stats7") {
+    try {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      start.setDate(start.getDate() - 6); // today + previous 6 days
+      const startTime = start.getTime();
+
+      // Fetch all closed-pnl records since startTime (paginated via cursor)
+      const records = [];
+      let cursor = "";
+      for (let page = 0; page < 10; page++) {
+        const timestamp  = (Date.now() - 1500).toString();
+        const recvWindow = "10000";
+        const params     = `category=linear&startTime=${startTime}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+        const sig        = sign(timestamp, recvWindow, params);
+        const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
+          headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+        });
+        const data = await res.json();
+        const list = data.result?.list || [];
+        records.push(...list);
+        cursor = data.result?.nextPageCursor || "";
+        if (!cursor || list.length === 0) break;
+      }
+
+      // Bucket by day (server-local midnight, same convention as /pnl2)
+      const days = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(startTime + i * 86_400_000);
+        days.push({
+          label: `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`,
+          pnl: 0, trades: 0,
+        });
+      }
+      let total = 0;
+      for (const r of records) {
+        const idx = Math.floor((parseInt(r.updatedTime) - startTime) / 86_400_000);
+        if (idx < 0 || idx > 6) continue;
+        const pnl = parseFloat(r.closedPnl || 0);
+        days[idx].pnl    += pnl;
+        days[idx].trades += 1;
+        total += pnl;
+      }
+
+      // Bar chart: blocks scaled to the biggest day (🟩 gain / 🟥 loss / · flat)
+      const maxAbs = Math.max(...days.map(d => Math.abs(d.pnl)), 0.01);
+      const lines = days.map(d => {
+        const blocks = d.pnl === 0 ? 0 : Math.max(1, Math.round((Math.abs(d.pnl) / maxAbs) * 6));
+        const bar    = d.trades === 0 && d.pnl === 0 ? "—" : (d.pnl >= 0 ? "🟩" : "🟥").repeat(blocks) || "·";
+        return `${d.label} ${bar} ${d.pnl >= 0 ? "+" : ""}$${d.pnl.toFixed(2)}${d.trades > 0 ? ` (${d.trades})` : ""}`;
+      });
+
+      const emoji = total >= 0 ? "🟢" : "🔴";
+      await sendTelegram(
+        `${emoji} <b>PnL últimos 7 dias — Bot v2</b>\n` +
+        `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>\n\n` +
+        lines.join("\n"),
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao obter stats: ${e.message}`, chatId);
+    }
+    return;
+  }
+
   if (cmd === "/pos2") {
     try {
       const positions = await getAllOpenPositions(); // USDT + USDC settled
@@ -780,6 +846,7 @@ async function startTelegramPolling() {
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({ commands: [
       { command: "pnl2", description: "📊 PnL do dia" },
+      { command: "stats7", description: "📈 PnL últimos 7 dias (gráfico)" },
       { command: "pos2", description: "📈 Posições abertas" },
       { command: "commit2", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit2 SYMBOL)" },
       { command: "close2", description: "✂️ Fechar posição sem re-entrada (ou /close2 SYMBOL)" },
