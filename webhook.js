@@ -490,7 +490,11 @@ async function handleTelegramCommand(text, chatId) {
         return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
       });
 
-      await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}`, chatId);
+      const totalPnl   = positions.reduce((s, p) => s + p.unrealizedPnl, 0);
+      const totalEmoji = totalPnl >= 0 ? "🟢" : "🔴";
+      const totalLine  = `${totalEmoji} <b>Total (${positions.length} posições): ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>`;
+
+      await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}\n\n${totalLine}`, chatId);
     } catch (e) {
       await sendTelegram(`❌ Erro ao obter posições: ${e.message}`, chatId);
     }
