@@ -383,46 +383,55 @@ async function fetchClosedPnlRange(startTime, endTime) {
   return records;
 }
 
-// Renders the N-day PnL summary + per-day bar chart (used by /stats7 and /stats30)
-async function sendPnlStats(nDays, chatId) {
+// Renders the N-day PnL summary + bar chart, bucketed by `groupDays` days per row
+// (1 = daily rows for /stats7; 7 = weekly rows for /stats30)
+async function sendPnlStats(nDays, chatId, groupDays = 1) {
   try {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
     start.setDate(start.getDate() - (nDays - 1)); // today + previous nDays-1 days
     const startTime = start.getTime();
+    const now       = Date.now();
 
-    const records = await fetchClosedPnlRange(startTime, Date.now());
+    const records = await fetchClosedPnlRange(startTime, now);
 
-    // Bucket by day (server-local midnight, same convention as /pnl2)
-    const days = [];
-    for (let i = 0; i < nDays; i++) {
-      const d = new Date(startTime + i * 86_400_000);
-      days.push({
-        label: `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`,
+    // Buckets of groupDays days (server-local midnight, same convention as /pnl2)
+    const fmt = (ms) => {
+      const d = new Date(ms);
+      return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+    };
+    const bucketMs = groupDays * 86_400_000;
+    const nBuckets = Math.ceil(nDays / groupDays);
+    const buckets  = [];
+    for (let i = 0; i < nBuckets; i++) {
+      const from = startTime + i * bucketMs;
+      const to   = Math.min(from + bucketMs - 86_400_000, now); // last day of the bucket
+      buckets.push({
+        label: groupDays === 1 ? fmt(from) : `${fmt(from)}–${fmt(to)}`,
         pnl: 0, trades: 0,
       });
     }
     let total = 0;
     for (const r of records) {
-      const idx = Math.floor((parseInt(r.updatedTime) - startTime) / 86_400_000);
-      if (idx < 0 || idx >= nDays) continue;
+      const idx = Math.floor((parseInt(r.updatedTime) - startTime) / bucketMs);
+      if (idx < 0 || idx >= nBuckets) continue;
       const pnl = parseFloat(r.closedPnl || 0);
-      days[idx].pnl    += pnl;
-      days[idx].trades += 1;
+      buckets[idx].pnl    += pnl;
+      buckets[idx].trades += 1;
       total += pnl;
     }
 
-    // Bar chart: blocks scaled to the biggest day (🟩 gain / 🟥 loss / — no trades)
-    const maxAbs = Math.max(...days.map(d => Math.abs(d.pnl)), 0.01);
-    const lines = days.map(d => {
-      const blocks = d.pnl === 0 ? 0 : Math.max(1, Math.round((Math.abs(d.pnl) / maxAbs) * 6));
-      const bar    = d.trades === 0 && d.pnl === 0 ? "—" : (d.pnl >= 0 ? "🟩" : "🟥").repeat(blocks) || "·";
-      return `${d.label} ${bar} ${d.pnl >= 0 ? "+" : ""}$${d.pnl.toFixed(2)}${d.trades > 0 ? ` (${d.trades})` : ""}`;
+    // Bar chart: blocks scaled to the biggest bucket (🟩 gain / 🟥 loss / — no trades)
+    const maxAbs = Math.max(...buckets.map(b => Math.abs(b.pnl)), 0.01);
+    const lines = buckets.map(b => {
+      const blocks = b.pnl === 0 ? 0 : Math.max(1, Math.round((Math.abs(b.pnl) / maxAbs) * 6));
+      const bar    = b.trades === 0 && b.pnl === 0 ? "—" : (b.pnl >= 0 ? "🟩" : "🟥").repeat(blocks) || "·";
+      return `${b.label} ${bar} ${b.pnl >= 0 ? "+" : ""}$${b.pnl.toFixed(2)}${b.trades > 0 ? ` (${b.trades})` : ""}`;
     });
 
     const emoji = total >= 0 ? "🟢" : "🔴";
     await sendTelegram(
-      `${emoji} <b>PnL últimos ${nDays} dias — Bot v2</b>\n` +
+      `${emoji} <b>PnL últimos ${nDays} dias — Bot v2</b>${groupDays > 1 ? ` <i>(por semana)</i>` : ""}\n` +
       `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>\n\n` +
       lines.join("\n"),
       chatId
@@ -485,9 +494,9 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
-  // /stats7 e /stats30 — total PnL dos últimos N dias + gráfico de barras por dia
+  // /stats7 (por dia) e /stats30 (agregado por semana)
   if (cmd === "/stats7" || cmd === "/stats30") {
-    await sendPnlStats(cmd === "/stats30" ? 30 : 7, chatId);
+    await sendPnlStats(cmd === "/stats30" ? 30 : 7, chatId, cmd === "/stats30" ? 7 : 1);
     return;
   }
 
