@@ -16,10 +16,10 @@ const PORT = process.env.PORT || 3000;
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  bybit: {
-    apiKey:    process.env.BYBIT_API_KEY,
-    secretKey: process.env.BYBIT_SECRET_KEY,
-    baseUrl:   process.env.BYBIT_BASE_URL || "https://api.bybit.com",
+  bingx: {
+    apiKey:    process.env.BINGX_API_KEY,
+    secretKey: process.env.BINGX_SECRET_KEY,
+    baseUrl:   process.env.BINGX_BASE_URL || "https://open-api.bingx.com",
   },
   webhookSecret:    process.env.WEBHOOK_SECRET     || "",
   paperTrading:     process.env.PAPER_TRADING      !== "false",
@@ -67,7 +67,7 @@ const CONFIG = {
   // Max SL hits per symbol per day before blocking all new entries for that symbol (0 = disabled)
   maxSlPerSymbol:       parseInt(process.env.MAX_SL_PER_SYMBOL || "0"),
   // Minimum Risk:Reward ratio filter (0 = disabled).
-  // Since TP is fired by TradingView (not placed on Bybit), the TP reference is computed
+  // Since TP is fired by TradingView (not placed on BingX), the TP reference is computed
   // dynamically as SL × minRR (the minimum move TradingView's strategy should target).
   // The filter only blocks if MAX_TP_PCT is set and the implied TP target exceeds it
   // (i.e., the required move is unrealistically large for the current volatility).
@@ -129,11 +129,11 @@ const CONFIG = {
   trailingReentryEnabled: process.env.TRAILING_REENTRY_ENABLED === "true",
   reentryCooldownMs:      parseInt(process.env.REENTRY_COOLDOWN_MS || "3600000"),  // 1h
   reentryExpiryHours:     parseFloat(process.env.REENTRY_EXPIRY_HOURS || "6"),
-  // Manual /commit2 Telegram command: close a position (bank the gain) and arm a
+  // Manual /commit3 Telegram command: close a position (bank the gain) and arm a
   // PULLBACK re-entry — re-enter the same direction once price retraces this % from the
   // exit (buy the dip for a long / sell the rip for a short). Cancelled by an opposite
   // signal; expires after REENTRY_EXPIRY_HOURS (shared with the breakout re-entry).
-  // Pullback distance for the /commit2 re-entry. Dynamic: ATR × COMMIT_PULLBACK_ATR_MULT
+  // Pullback distance for the /commit3 re-entry. Dynamic: ATR × COMMIT_PULLBACK_ATR_MULT
   // (adapts to each pair's volatility — "half an average candle" of retrace by default).
   // Falls back to the fixed COMMIT_PULLBACK_PCT when ATR can't be fetched.
   commitPullbackAtrMult:  parseFloat(process.env.COMMIT_PULLBACK_ATR_MULT || "0.5"),
@@ -143,19 +143,19 @@ const CONFIG = {
   // cancel the limit and re-enter at market (mirroring qty/leverage) so the move isn't lost.
   // 0 = disabled (limit-only, may expire unfilled).
   commitBreakoutAtrMult:  parseFloat(process.env.COMMIT_BREAKOUT_ATR_MULT || "0.5"),
-  // /commit2 with no argument lists one button per open symbol whose unrealized gain
+  // /commit3 with no argument lists one button per open symbol whose unrealized gain
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
-  // Auto-commit: automatically bank a position (same flow as /commit2 — close + pullback
+  // Auto-commit: automatically bank a position (same flow as /commit3 — close + pullback
   // limit re-entry) once its unrealized gain reaches the threshold. Checked every 1 min.
   // AUTO_COMMIT_GAIN_PCT: threshold as % of the position's own margin (ROI — e.g. 100 =
   //   gain equals the margin). Scales with position size and leverage, so manual positions
   //   and different leverages are treated proportionally. Takes precedence when > 0.
   // AUTO_COMMIT_GAIN_USD: fixed-USD alternative, used when PCT is 0.
-  // Both 0 = disabled (manual /commit2 only).
+  // Both 0 = disabled (manual /commit3 only).
   autoCommitGainPct:      parseFloat(process.env.AUTO_COMMIT_GAIN_PCT || "0"),
   autoCommitGainUSD:      parseFloat(process.env.AUTO_COMMIT_GAIN_USD || "0"),
-  // Bybit API keys without an IP whitelist expire every 3 months. Checked daily; a
+  // BingX API keys without an IP whitelist expire every 3 months. Checked daily; a
   // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
   apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
 };
@@ -303,7 +303,7 @@ async function sendTelegram(message, chatId = null) {
 
 // Send a message with a one-time reply keyboard. `rows` is an array of rows, each a
 // list of button labels (strings). Tapping a button sends its label as a normal message,
-// so labels like "/commit2 BTCUSDT" route straight through handleTelegramCommand.
+// so labels like "/commit3 BTCUSDT" route straight through handleTelegramCommand.
 async function sendTelegramKeyboard(message, rows, chatId = null) {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const target = chatId || process.env.TELEGRAM_CHAT_ID;
@@ -319,33 +319,24 @@ async function sendTelegramKeyboard(message, rows, chatId = null) {
   }).catch((e) => console.log("Telegram error:", e.message));
 }
 
-// Returns all open linear positions with size > 0 (across all symbols).
-// Bybit's position/list requires a settleCoin filter, and USDT- vs USDC-settled perps
-// (e.g. SOLUSDT vs SOLUSDC) are returned separately — so we query both and merge.
+// Returns all open perpetual positions with size > 0 (across all symbols).
+// BingX returns everything in one call (no settleCoin split needed).
 async function getAllOpenPositions() {
+  const data = await bxRequest("GET", "/openApi/swap/v2/user/positions", {});
   const out = [];
-  for (const settleCoin of ["USDT", "USDC"]) {
-    const timestamp  = (Date.now() - 1500).toString();
-    const recvWindow = "10000";
-    const params     = `category=linear&settleCoin=${settleCoin}`;
-    const sig        = sign(timestamp, recvWindow, params);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
-      headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    });
-    const data = await res.json();
-    for (const p of (data.result?.list || [])) {
-      if (parseFloat(p.size) > 0) {
-        out.push({
-          symbol:        p.symbol,
-          side:          p.side,
-          size:          parseFloat(p.size),
-          avgPrice:      parseFloat(p.avgPrice      || "0"),
-          markPrice:     parseFloat(p.markPrice     || "0"),  // current price
-          unrealizedPnl: parseFloat(p.unrealisedPnl || "0"),
-          leverage:      parseFloat(p.leverage      || "0"),  // for margin/ROI calc
-          stopLoss:      p.stopLoss || "",
-        });
-      }
+  for (const p of (Array.isArray(data) ? data : [])) {
+    const size = Math.abs(parseFloat(p.positionAmt || "0"));
+    if (size > 0) {
+      out.push({
+        symbol:        fromBingxSymbol(p.symbol),
+        side:          p.positionSide === "SHORT" || parseFloat(p.positionAmt) < 0 ? "Sell" : "Buy",
+        size,
+        avgPrice:      parseFloat(p.avgPrice || "0"),
+        markPrice:     parseFloat(p.markPrice || "0"),  // current price
+        unrealizedPnl: parseFloat(p.unrealizedProfit || p.unrealisedProfit || "0"),
+        leverage:      parseFloat(p.leverage || "0"),   // for margin/ROI calc
+        stopLoss:      "",                              // SL vive em ordens separadas na BingX (ver getOpenPosition)
+      });
     }
   }
   return out;
@@ -354,30 +345,21 @@ async function getAllOpenPositions() {
 // ─── Telegram Command Polling ─────────────────────────────────────────────────
 // Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
 // Supported commands:
-//   /pnl2  — daily closed PnL (total + per symbol)
-//   /pos2  — open positions summary
+//   /pnl3  — daily closed PnL (total + per symbol)
+//   /pos3  — open positions summary
 
-// Fetch all closed-pnl records in [startTime, endTime], chunked into ≤6-day windows
-// (Bybit limits closed-pnl queries to ~7-day ranges) with cursor pagination per chunk.
+// Fetch all realized-PnL records in [startTime, endTime], chunked into ≤6-day windows
+// (income queries are range-limited) — records shaped like BingX's closed-pnl entries
+// ({ symbol, closedPnl, updatedTime }) so the stats renderer stays unchanged.
 async function fetchClosedPnlRange(startTime, endTime) {
   const records = [];
   const CHUNK = 6 * 86_400_000;
   for (let from = startTime; from < endTime; from += CHUNK) {
     const to = Math.min(from + CHUNK, endTime);
-    let cursor = "";
-    for (let page = 0; page < 10; page++) {
-      const timestamp  = (Date.now() - 1500).toString();
-      const recvWindow = "10000";
-      const params     = `category=linear&startTime=${from}&endTime=${to}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
-      const sig        = sign(timestamp, recvWindow, params);
-      const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
-        headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      });
-      const data = await res.json();
-      const list = data.result?.list || [];
-      records.push(...list);
-      cursor = data.result?.nextPageCursor || "";
-      if (!cursor || list.length === 0) break;
+    try {
+      records.push(...await fetchIncomeRange(from, to));
+    } catch (e) {
+      console.log(`  ⚠️  fetchClosedPnlRange chunk falhou: ${e.message}`);
     }
   }
   return records;
@@ -395,7 +377,7 @@ async function sendPnlStats(nDays, chatId, groupDays = 1) {
 
     const records = await fetchClosedPnlRange(startTime, now);
 
-    // Buckets of groupDays days (server-local midnight, same convention as /pnl2)
+    // Buckets of groupDays days (server-local midnight, same convention as /pnl3)
     const fmt = (ms) => {
       const d = new Date(ms);
       return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -431,7 +413,7 @@ async function sendPnlStats(nDays, chatId, groupDays = 1) {
 
     const emoji = total >= 0 ? "🟢" : "🔴";
     await sendTelegram(
-      `${emoji} <b>PnL últimos ${nDays} dias — Bot v2</b>${groupDays > 1 ? ` <i>(por semana)</i>` : ""}\n` +
+      `${emoji} <b>PnL últimos ${nDays} dias — Bot v3</b>${groupDays > 1 ? ` <i>(por semana)</i>` : ""}\n` +
       `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>\n\n` +
       lines.join("\n"),
       chatId
@@ -444,26 +426,12 @@ async function sendPnlStats(nDays, chatId, groupDays = 1) {
 async function handleTelegramCommand(text, chatId) {
   const cmd = (text || "").trim().split(/\s+/)[0].toLowerCase().replace(/@\S+/, "");
 
-  if (cmd === "/pnl2") {
+  if (cmd === "/pnl3") {
     try {
       // Fetch all closed trades today (no symbol filter) and group by symbol
       const todayMidnight = new Date();
       todayMidnight.setHours(0, 0, 0, 0);
-      const startTime  = todayMidnight.getTime().toString();
-      const timestamp  = (Date.now() - 1500).toString();
-      const recvWindow = "10000";
-      const params     = `category=linear&startTime=${startTime}&limit=200`;
-      const sig        = sign(timestamp, recvWindow, params);
-      const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
-        headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      });
-      const rawText = await res.text();
-      let data;
-      try { data = JSON.parse(rawText); }
-      catch (e) {
-        throw new Error(`Bybit devolveu resposta inválida (HTTP ${res.status}): ${rawText.substring(0, 300)}`);
-      }
-      const list = data.result?.list || [];
+      const list = await fetchIncomeRange(todayMidnight.getTime(), Date.now());
 
       // Group by symbol
       const bySymbol = {};
@@ -482,7 +450,7 @@ async function handleTelegramCommand(text, chatId) {
 
       const emoji = total >= 0 ? "🟢" : "🔴";
       const msg = [
-        `${emoji} <b>PnL do dia — Bot v2</b> (${todayStr})`,
+        `${emoji} <b>PnL do dia — Bot v3</b> (${todayStr})`,
         `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>`,
         lines.length > 0 ? "\nPor símbolo:\n" + lines.join("\n") : "\nNenhuma trade fechada hoje.",
       ].join("\n");
@@ -500,12 +468,12 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
-  if (cmd === "/pos2") {
+  if (cmd === "/pos3") {
     try {
       const positions = await getAllOpenPositions(); // USDT + USDC settled
 
       if (positions.length === 0) {
-        await sendTelegram(`📭 <b>Bot v2</b> — Sem posições abertas`, chatId);
+        await sendTelegram(`📭 <b>Bot v3</b> — Sem posições abertas`, chatId);
         return;
       }
 
@@ -518,18 +486,18 @@ async function handleTelegramCommand(text, chatId) {
       const totalEmoji = totalPnl >= 0 ? "🟢" : "🔴";
       const totalLine  = `${totalEmoji} <b>Total (${positions.length} posições): ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>`;
 
-      await sendTelegram(`📊 <b>Posições abertas — Bot v2</b>\n\n${lines.join("\n\n")}\n\n${totalLine}`, chatId);
+      await sendTelegram(`📊 <b>Posições abertas — Bot v3</b>\n\n${lines.join("\n\n")}\n\n${totalLine}`, chatId);
     } catch (e) {
       await sendTelegram(`❌ Erro ao obter posições: ${e.message}`, chatId);
     }
     return;
   }
 
-  // /commit2          → list one button per symbol with unrealized gain > COMMIT_MIN_GAIN_USD
-  // /commit2 SYMBOL   → close that position (bank the gain) + arm a pullback re-entry
-  if (cmd === "/commit2") {
+  // /commit3          → list one button per symbol with unrealized gain > COMMIT_MIN_GAIN_USD
+  // /commit3 SYMBOL   → close that position (bank the gain) + arm a pullback re-entry
+  if (cmd === "/commit3") {
     if (CONFIG.paperTrading) {
-      await sendTelegram(`📋 <b>Bot v2</b> — /commit2 só funciona em modo LIVE (atual: paper)`, chatId);
+      await sendTelegram(`📋 <b>Bot v3</b> — /commit3 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
     const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
@@ -547,12 +515,12 @@ async function handleTelegramCommand(text, chatId) {
         .sort((a, b) => b.unrealizedPnl - a.unrealizedPnl);
 
       if (winners.length === 0) {
-        await sendTelegram(`📭 <b>Bot v2</b> — nenhum símbolo com ganho > $${CONFIG.commitMinGainUSD}`, chatId);
+        await sendTelegram(`📭 <b>Bot v3</b> — nenhum símbolo com ganho > $${CONFIG.commitMinGainUSD}`, chatId);
         return;
       }
 
       const listText = winners.map(p => `• <b>${p.symbol}</b> ${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
-      const rows     = winners.map(p => [`/commit2 ${p.symbol}`]);
+      const rows     = winners.map(p => [`/commit3 ${p.symbol}`]);
       await sendTelegramKeyboard(
         `💰 <b>Encaixar ganho</b> — símbolos com PnL > $${CONFIG.commitMinGainUSD}:\n${listText}\n\nToca para encaixar 👇`,
         rows,
@@ -564,13 +532,13 @@ async function handleTelegramCommand(text, chatId) {
     return;
   }
 
-  // /close2                    → list one button per open position (any PnL)
-  // /close2 SYMBOL             → ask for confirmation (guards against accidental taps)
-  // /close2 SYMBOL confirmar   → actually close, NO re-entry (also cancels any pending
+  // /close3                    → list one button per open position (any PnL)
+  // /close3 SYMBOL             → ask for confirmation (guards against accidental taps)
+  // /close3 SYMBOL confirmar   → actually close, NO re-entry (also cancels any pending
   //                              re-entry watch/limit order for the symbol)
-  if (cmd === "/close2") {
+  if (cmd === "/close3") {
     if (CONFIG.paperTrading) {
-      await sendTelegram(`📋 <b>Bot v2</b> — /close2 só funciona em modo LIVE (atual: paper)`, chatId);
+      await sendTelegram(`📋 <b>Bot v3</b> — /close3 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
     const parts  = (text || "").trim().split(/\s+/);
@@ -587,7 +555,7 @@ async function handleTelegramCommand(text, chatId) {
       try {
         const pos = await getOpenPosition(argSym);
         if (!pos) {
-          await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para fechar`, chatId);
+          await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
           return;
         }
         await sendTelegramKeyboard(
@@ -595,11 +563,11 @@ async function handleTelegramCommand(text, chatId) {
           `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
           `PnL atual: ${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}\n` +
           `Fecha a mercado, SEM re-entrada (cancela re-entradas pendentes).`,
-          [[`/close2 ${argSym} confirmar`], ["❌ Cancelar"]],
+          [[`/close3 ${argSym} confirmar`], ["❌ Cancelar"]],
           chatId
         );
       } catch (e) {
-        await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — erro ao obter posição\n${e.message}`, chatId);
+        await sendTelegram(`❌ <b>Bot v3 ${argSym}</b> — erro ao obter posição\n${e.message}`, chatId);
       }
       return;
     }
@@ -608,11 +576,11 @@ async function handleTelegramCommand(text, chatId) {
     try {
       const positions = (await getAllOpenPositions()).sort((a, b) => b.unrealizedPnl - a.unrealizedPnl);
       if (positions.length === 0) {
-        await sendTelegram(`📭 <b>Bot v2</b> — Sem posições abertas para fechar`, chatId);
+        await sendTelegram(`📭 <b>Bot v3</b> — Sem posições abertas para fechar`, chatId);
         return;
       }
       const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
-      const rows     = positions.map(p => [`/close2 ${p.symbol}`]);
+      const rows     = positions.map(p => [`/close3 ${p.symbol}`]);
       await sendTelegramKeyboard(
         `✂️ <b>Fechar posição</b> (sem re-entrada):\n${listText}\n\nToca para fechar 👇`,
         rows,
@@ -625,21 +593,21 @@ async function handleTelegramCommand(text, chatId) {
   }
 }
 
-// Close a symbol's position with NO re-entry — /close2. Also cancels any pending
-// re-entry (software watch or resting Bybit limit order) and clears positionOpenTime
+// Close a symbol's position with NO re-entry — /close3. Also cancels any pending
+// re-entry (software watch or resting BingX limit order) and clears positionOpenTime
 // so the breakout auto-detector doesn't re-arm a watch for this closure.
 async function closeSymbol(argSym, chatId) {
   try {
     const pos = await getOpenPosition(argSym);
     if (!pos) {
-      await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para fechar`, chatId);
+      await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
       return;
     }
     const pnl       = pos.unrealizedPnl;
     const exitPrice = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
 
     const result = await closePosition(argSym, pos);
-    console.log(`  ✂️ /close2 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
+    console.log(`  ✂️ /close3 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
 
     const s = _getSymState(argSym);
     s.positionOpenTime = null; // prevents the breakout auto-detector from arming a watch
@@ -654,26 +622,26 @@ async function closeSymbol(argSym, chatId) {
     }
     saveSymbolState();
 
-    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close2 — fechado sem re-entrada (PnL ~$${pnl.toFixed(2)})`);
+    logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close3 — fechado sem re-entrada (PnL ~$${pnl.toFixed(2)})`);
     await sendTelegram(
-      `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v2 ${argSym}</b> — Posição fechada (/close2)\n` +
+      `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Posição fechada (/close3)\n` +
       `${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `Sem re-entrada${cancelledReentry ? " | re-entrada pendente cancelada" : ""}`,
       chatId
     );
   } catch (e) {
-    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — /close2 falhou\n${e.message}`, chatId);
+    await sendTelegram(`❌ <b>Bot v3 ${argSym}</b> — /close3 falhou\n${e.message}`, chatId);
   }
 }
 
 // Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
 // re-entering once price retraces the pullback distance from the exit.
-// Used by /commit2 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
-async function commitSymbol(argSym, chatId, source = "/commit2") {
+// Used by /commit3 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
+async function commitSymbol(argSym, chatId, source = "/commit3") {
   try {
     const pos = await getOpenPosition(argSym);
     if (!pos) {
-      await sendTelegram(`⚠️ <b>Bot v2 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
+      await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
       return;
     }
     const sideAction = pos.side === "Buy" ? "buy" : "sell";
@@ -722,7 +690,7 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
         console.log(`  ⏸ ${argSym}: ${msg}`);
         logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada bloqueada (SL ${(impliedSlPct * 100).toFixed(2)}%)`);
         await sendTelegram(
-          `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v2 ${argSym}</b> — Ganho encaixado (${source})\n` +
+          `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Ganho encaixado (${source})\n` +
           `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
           `⏸ Sem re-entrada: ${msg}`,
           chatId
@@ -731,9 +699,9 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
       }
     }
 
-    // Place a real GTC limit order on Bybit at the dip/rip level. Unlike an in-memory
+    // Place a real GTC limit order on BingX at the dip/rip level. Unlike an in-memory
     // watch, this survives bot restarts/redeploys (it lives on the exchange).
-    // Re-enter with the SAME leverage the closed position used (read from Bybit), not the
+    // Re-enter with the SAME leverage the closed position used (read from BingX), not the
     // env default / dynamic leverage — otherwise a 100x trade re-opens at a lower leverage.
     const reLev = pos.leverage > 0 ? pos.leverage : CONFIG.leverage;
     await setLeverage(argSym, reLev);
@@ -774,9 +742,9 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, ordem limite re-entrada @ $${lim.priceStr}`);
     const emoji = pnl >= 0 ? "🟢" : "🔴";
     await sendTelegram(
-      `${emoji} <b>Bot v2 ${argSym}</b> — Ganho encaixado (${source})\n` +
+      `${emoji} <b>Bot v3 ${argSym}</b> — Ganho encaixado (${source})\n` +
       `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-      `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na Bybit @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
+      `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na BingX @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
       (lim.tpPrice ? `🎯 TP herdado: $${lim.tpPrice}\n` : "") +
       (!hadSL || !hadTrail ? `⚠️ Sem ${!hadSL && !hadTrail ? "SL nem trailing" : !hadSL ? "SL" : "trailing"} (a posição original não tinha)\n` : "") +
@@ -785,13 +753,13 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
       chatId
     );
   } catch (e) {
-    await sendTelegram(`❌ <b>Bot v2 ${argSym}</b> — ${source} falhou\n${e.message}`, chatId);
+    await sendTelegram(`❌ <b>Bot v3 ${argSym}</b> — ${source} falhou\n${e.message}`, chatId);
   }
 }
 
 // Background auto-commit — runs every 1 min when a threshold is configured.
 // Banks any position whose unrealized gain reached the threshold, using the exact same
-// flow as the manual /commit2 (close + pullback limit re-entry, volatility-filtered).
+// flow as the manual /commit3 (close + pullback limit re-entry, volatility-filtered).
 // Threshold: % of the position's own margin (AUTO_COMMIT_GAIN_PCT, ROI-based — scales
 // with size/leverage) or fixed USD (AUTO_COMMIT_GAIN_USD) when PCT is 0.
 async function checkAutoCommit() {
@@ -829,7 +797,7 @@ async function startTelegramPolling() {
   }
 
   let offset = 0;
-  console.log(`📡 Telegram polling ativo — comandos: /pnl2, /pos2 | chat_id=${chatId}`);
+  console.log(`📡 Telegram polling ativo — comandos: /pnl3, /pos3 | chat_id=${chatId}`);
 
   const poll = async () => {
     try {
@@ -876,66 +844,94 @@ async function startTelegramPolling() {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({ commands: [
-      { command: "pnl2", description: "📊 PnL do dia" },
+      { command: "pnl3", description: "📊 PnL do dia" },
       { command: "stats7", description: "📈 PnL últimos 7 dias (gráfico)" },
       { command: "stats30", description: "📈 PnL últimos 30 dias (gráfico)" },
-      { command: "pos2", description: "📈 Posições abertas" },
-      { command: "commit2", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit2 SYMBOL)" },
-      { command: "close2", description: "✂️ Fechar posição sem re-entrada (ou /close2 SYMBOL)" },
+      { command: "pos3", description: "📈 Posições abertas" },
+      { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
+      { command: "close3", description: "✂️ Fechar posição sem re-entrada (ou /close3 SYMBOL)" },
     ]}),
   }).catch(() => {});
 
   poll();
 }
 
-// ─── Bybit helpers ───────────────────────────────────────────────────────────
+// ─── BingX helpers ───────────────────────────────────────────────────────────
+// BingX Perpetual Futures API v2/v3 (open-api.bingx.com). Auth: HMAC-SHA256 over the
+// raw "k=v&k=v&timestamp=..." parameter string, sent as &signature=..., with the API
+// key in the X-BX-APIKEY header. Responses: { code: 0, msg, data }.
+// Symbols use a dash (BTC-USDT); TradingView/state keep the dashless form (BTCUSDT),
+// converted at the API boundary only.
 
-function sign(timestamp, recvWindow, body) {
-  const msg = `${timestamp}${CONFIG.bybit.apiKey}${recvWindow}${body}`;
-  return crypto.createHmac("sha256", CONFIG.bybit.secretKey).update(msg).digest("hex");
+function toBingxSymbol(sym) {
+  const s = String(sym || "").toUpperCase();
+  if (s.includes("-")) return s;
+  if (s.endsWith("USDT")) return s.slice(0, -4) + "-USDT";
+  if (s.endsWith("USDC")) return s.slice(0, -4) + "-USDC";
+  return s;
+}
+function fromBingxSymbol(sym) { return String(sym || "").replace("-", ""); }
+
+function bxSignature(paramStr) {
+  return crypto.createHmac("sha256", CONFIG.bingx.secretKey).update(paramStr).digest("hex");
 }
 
-async function setLeverage(symbol, lev) {
-  const attempt = async (leverage) => {
-    const timestamp  = (Date.now() - 1500).toString();
-    const recvWindow = "10000";
-    const body       = JSON.stringify({ category: "linear", symbol, buyLeverage: String(leverage), sellLeverage: String(leverage) });
-    const sig        = sign(timestamp, recvWindow, body);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/set-leverage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-      body,
-    });
-    return res.json();
-  };
+// Signed request. `params` values are signed raw and URL-encoded on the wire.
+async function bxRequest(method, path, params = {}) {
+  const p = { ...params, timestamp: Date.now() };
+  const rawQs = Object.entries(p).map(([k, v]) => `${k}=${v}`).join("&");
+  const encQs = Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+  const url = `${CONFIG.bingx.baseUrl}${path}?${encQs}&signature=${bxSignature(rawQs)}`;
+  const res  = await fetch(url, { method, headers: { "X-BX-APIKEY": CONFIG.bingx.apiKey } });
+  const data = await res.json();
+  if (data.code !== undefined && data.code !== 0) throw new Error(`BingX ${path}: ${data.msg || `code ${data.code}`}`);
+  return data.data;
+}
 
-  let data = await attempt(lev);
+// Public (unsigned) request.
+async function bxPublic(path, params = {}) {
+  const qs  = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+  const res = await fetch(`${CONFIG.bingx.baseUrl}${path}${qs ? `?${qs}` : ""}`);
+  const data = await res.json();
+  if (data.code !== undefined && data.code !== 0) throw new Error(`BingX ${path}: ${data.msg || `code ${data.code}`}`);
+  return data.data;
+}
 
-  // If leverage exceeds instrument maximum, auto-cap and retry once.
-  // Bybit error message format: "cannot set leverage [REQ] gt maxLeverage [MAX]..."
-  if (data.retCode !== 0 && data.retCode !== 110043) {
-    const match = data.retMsg?.match(/gt maxLeverage \[(\d+)\]/);
-    if (match) {
-      const maxLev = Math.floor(parseInt(match[1]) / 100); // Bybit returns in basis points (×100)
-      console.log(`  ⚠️  Leverage ${lev}x excede máximo ${maxLev}x para ${symbol} — a usar ${maxLev}x`);
-      data = await attempt(maxLev);
-    }
-    if (data.retCode !== 0 && data.retCode !== 110043) throw new Error(`Set leverage failed: ${data.retMsg}`);
+// One-way position mode (positionSide=BOTH on every order) — set once at startup.
+async function setOneWayMode() {
+  try {
+    await bxRequest("POST", "/openApi/swap/v1/positionSide/dual", { dualSidePosition: "false" });
+    console.log("✅ BingX em modo one-way (posição única por símbolo)");
+  } catch (e) {
+    console.log(`⚠️  Definir modo one-way falhou (pode já estar ativo): ${e.message}`);
   }
 }
 
+async function setLeverage(symbol, lev) {
+  // Clamp to the instrument maximum first (BingX rejects above-max without a parseable hint)
+  try {
+    const { maxLeverage } = await getInstrumentInfo(symbol);
+    if (maxLeverage > 0 && lev > maxLeverage) {
+      console.log(`  ⚠️  Leverage ${lev}x excede máximo ${maxLeverage}x para ${symbol} — a usar ${maxLeverage}x`);
+      lev = maxLeverage;
+    }
+  } catch {}
+  await bxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol: toBingxSymbol(symbol), side: "BOTH", leverage: lev });
+}
+
+// Contract specs. BingX exposes precisions, not tick/step sizes — converted here.
 async function getInstrumentInfo(symbol) {
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/instruments-info?category=linear&symbol=${symbol}`);
-  const data = await res.json();
-  const inst = data.result?.list?.[0];
-  const lot  = inst?.lotSizeFilter;
-  const lev  = inst?.leverageFilter;
-  const prc  = inst?.priceFilter;
+  const data = await bxPublic("/openApi/swap/v2/quote/contracts");
+  const bx   = toBingxSymbol(symbol);
+  const inst = (Array.isArray(data) ? data : []).find(c => c.symbol === bx);
+  if (!inst) return { minQty: 0.001, qtyStep: 0.001, maxLeverage: 0, tickSize: 0 };
+  const qtyPrec   = parseInt(inst.quantityPrecision ?? 3);
+  const pricePrec = parseInt(inst.pricePrecision    ?? 2);
   return {
-    minQty:      parseFloat(lot?.minOrderQty   || "0.001"),
-    qtyStep:     parseFloat(lot?.qtyStep       || "0.001"),
-    maxLeverage: parseFloat(lev?.maxLeverage   || "0"),
-    tickSize:    parseFloat(prc?.tickSize      || "0"),
+    minQty:      parseFloat(inst.tradeMinQuantity ?? Math.pow(10, -qtyPrec)),
+    qtyStep:     Math.pow(10, -qtyPrec),
+    maxLeverage: parseFloat(inst.maxLongLeverage ?? "0"),
+    tickSize:    Math.pow(10, -pricePrec),
   };
 }
 
@@ -945,73 +941,84 @@ async function getInstrumentLotSize(symbol) {
   return { minQty, qtyStep };
 }
 
-// Bybit supports these kline intervals (minutes, or D/W/M).
-// TradingView may send unsupported values (e.g. "2") — map to nearest supported.
-const BYBIT_INTERVALS = [1, 3, 5, 15, 30, 60, 120, 240, 360, 720];
+// BingX kline intervals are strings ("1m","1h","4h","1d"...). TradingView sends minutes
+// ("60") or D/W/M — map to the nearest supported BingX interval.
+const BINGX_INTERVAL_MAP = { 1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 120: "2h", 240: "4h", 360: "6h", 480: "8h", 720: "12h" };
+const BINGX_MINUTES      = Object.keys(BINGX_INTERVAL_MAP).map(Number);
 
-function toBybitInterval(tvInterval) {
+// Kept under the historical name — call sites resolve payload interval → exchange interval.
+function toBingXInterval(tvInterval) {
   const str = String(tvInterval || "").toUpperCase();
-  if (["D", "W", "M"].includes(str)) return str;
+  if (str === "D") return "1d";
+  if (str === "W") return "1w";
+  if (str === "M") return "1M";
+  if (BINGX_INTERVAL_MAP[str] !== undefined) return BINGX_INTERVAL_MAP[str]; // minutos
+  if (Object.values(BINGX_INTERVAL_MAP).includes(str.toLowerCase())) return str.toLowerCase(); // já no formato BingX
   const num = parseInt(str);
-  if (isNaN(num)) return CONFIG.candleInterval; // fallback to config default
-  if (BYBIT_INTERVALS.includes(num)) return String(num);
-  // Map to nearest supported numeric interval
-  const nearest = BYBIT_INTERVALS.reduce((a, b) =>
-    Math.abs(b - num) < Math.abs(a - num) ? b : a
-  );
-  console.log(`  ⚠️  Intervalo ${num}m não suportado pela Bybit — a usar ${nearest}m`);
-  return String(nearest);
+  if (isNaN(num)) return toBingXInterval(CONFIG.candleInterval); // fallback to config default
+  const nearest = BINGX_MINUTES.reduce((a, b) => Math.abs(b - num) < Math.abs(a - num) ? b : a);
+  console.log(`  ⚠️  Intervalo ${num}m não suportado pela BingX — a usar ${BINGX_INTERVAL_MAP[nearest]}`);
+  return BINGX_INTERVAL_MAP[nearest];
+}
+
+// Fetch klines and normalize to the newest-first array-shape the math functions expect:
+// [ [startTime, open, high, low, close, volume], ... ]
+async function fetchKlinesBX(symbol, interval, limit) {
+  const data = await bxPublic("/openApi/swap/v3/quote/klines", {
+    symbol: toBingxSymbol(symbol), interval: toBingXInterval(interval), limit,
+  });
+  const list = (Array.isArray(data) ? data : [])
+    .map(c => [parseInt(c.time), c.open, c.high, c.low, c.close, c.volume])
+    .sort((a, b) => b[0] - a[0]); // newest first
+  return list;
 }
 
 // Fetch current best bid and ask prices for a symbol.
 async function fetchBidAsk(symbol) {
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
-  const data = await res.json();
-  const t    = data.result?.list?.[0];
-  if (!t) throw new Error(`fetchBidAsk: sem dados de ticker para ${symbol}`);
-  return { bid: parseFloat(t.bid1Price), ask: parseFloat(t.ask1Price) };
+  const t = await bxPublic("/openApi/swap/v2/quote/bookTicker", { symbol: toBingxSymbol(symbol) });
+  const book = t?.book_ticker || t; // some responses nest under book_ticker
+  const bid = parseFloat(book?.bidPrice ?? book?.bid_price);
+  const ask = parseFloat(book?.askPrice ?? book?.ask_price);
+  if (!bid || !ask) throw new Error(`fetchBidAsk: sem dados de ticker para ${symbol}`);
+  return { bid, ask };
 }
 
 // Query the status of an open/recent order.
-// Returns orderStatus string (e.g. "New", "Filled", "PartiallyFilled", "Cancelled") or null on error.
+// Returns a BingX-style status string ("New", "Filled", "PartiallyFilled", "Cancelled")
+// so existing call sites keep working, or null on error.
 async function getOrderStatus(symbol, orderId) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = `category=linear&symbol=${symbol}&orderId=${orderId}`;
-  const sig        = sign(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/realtime?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-  });
-  const data = await res.json();
-  return data.result?.list?.[0]?.orderStatus ?? null;
+  try {
+    const data = await bxRequest("GET", "/openApi/swap/v2/trade/order", { symbol: toBingxSymbol(symbol), orderId });
+    const st = data?.order?.status || data?.status;
+    switch (st) {
+      case "NEW": case "PENDING": return "New";
+      case "FILLED": return "Filled";
+      case "PARTIALLY_FILLED": return "PartiallyFilled";
+      case "CANCELLED": case "CANCELED": return "Cancelled";
+      case "EXPIRED": return "Deactivated";
+      default: return st ?? null;
+    }
+  } catch {
+    return null;
+  }
 }
 
 // Cancel an open order by orderId.
 async function cancelOrder(symbol, orderId) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const body       = JSON.stringify({ category: "linear", symbol, orderId });
-  const sig        = sign(timestamp, recvWindow, body);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) console.log(`  ⚠️  Cancelamento de ordem falhou: ${data.retMsg}`);
-  return data;
+  try {
+    return await bxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol: toBingxSymbol(symbol), orderId });
+  } catch (e) {
+    console.log(`  ⚠️  Cancelamento de ordem falhou: ${e.message}`);
+    return null;
+  }
 }
 
-// Fetch candles from Bybit and compute simple ATR(period).
-// interval: Bybit-compatible interval string — derived from TradingView payload or CANDLE_INTERVAL.
+// Fetch candles from BingX and compute simple ATR(period).
+// interval: TV/config interval — converted internally.
 // If TradingView already sends "atr" in the payload, this function is skipped entirely.
 async function fetchATR(symbol, interval) {
   const limit = CONFIG.atrPeriod + 1; // need one extra candle for the first prev-close
-  const res   = await fetch(
-    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`
-  );
-  const data    = await res.json();
-  const candles = data.result?.list;
+  const candles = await fetchKlinesBX(symbol, interval, limit);
   if (!candles || candles.length < CONFIG.atrPeriod + 1)
     throw new Error(`ATR: só ${candles?.length ?? 0} velas disponíveis (precisa de ${CONFIG.atrPeriod + 1})`);
 
@@ -1030,15 +1037,11 @@ async function fetchATR(symbol, interval) {
 // Returns the EMA value; caller compares to current price to determine trend.
 async function fetchTrendEMA(symbol, interval, period) {
   const limit = period * 2; // extra candles for EMA warm-up
-  const res   = await fetch(
-    `${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`
-  );
-  const data    = await res.json();
-  const candles = data.result?.list;
+  const candles = await fetchKlinesBX(symbol, interval, limit);
   if (!candles || candles.length < period)
     throw new Error(`Trend EMA: só ${candles?.length ?? 0} velas (precisa de ${period})`);
 
-  // Bybit returns newest-first — reverse to oldest-first for sequential EMA
+  // newest-first — reverse to oldest-first for sequential EMA
   const closes = candles.map(c => parseFloat(c[4])).reverse();
   const k      = 2 / (period + 1);
   let ema      = closes[0]; // seed with oldest close
@@ -1060,12 +1063,10 @@ function isInTimeWindow(hourUTC, start, end) {
 async function fetchATRAvg50(symbol, interval) {
   const avgPeriod = 50;
   const limit     = CONFIG.atrPeriod + avgPeriod + 1;
-  const res       = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  const data      = await res.json();
-  const candles   = data.result?.list;
+  const candles   = await fetchKlinesBX(symbol, interval, limit);
   if (!candles || candles.length < CONFIG.atrPeriod + 2)
     throw new Error(`ATRAvg50: só ${candles?.length ?? 0} velas`);
-  // Bybit: newest-first. Compute TR for each consecutive pair.
+  // newest-first. Compute TR for each consecutive pair.
   const trs = [];
   for (let i = 0; i < candles.length - 1; i++) {
     const h = parseFloat(candles[i][2]), l = parseFloat(candles[i][3]), pc = parseFloat(candles[i + 1][4]);
@@ -1083,13 +1084,9 @@ function calcDynamicLeverage(atr, avg50, baseLev) {
   return baseLev;
 }
 
-// Fetch best bid/ask from Bybit orderbook and return spread as % of mid price.
+// Fetch best bid/ask and return spread as % of mid price.
 async function fetchSpreadPct(symbol) {
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/orderbook?category=linear&symbol=${symbol}&limit=1`);
-  const data = await res.json();
-  const bid  = parseFloat(data.result?.b?.[0]?.[0]);
-  const ask  = parseFloat(data.result?.a?.[0]?.[0]);
-  if (!bid || !ask) throw new Error("Orderbook vazio");
+  const { bid, ask } = await fetchBidAsk(symbol);
   const mid = (bid + ask) / 2;
   return { bid, ask, spreadPct: (ask - bid) / mid };
 }
@@ -1098,9 +1095,7 @@ async function fetchSpreadPct(symbol) {
 // currentVol = volume of the most recent completed bar; avgVol = mean of last `periods` bars.
 async function fetchVolumeRatio(symbol, interval, periods) {
   const limit   = periods + 1; // +1 so candles[0] (possibly open bar) is excluded
-  const res     = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  const data    = await res.json();
-  const candles = data.result?.list;
+  const candles = await fetchKlinesBX(symbol, interval, limit);
   if (!candles || candles.length < 2) throw new Error("Volume: candles insuficientes");
   // candles[0] = current (may be incomplete); candles[1..] = completed bars
   const completed  = candles.slice(1);
@@ -1130,7 +1125,7 @@ async function checkPositionTimeouts() {
         state.positionOpenTime = null;
         saveSymbolState();
         await sendTelegram(
-          `⏰ <b>Bot v2 ${sym}</b> — Posição fechada por timeout\n` +
+          `⏰ <b>Bot v3 ${sym}</b> — Posição fechada por timeout\n` +
           `Aberta há ${elapsedH}h | PnL: $${pnl.toFixed(2)}\n` +
           `(PnL dentro de $${CONFIG.positionTimeoutPnlMin} a $${CONFIG.positionTimeoutPnlMax})`
         );
@@ -1145,7 +1140,7 @@ async function checkPositionTimeouts() {
 //   • "breakout" (auto, only when TRAILING_REENTRY_ENABLED=true): a position closed at
 //     breakeven/profit by the trailing-stop arms a watch; re-enters when price breaks
 //     back past the exit level (trend continuation).
-//   • "pullback" (from the manual /commit2 command): re-enters when price retraces to a
+//   • "pullback" (from the manual /commit3 command): re-enters when price retraces to a
 //     target below/above the exit (buy the dip / sell the rip).
 // Both: at most once per REENTRY_COOLDOWN_MS, expire after REENTRY_EXPIRY_HOURS, and are
 // cancelled by an opposite-direction signal (see handleWebhook).
@@ -1179,7 +1174,7 @@ async function checkTrailingReentries() {
         const r = state.reentry;
         const kind = r.type || "breakout";
 
-        // ── 2a) Bybit limit re-entry (/commit2) — poll status ───────────────
+        // ── 2a) BingX limit re-entry (/commit3) — poll status ───────────────
         if (kind === "limit") {
           const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
           let status = null;
@@ -1202,7 +1197,7 @@ async function checkTrailingReentries() {
                 console.log(`  ℹ️  ${sym}: sem trailing na re-entrada (posição original não tinha)`);
               }
             } catch (e) { console.log(`  ⚠️  Trailing pós-fill ${sym}: ${e.message}`); }
-            await sendTelegram(`🔁 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
+            await sendTelegram(`🔁 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
             continue;
           }
           if (status === "Cancelled" || status === "Rejected" || status === "Deactivated") {
@@ -1237,27 +1232,21 @@ async function checkTrailingReentries() {
                 // Inherited TP — only if still on the correct side of the current price
                 const tpOk = r.tpPrice > 0 && (r.action === "buy" ? r.tpPrice > cur : r.tpPrice < cur);
                 const takeProfit = tpOk ? roundToTick(r.tpPrice, tickSize) : null;
-                const body = JSON.stringify({ category: "linear", symbol: sym, side, orderType: "Market", qty: String(r.qty), positionIdx: 0,
-                  ...(stopLoss ? { stopLoss, slTriggerBy: "LastPrice" } : {}),
-                  ...(takeProfit ? { takeProfit, tpTriggerBy: "LastPrice" } : {}) });
-                const ts = (Date.now() - 1500).toString();
-                const rw = "10000";
-                const sg = sign(ts, rw, body);
-                const resM = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sg, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": rw },
-                  body,
-                });
-                const dM = await resM.json();
-                if (dM.retCode !== 0) throw new Error(dM.retMsg);
+                const mktParams = {
+                  symbol: toBingxSymbol(sym), side: side.toUpperCase(), positionSide: "BOTH",
+                  type: "MARKET", quantity: String(r.qty),
+                };
+                if (stopLoss)   mktParams.stopLoss   = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(stopLoss), workingType: "CONTRACT_PRICE" });
+                if (takeProfit) mktParams.takeProfit = JSON.stringify({ type: "TAKE_PROFIT_MARKET", stopPrice: parseFloat(takeProfit), workingType: "CONTRACT_PRICE" });
+                const dM = await bxRequest("POST", "/openApi/swap/v2/trade/order", mktParams);
                 state.positionOpenTime = now;
                 state.lastAction       = r.action;
                 delete state.reentry;
                 saveSymbolState();
                 if (r.hadTrail !== false && CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, cur, atr);
-                logTrade(sym, r.action, cur, "", dM.result?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel)} (limite não encheu)`);
+                logTrade(sym, r.action, cur, "", dM?.order?.orderId ?? dM?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel)} (limite não encheu)`);
                 await sendTelegram(
-                  `🚀 <b>Bot v2 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} a mercado (fallback)\n` +
+                  `🚀 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} a mercado (fallback)\n` +
                   `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel)}\n` +
                   `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}${takeProfit ? ` | TP herdado: $${takeProfit}` : ""}`
                 );
@@ -1265,7 +1254,7 @@ async function checkTrailingReentries() {
                 console.log(`  ❌ Fallback breakout ${sym} falhou: ${e.message}`);
                 delete state.reentry;
                 saveSymbolState();
-                await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Fallback breakout falhou\n${e.message}`);
+                await sendTelegram(`❌ <b>Bot v3 ${sym}</b> — Fallback breakout falhou\n${e.message}`);
               }
               continue;
             }
@@ -1372,17 +1361,17 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
 
     logTrade(symbol, action, priceNum, order.tradeSize, order.orderId, "LIVE", `Re-entrada ${kind} @ $${refLevel}`);
     await sendTelegram(
-      `🔁 <b>Bot v2 ${symbol}</b> — Re-entrada ${action.toUpperCase()} (${kindLabel})\n` +
+      `🔁 <b>Bot v3 ${symbol}</b> — Re-entrada ${action.toUpperCase()} (${kindLabel})\n` +
       `Preço: $${priceNum} | Nível ref: $${refLevel}\n` +
       `SL: $${order.slPrice} (${(order.slPct * 100).toFixed(2)}%)`
     );
   } catch (e) {
     console.log(`  ❌ Re-entrada falhou: ${e.message}`);
-    await sendTelegram(`❌ <b>Bot v2 ${symbol}</b> — Re-entrada falhou\n${e.message}`);
+    await sendTelegram(`❌ <b>Bot v3 ${symbol}</b> — Re-entrada falhou\n${e.message}`);
   }
 }
 
-// Places a resting GTC limit order at a specific price (the /commit2 dip/rip level),
+// Places a resting GTC limit order at a specific price (the /commit3 dip/rip level),
 // with an ATR-based SL attached (activates on fill). Returns { orderId, slPrice, priceStr, qty }.
 // Unlike placeOrder's chase-limit→market flow, this never falls back to market — it must
 // rest in the book until price reaches the level (or it's cancelled).
@@ -1418,24 +1407,17 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverri
   } else {
     qty = calcQty(CONFIG.tradeSize, lev, priceNum, minQty, qtyStep);
   }
-  const body = JSON.stringify({
-    category: "linear", symbol, side, orderType: "Limit",
-    price: priceStr, qty, timeInForce: "GTC", positionIdx: 0,
-    ...(slPrice ? { stopLoss: slPrice, slTriggerBy: "LastPrice" } : {}),
-    ...(tpStr   ? { takeProfit: tpStr, tpTriggerBy: "LastPrice" } : {}),
-  });
-  const ts  = (Date.now() - 1500).toString();
-  const rw  = "10000";
-  const sig = sign(ts, rw, body);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": rw },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Limit re-entry failed: ${data.retMsg}`);
-  console.log(`  📌 Ordem limite de re-entrada @ $${priceStr} | qty=${qty} | SL=${slPrice ?? "—"} | TP=${tpStr ?? "—"} | ${data.result?.orderId}`);
-  return { orderId: data.result?.orderId, slPrice, tpPrice: tpStr, priceStr, qty };
+  // BingX: SL/TP anexados como objetos JSON no próprio pedido de ordem
+  const params = {
+    symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+    type: "LIMIT", price: priceStr, quantity: qty, timeInForce: "GTC",
+  };
+  if (slPrice) params.stopLoss   = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(slPrice), workingType: "CONTRACT_PRICE" });
+  if (tpStr)   params.takeProfit = JSON.stringify({ type: "TAKE_PROFIT_MARKET", stopPrice: parseFloat(tpStr), workingType: "CONTRACT_PRICE" });
+  const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", params);
+  const orderId = data?.order?.orderId ?? data?.orderId;
+  console.log(`  📌 Ordem limite de re-entrada @ $${priceStr} | qty=${qty} | SL=${slPrice ?? "—"} | TP=${tpStr ?? "—"} | ${orderId}`);
+  return { orderId, slPrice, tpPrice: tpStr, priceStr, qty };
 }
 
 // Risk-based sizing: tradeSize so that SL (stopLossPct) = exactly riskUSD
@@ -1454,7 +1436,7 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
   return qty.toFixed(decimals);
 }
 
-// atrValue: if provided (from payload or pre-fetched), skips the Bybit candle fetch.
+// atrValue: if provided (from payload or pre-fetched), skips the BingX candle fetch.
 // Returns { orderId, slPrice, slPct, slDistance, atrUsed, tradeSize, filledAs }
 //   filledAs: "maker" (limit filled) | "taker" (market fallback)
 // slOverride: absolute SL price from payload (e.g. TradingView indicator level).
@@ -1495,7 +1477,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
       : price + slDistance;
   }
   // stopLoss is rounded to the instrument tick size after getInstrumentInfo below.
-  // TP is managed by TradingView webhooks (tp/tp2) — no native Bybit TP set
+  // TP is managed by TradingView webhooks (tp/tp2) — no native BingX TP set
   // to avoid conflict with the half-close + break-even logic
 
   // ── Position sizing ───────────────────────────────────────────────────────
@@ -1510,7 +1492,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   // Round SL to the instrument tick size (was toFixed(2) — wrong for sub-$1 / fine-tick assets)
   stopLoss = roundToTick(stopLoss, tickSize);
   console.log(`  SL: $${stopLoss}${tickSize > 0 ? ` (tick ${tickSize})` : ""}`);
-  // Cap leverage to instrument maximum (avoids "gt maxLeverage" error from Bybit)
+  // Cap leverage to instrument maximum (avoids "gt maxLeverage" error from BingX)
   if (maxLeverage > 0 && lev > maxLeverage) {
     console.log(`  ⚠️  Leverage ${lev}x capado a ${maxLeverage}x (máx para ${symbol})`);
     lev = maxLeverage;
@@ -1524,33 +1506,27 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   let orderId  = null;
   let filledAs = "taker";
 
+  // BingX: SL anexado como objeto JSON no pedido de ordem
+  const slParam = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(stopLoss), workingType: "CONTRACT_PRICE" });
+
   if (CONFIG.chaseLimitEnabled && CONFIG.tradeMode === "futures") {
     try {
       const { bid, ask } = await fetchBidAsk(symbol);
       const limitPrice   = roundToTick(action === "buy" ? bid : ask, tickSize);
       console.log(`  🎯 Chase Limit @ $${limitPrice} (${action === "buy" ? "bid" : "ask"}) — aguarda ${CONFIG.chaseLimitTimeoutMs}ms`);
 
-      const limitBody = JSON.stringify({
-        category: "linear", symbol, side,
-        orderType: "Limit",
-        price: limitPrice,
-        qty: quantity,
-        timeInForce: "GTC",
-        stopLoss, slTriggerBy: "LastPrice",
-        positionIdx: 0,
-      });
-      const ts1  = (Date.now() - 1500).toString();
-      const rw1  = "10000";
-      const sig1 = sign(ts1, rw1, limitBody);
-      const res1 = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig1, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts1, "X-BAPI-RECV-WINDOW": rw1 },
-        body: limitBody,
-      });
-      const d1 = await res1.json();
+      let limitOrderId = null;
+      try {
+        const d1 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+          symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+          type: "LIMIT", price: limitPrice, quantity, timeInForce: "GTC", stopLoss: slParam,
+        });
+        limitOrderId = d1?.order?.orderId ?? d1?.orderId;
+      } catch (e) {
+        console.log(`  ⚠️  Limit rejeitada pela BingX (${e.message}) — a usar Market`);
+      }
 
-      if (d1.retCode === 0) {
-        const limitOrderId = d1.result?.orderId;
+      if (limitOrderId) {
         // Wait for potential fill
         await new Promise(r => setTimeout(r, CONFIG.chaseLimitTimeoutMs));
         const status = await getOrderStatus(symbol, limitOrderId);
@@ -1559,20 +1535,18 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
         if (status === "Filled") {
           orderId  = limitOrderId;
           filledAs = "maker";
-          console.log(`  ✅ LIMIT FILLED — taxa maker 0.02%`);
+          console.log(`  ✅ LIMIT FILLED — taxa maker`);
         } else if (status === "PartiallyFilled") {
           // Accept partial fill, cancel remaining to avoid open limit sitting in book
           await cancelOrder(symbol, limitOrderId);
           orderId  = limitOrderId;
           filledAs = "maker";
-          console.log(`  ✅ LIMIT PARCIALMENTE FILLED — restante cancelado | taxa maker 0.02%`);
+          console.log(`  ✅ LIMIT PARCIALMENTE FILLED — restante cancelado | taxa maker`);
         } else {
           // Not filled → cancel and fall through to market
           console.log(`  ⚠️  Limit não encheu (${status ?? "unknown"}) — a cancelar → Market`);
           await cancelOrder(symbol, limitOrderId);
         }
-      } else {
-        console.log(`  ⚠️  Limit rejeitada pela Bybit (${d1.retMsg}) — a usar Market`);
       }
     } catch (e) {
       console.log(`  ⚠️  Chase Limit erro (${e.message}) — a usar Market`);
@@ -1581,81 +1555,79 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
 
   // ── Market order (fallback ou direto se chase limit desativado) ───────────
   if (!orderId) {
-    const marketBody = JSON.stringify(
-      CONFIG.tradeMode === "futures"
-        ? { category: "linear", symbol, side, orderType: "Market", qty: quantity, positionIdx: 0,
-            stopLoss, slTriggerBy: "LastPrice" }
-        : { category: "spot", symbol, side, orderType: "Market", qty: quantity }
-    );
-    const ts2  = (Date.now() - 1500).toString();
-    const rw2  = "10000";
-    const sig2 = sign(ts2, rw2, marketBody);
-    const res2 = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig2, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": ts2, "X-BAPI-RECV-WINDOW": rw2 },
-      body: marketBody,
+    const d2 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+      symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+      type: "MARKET", quantity, stopLoss: slParam,
     });
-    const d2 = await res2.json();
-    if (d2.retCode !== 0) throw new Error(`Order failed: ${d2.retMsg}`);
-    orderId  = d2.result?.orderId;
+    orderId  = d2?.order?.orderId ?? d2?.orderId;
     filledAs = "taker";
-    console.log(`  ✅ MARKET ORDER — taxa taker 0.055%`);
+    console.log(`  ✅ MARKET ORDER — taxa taker`);
   }
 
   return { orderId, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize, filledAs };
 }
 
 async function fetchCurrentPrice(symbol) {
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
-  let data;
   try {
-    data = await res.json();
+    const data = await bxPublic("/openApi/swap/v1/ticker/price", { symbol: toBingxSymbol(symbol) });
+    return parseFloat(data?.price || "0") || null;
   } catch (e) {
-    const raw = await res.text().catch(() => "(ilegível)");
-    console.log(`  ⚠️  fetchCurrentPrice JSON parse falhou para ${symbol}: ${e.message} | body: ${raw.substring(0, 200)}`);
+    console.log(`  ⚠️  fetchCurrentPrice falhou para ${symbol}: ${e.message}`);
     return null;
   }
-  return parseFloat(data.result?.list?.[0]?.lastPrice || "0") || null;
+}
+
+// Open conditional (SL/TP/trailing) orders attached to a symbol's position.
+// BingX keeps protections as separate reduce orders, not position attributes — this
+// reconstructs the BingX-style view (stopLoss/takeProfit/trailing on the position).
+async function getProtectionOrders(symbol) {
+  try {
+    const data = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol: toBingxSymbol(symbol) });
+    const orders = data?.orders || [];
+    const sl    = orders.find(o => o.type === "STOP_MARKET" || o.type === "STOP");
+    const tp    = orders.find(o => o.type === "TAKE_PROFIT_MARKET" || o.type === "TAKE_PROFIT");
+    const trail = orders.find(o => o.type === "TRAILING_STOP_MARKET");
+    return {
+      slPrice:      sl    ? parseFloat(sl.stopPrice || sl.price || "0") : 0,
+      slOrderId:    sl?.orderId    ?? null,
+      tpPrice:      tp    ? parseFloat(tp.stopPrice || tp.price || "0") : 0,
+      tpOrderId:    tp?.orderId    ?? null,
+      trailActive:  trail ? 1 : 0,
+      trailOrderId: trail?.orderId ?? null,
+    };
+  } catch {
+    return { slPrice: 0, slOrderId: null, tpPrice: 0, tpOrderId: null, trailActive: 0, trailOrderId: null };
+  }
 }
 
 async function getOpenPosition(symbol) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = `category=linear&symbol=${symbol}`;
-  const sig        = sign(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/list?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-  });
-  const data = await res.json();
-  const position = data.result?.list?.[0];
+  const data = await bxRequest("GET", "/openApi/swap/v2/user/positions", { symbol: toBingxSymbol(symbol) });
+  const position = (Array.isArray(data) ? data : []).find(p => Math.abs(parseFloat(p.positionAmt || "0")) > 0);
   if (!position) return null;
-  const size = parseFloat(position.size);
-  return size > 0 ? {
-    side:           position.side,
+  const size = Math.abs(parseFloat(position.positionAmt));
+  const prot = await getProtectionOrders(symbol);
+  return {
+    side:           position.positionSide === "SHORT" || parseFloat(position.positionAmt) < 0 ? "Sell" : "Buy",
     size,
-    stopLoss:       parseFloat(position.stopLoss      || "0"),
-    avgPrice:       parseFloat(position.avgPrice      || "0"),  // entry price from Bybit — reliable even after partial closes
-    unrealizedPnl:  parseFloat(position.unrealisedPnl || "0"),  // Bybit field name: unrealisedPnl
-    leverage:       parseFloat(position.leverage      || "0"),  // so a re-entry can mirror the original leverage
-    trailingStop:   parseFloat(position.trailingStop  || "0"),  // so a re-entry can mirror SL/trailing presence
-    takeProfit:     parseFloat(position.takeProfit    || "0"),  // so a re-entry can inherit the TP level
-  } : null;
+    stopLoss:       prot.slPrice,                                     // from the open STOP_MARKET order
+    avgPrice:       parseFloat(position.avgPrice        || "0"),
+    unrealizedPnl:  parseFloat(position.unrealizedProfit || position.unrealisedProfit || "0"),
+    leverage:       parseFloat(position.leverage        || "0"),      // so a re-entry can mirror the original leverage
+    trailingStop:   prot.trailActive,                                 // so a re-entry can mirror SL/trailing presence
+    takeProfit:     prot.tpPrice,                                     // so a re-entry can inherit the TP level
+    slOrderId:      prot.slOrderId,
+    tpOrderId:      prot.tpOrderId,
+    trailOrderId:   prot.trailOrderId,
+  };
 }
 
 async function closePosition(symbol, position) {
-  const closeSide  = position.side === "Buy" ? "Sell" : "Buy";
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const body       = JSON.stringify({ category: "linear", symbol, side: closeSide, orderType: "Market", qty: String(position.size), positionIdx: 0, reduceOnly: true });
-  const sig        = sign(timestamp, recvWindow, body);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
+  const closeSide = position.side === "Buy" ? "SELL" : "BUY";
+  const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
+    type: "MARKET", quantity: String(position.size), reduceOnly: "true",
   });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Close position failed: ${data.retMsg}`);
-  return data.result;
+  return { orderId: data?.order?.orderId ?? data?.orderId };
 }
 
 async function closeHalfPosition(symbol, position) {
@@ -1666,35 +1638,40 @@ async function closeHalfPosition(symbol, position) {
   const halfQty  = (Math.floor(halfRaw / qtyStep) * qtyStep).toFixed(decimals);
   if (parseFloat(halfQty) <= 0) throw new Error(`Half qty (${halfQty}) is zero — position too small to split`);
 
-  const closeSide  = position.side === "Buy" ? "Sell" : "Buy";
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const body       = JSON.stringify({ category: "linear", symbol, side: closeSide, orderType: "Market", qty: halfQty, positionIdx: 0, reduceOnly: true });
-  const sig        = sign(timestamp, recvWindow, body);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
+  const closeSide = position.side === "Buy" ? "SELL" : "BUY";
+  const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
+    type: "MARKET", quantity: halfQty, reduceOnly: "true",
   });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Close half position failed: ${data.retMsg}`);
-  return { ...data.result, closedQty: halfQty, remainingQty: (position.size - parseFloat(halfQty)).toFixed(decimals) };
+  return { orderId: data?.order?.orderId ?? data?.orderId, closedQty: halfQty, remainingQty: (position.size - parseFloat(halfQty)).toFixed(decimals) };
 }
 
+// Move the position SL to a new price. On BingX the SL is a separate STOP_MARKET order:
+// cancel the existing one (if any) and place a new closePosition stop at the new level.
 async function setBreakEvenStop(symbol, entryPrice) {
   const { tickSize } = await getInstrumentInfo(symbol);
-  const slPrice    = roundToTick(parseFloat(entryPrice), tickSize);
-  const timestamp  = Date.now().toString();
-  const recvWindow = "5000";
-  const body       = JSON.stringify({ category: "linear", symbol, stopLoss: slPrice, slTriggerBy: "LastPrice", positionIdx: 0 });
-  const sig        = sign(timestamp, recvWindow, body);
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
+  const slPrice = roundToTick(parseFloat(entryPrice), tickSize);
+  const pos = await getOpenPosition(symbol);
+  if (!pos) throw new Error("Sem posição aberta para mover o SL");
+  if (pos.slOrderId) await cancelOrder(symbol, pos.slOrderId);
+  const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
+  await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
+    type: "STOP_MARKET", stopPrice: slPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
   });
-  const data = await res.json();
-  if (data.retCode !== 0) throw new Error(`Set break-even SL failed: ${data.retMsg}`);
+}
+
+// Realized-PnL income records in [startTime, endTime] — the building block for the
+// daily/period PnL views. BingX income REALIZED_PNL is per-close, per-symbol.
+async function fetchIncomeRange(startTime, endTime) {
+  const data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
+    incomeType: "REALIZED_PNL", startTime, endTime, limit: 1000,
+  });
+  return (Array.isArray(data) ? data : []).map(r => ({
+    symbol:      fromBingxSymbol(r.symbol),
+    closedPnl:   r.income,
+    updatedTime: String(r.time),
+  }));
 }
 
 // Returns today's total realised PnL (negative = loss).
@@ -1702,73 +1679,39 @@ async function setBreakEvenStop(symbol, entryPrice) {
 async function getDailyClosedPnl(symbol = null) {
   const todayMidnight = new Date();
   todayMidnight.setHours(0, 0, 0, 0);
-  const startTime  = todayMidnight.getTime().toString();
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = `category=linear${symbol ? `&symbol=${symbol}` : ""}&startTime=${startTime}&limit=200`;
-  const sig        = sign(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-  });
-  const data = await res.json();
-  const list = data.result?.list || [];
-  return list.reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
+  const list = await fetchIncomeRange(todayMidnight.getTime(), Date.now());
+  return list
+    .filter(r => !symbol || r.symbol === symbol.toUpperCase())
+    .reduce((sum, item) => sum + parseFloat(item.closedPnl || 0), 0);
 }
 
-// Returns the most recently closed position record for a symbol (or null).
-// Used to detect how/at what price a position was closed (trailing-stop vs SL).
+// Returns the most recently closed position record for a symbol (or null), shaped like
+// BingX's closed-pnl entry ({ closedPnl, avgExitPrice, updatedTime }) so the re-entry
+// and cooldown logic stay unchanged. Uses BingX position history.
 async function getLastClosedPnl(symbol) {
-  const timestamp  = (Date.now() - 1500).toString();
-  const recvWindow = "10000";
-  const params     = `category=linear&symbol=${symbol}&limit=1`;
-  const sig        = sign(timestamp, recvWindow, params);
-  const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/closed-pnl?${params}`, {
-    headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-  });
-  const data = await res.json();
-  return data.result?.list?.[0] || null;
+  try {
+    const now = Date.now();
+    const data = await bxRequest("GET", "/openApi/swap/v1/trade/positionHistory", {
+      symbol: toBingxSymbol(symbol), startTs: now - 7 * 86_400_000, endTs: now, pageIndex: 1, pageSize: 10,
+    });
+    const list = data?.positionHistory || (Array.isArray(data) ? data : []);
+    if (!list.length) return null;
+    const last = [...list].sort((a, b) => parseInt(b.updateTime || b.closeTime || 0) - parseInt(a.updateTime || a.closeTime || 0))[0];
+    return {
+      closedPnl:    last.netProfit ?? last.realisedProfit ?? "0",
+      avgExitPrice: last.avgClosePrice ?? last.closePrice ?? "0",
+      updatedTime:  String(last.updateTime ?? last.closeTime ?? now),
+    };
+  } catch (e) {
+    console.log(`  ⚠️  getLastClosedPnl ${symbol}: ${e.message}`);
+    return null;
+  }
 }
 
-// Daily API-key expiry check — Bybit keys without an IP whitelist expire every 3 months
-// and the bot dies silently when they do. Queries /v5/user/query-api for the key's own
-// expiry and warns on Telegram each day once ≤ API_KEY_EXPIRY_WARN_DAYS days remain.
+// BingX API keys don't auto-expire on a fixed 3-month schedule like BingX's — this
+// check is a no-op kept for config compatibility.
 async function checkApiKeyExpiry() {
-  if (!(CONFIG.apiKeyExpiryWarnDays > 0)) return;
-  try {
-    const timestamp  = (Date.now() - 1500).toString();
-    const recvWindow = "10000";
-    const params     = "";
-    const sig        = sign(timestamp, recvWindow, params);
-    const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/user/query-api`, {
-      headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    });
-    const data = await res.json();
-    if (data.retCode !== 0) throw new Error(data.retMsg);
-    const r = data.result || {};
-
-    // deadlineDay = remaining days (only present for keys without IP whitelist);
-    // fall back to computing from expiredAt. Null → key never expires (IP-bound).
-    let daysLeft = null;
-    if (r.deadlineDay != null && parseInt(r.deadlineDay) > 0) {
-      daysLeft = parseInt(r.deadlineDay);
-    } else if (r.expiredAt) {
-      const exp = new Date(r.expiredAt).getTime();
-      if (exp > 0) daysLeft = Math.floor((exp - Date.now()) / 86_400_000);
-    }
-    if (daysLeft == null) return;
-
-    console.log(`🔑 API key Bybit expira em ${daysLeft} dia(s)`);
-    if (daysLeft <= CONFIG.apiKeyExpiryWarnDays) {
-      await sendTelegram(
-        `🔑⚠️ <b>Bot v2</b> — a API key da Bybit expira em <b>${daysLeft} dia(s)</b>!\n` +
-        `1. Bybit → API Management → renovar/criar chave\n` +
-        `2. Railway → atualizar BYBIT_API_KEY e BYBIT_SECRET_KEY\n` +
-        `Sem renovação o bot deixa de conseguir abrir/fechar posições.`
-      );
-    }
-  } catch (e) {
-    console.log(`  ⚠️  Verificação de expiração da API key falhou: ${e.message}`);
-  }
+  console.log("🔑 Verificação de expiração da API key: n/a na BingX");
 }
 
 // Format a price/distance value with enough decimal places to avoid rounding to zero.
@@ -1781,7 +1724,7 @@ function formatPrice(value) {
 }
 
 // Round a price (or price-distance) to the instrument's tick size and format with
-// matching decimals. Bybit rejects SL / activePrice values that aren't exact multiples
+// matching decimals. BingX rejects SL / activePrice values that aren't exact multiples
 // of tickSize — toFixed(2) silently corrupts them for sub-$1 or fine-tick assets.
 // Falls back to formatPrice (decimal-count heuristic) when tickSize is unknown.
 function roundToTick(price, tickSize) {
@@ -1795,7 +1738,7 @@ function roundToTick(price, tickSize) {
 // atr: if provided, trailing distance = atr × ATR_MULTIPLIER (same buffer as the SL).
 // Fallback: entryPrice × TRAILING_STOP_PCT (legacy fixed %).
 // Stable coins (STABLE_SYMBOLS) use wider STABLE_TRAILING_STOP_PCT.
-// Activation price = entry ± trailingDistance, so that when Bybit activates the
+// Activation price = entry ± trailingDistance, so that when BingX activates the
 // trail (stop = activePrice − distance), the initial stop lands at breakeven —
 // the trailing stop can never close the position at a loss, only at breakeven or profit.
 async function setTrailingStop(symbol, action, entryPrice, atr = null) {
@@ -1811,7 +1754,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   const trailingDistance = roundToTick(rawDistance, tickSize);
   const distanceNum = parseFloat(trailingDistance);
 
-  // Guard: if distance rounds to zero Bybit will reject the request
+  // Guard: if distance rounds to zero BingX will reject the request
   if (distanceNum === 0) {
     console.log(`  ⚠️  Trailing stop ignorado — distância calculada é zero (ATR demasiado pequeno)`);
     return;
@@ -1822,7 +1765,7 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
     ? entryPrice + distanceNum
     : entryPrice - distanceNum;
 
-  // Check current price — if it already passed activePriceNum, Bybit rejects activePrice.
+  // Check current price — if it already passed activePriceNum, BingX rejects activePrice.
   // In that case omit it: trailing activates immediately (stop = currentPrice − distance ≥ entry).
   const currentPrice = await fetchCurrentPrice(symbol);
   const alreadyActivated = currentPrice > 0 && (
@@ -1837,20 +1780,29 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
     console.log(`  Trailing stop: distance=$${trailingDistance} (${src}) | activa @ $${formatPrice(activePriceNum)} (breakeven garantido)`);
   }
 
-  const timestamp  = Date.now().toString();
-  const recvWindow = "5000";
-  const orderBody  = alreadyActivated
-    ? { category: "linear", symbol, trailingStop: trailingDistance, positionIdx: 0 }
-    : { category: "linear", symbol, trailingStop: trailingDistance, activePrice: roundToTick(activePriceNum, tickSize), positionIdx: 0 };
-  const body = JSON.stringify(orderBody);
-  const sig  = sign(timestamp, recvWindow, body);
-  const res  = await fetch(`${CONFIG.bybit.baseUrl}/v5/position/trading-stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
-    body,
-  });
-  const data = await res.json();
-  if (data.retCode !== 0) console.log(`  ⚠️  Trailing stop falhou: ${data.retMsg}`);
+  // BingX: o trailing é uma ordem TRAILING_STOP_MARKET reduce-only com callback em
+  // RÁCIO (priceRate = distância/entrada) e activationPrice opcional. Com a ativação
+  // em entrada ± distância, o stop inicial ao ativar ≈ breakeven — mesma garantia.
+  try {
+    const pos = await getOpenPosition(symbol);
+    if (!pos) { console.log("  ⚠️  Trailing ignorado — posição não encontrada"); return; }
+    // Cancel a previous trailing order, if any (replace semantics like BingX's)
+    if (pos.trailOrderId) await cancelOrder(symbol, pos.trailOrderId);
+    const priceRate = Math.min(0.99, Math.max(0.001, distanceNum / entryPrice));
+    const params = {
+      symbol: toBingxSymbol(symbol),
+      side: action === "buy" ? "SELL" : "BUY",
+      positionSide: "BOTH",
+      type: "TRAILING_STOP_MARKET",
+      quantity: String(pos.size),
+      priceRate: priceRate.toFixed(4),
+      reduceOnly: "true",
+    };
+    if (!alreadyActivated) params.activationPrice = roundToTick(activePriceNum, tickSize);
+    await bxRequest("POST", "/openApi/swap/v2/trade/order", params);
+  } catch (e) {
+    console.log(`  ⚠️  Trailing stop falhou: ${e.message}`);
+  }
 }
 
 // ─── Webhook endpoint ─────────────────────────────────────────────────────────
@@ -1955,7 +1907,7 @@ async function handleWebhook(body) {
   // If payload price differs by >10% from market, it's stale/wrong → use live price.
   let priceNum = parseFloat(price);
   if (!priceNum || isNaN(priceNum)) {
-    console.log("  ℹ️  No price in payload — fetching live price from Bybit...");
+    console.log("  ℹ️  No price in payload — fetching live price from BingX...");
     priceNum = await fetchCurrentPrice(sym);
     if (!priceNum) {
       console.log("  ❌ Não foi possível obter preço live — sinal ignorado");
@@ -1976,7 +1928,7 @@ async function handleWebhook(body) {
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"} | Size: $${CONFIG.tradeSize} | Leverage: ${effectiveLev}x${leverage ? " (payload)" : " (default)"} | SL: ${CONFIG.stopLossPct*100}% | TP: ${CONFIG.takeProfitPct*100}%`);
 
   // Cancel a pending re-entry on a new signal. Opposite signals cancel any watch; a resting
-  // Bybit limit re-entry (from /commit2) is cancelled by ANY new signal (same or opposite)
+  // BingX limit re-entry (from /commit3) is cancelled by ANY new signal (same or opposite)
   // so a fresh entry can't leave an orphan limit order behind. Done here (not only via
   // recordSignalPlaced) so it happens even if the new order is later blocked by a filter.
   if (actionLower !== "tp") {
@@ -1984,7 +1936,7 @@ async function handleWebhook(body) {
     const rc = stCancel?.reentry;
     if (rc && (rc.action !== actionLower || rc.type === "limit")) {
       if (rc.type === "limit" && rc.orderId) {
-        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym}: ordem limite de re-entrada ${rc.orderId} cancelada na Bybit`); }
+        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym}: ordem limite de re-entrada ${rc.orderId} cancelada na BingX`); }
         catch (e) { console.log(`  ⚠️  ${sym}: cancelar ordem de re-entrada falhou: ${e.message}`); }
       } else {
         console.log(`  ✖ ${sym}: watch de re-entrada (${rc.type || "breakout"}) cancelada — sinal ${actionLower.toUpperCase()}`);
@@ -1999,14 +1951,14 @@ async function handleWebhook(body) {
     console.log(`  🎯 TP signal — a fechar metade da posição em ${sym}...`);
     if (CONFIG.paperTrading) {
       console.log(`  📋 PAPER TP — nenhuma ordem enviada`);
-      await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER TP\nFecharia metade da posição`);
+      await sendTelegram(`📋 <b>Bot v3 ${sym}</b> — PAPER TP\nFecharia metade da posição`);
       return;
     }
     try {
       const openPos = await getOpenPosition(sym);
       if (!openPos) {
         console.log(`  ⚠️  Nenhuma posição aberta em ${sym} — TP ignorado`);
-        await sendTelegram(`⚠️ <b>Bot v2 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
+        await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
         return;
       }
       console.log(`  Posição: ${openPos.side} qty=${openPos.size} | PnL não realizado: ${openPos.unrealizedPnl >= 0 ? "+" : ""}$${openPos.unrealizedPnl.toFixed(2)}`);
@@ -2016,7 +1968,7 @@ async function handleWebhook(body) {
         const msg = `⏸ TP ignorado — PnL não realizado $${openPos.unrealizedPnl.toFixed(2)} < mínimo $${CONFIG.minTpPnlUSD} (posição em perda)`;
         console.log(`  ${msg}`);
         await sendTelegram(
-          `⏸ <b>Bot v2 ${sym}</b> — TP ignorado\n` +
+          `⏸ <b>Bot v3 ${sym}</b> — TP ignorado\n` +
           `Posição ${openPos.side} ainda em perda\n` +
           `PnL atual: $${openPos.unrealizedPnl.toFixed(2)} | Mínimo para fechar: $${CONFIG.minTpPnlUSD}\n` +
           `A aguardar recuperação antes de executar TP`
@@ -2030,10 +1982,10 @@ async function handleWebhook(body) {
       logTrade(sym, openPos.side === "Buy" ? "sell" : "buy", priceNum, "", result.orderId, "LIVE", `TP: closed half (${result.closedQty}), remaining ${result.remainingQty}`);
       recordTpReceived(sym);
 
-      // Entry price — use Bybit's avgPrice (always reliable) with payload entry_price as fallback
+      // Entry price — use BingX's avgPrice (always reliable) with payload entry_price as fallback
       const entryNum = (openPos.avgPrice > 0 ? openPos.avgPrice : null)
                     ?? (parseFloat(entry_price) > 0 ? parseFloat(entry_price) : null);
-      if (entryNum) console.log(`  Entry price: $${entryNum} (${openPos.avgPrice > 0 ? "Bybit avgPrice" : "payload entry_price"})`);
+      if (entryNum) console.log(`  Entry price: $${entryNum} (${openPos.avgPrice > 0 ? "BingX avgPrice" : "payload entry_price"})`);
 
       // PnL da operação: (exit - entry) × qty fechada
       const closedQtyNum = parseFloat(result.closedQty);
@@ -2045,7 +1997,7 @@ async function handleWebhook(body) {
         console.log(`  💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)} (entrada $${entryNum} → saída $${priceNum} × ${closedQtyNum})`);
       }
 
-      // PnL do dia via Bybit closed-pnl
+      // PnL do dia via BingX closed-pnl
       let dailyPnl = null;
       try { dailyPnl = await getDailyClosedPnl(sym); } catch (_) {}
 
@@ -2089,7 +2041,7 @@ async function handleWebhook(body) {
           // For a Buy  position: SL must be < current price (stop loss is below).
           // For a Sell position: SL must be > current price (stop loss is above).
           // If the position is in loss at TP time the computed break-even can end up
-          // on the wrong side, causing Bybit to reject the order.
+          // on the wrong side, causing BingX to reject the order.
           const slInvalid = newSl !== null && (
             openPos.side === "Buy"  ? newSl >= priceNum :
             openPos.side === "Sell" ? newSl <= priceNum : false
@@ -2108,7 +2060,7 @@ async function handleWebhook(body) {
       }
 
       await sendTelegram(
-        `🎯 <b>Take-Profit Bot v2</b> — ${sym}\n` +
+        `🎯 <b>Take-Profit Bot v3</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
         (newSl !== null ? `🛡 Novo SL: $${formatPrice(newSl)}\n` : "") +
         (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
@@ -2117,7 +2069,7 @@ async function handleWebhook(body) {
       return;
     } catch (err) {
       console.log(`  ❌ TP ERROR — ${err.message}`);
-      await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro no TP\n${err.message}`);
+      await sendTelegram(`❌ <b>Bot v3 ${sym}</b> — Erro no TP\n${err.message}`);
       return;
     }
   }
@@ -2126,7 +2078,7 @@ async function handleWebhook(body) {
     const paperId = `PAPER-${Date.now()}`;
     console.log(`  📋 PAPER TRADE — ${actionLower.toUpperCase()} $${CONFIG.tradeSize} ${sym}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, paperId, "PAPER", "Signal received");
-    await sendTelegram(`📋 <b>Bot v2 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}%`);
+    await sendTelegram(`📋 <b>Bot v3 ${sym}</b> — PAPER ${actionLower.toUpperCase()}\nPreço: $${priceNum} | Size: $${CONFIG.tradeSize}\nSL: ${CONFIG.stopLossPct*100}%`);
     return;
   }
 
@@ -2142,14 +2094,14 @@ async function handleWebhook(body) {
       if (CONFIG.maxDailyLossPerSymbol > 0 && symbolPnl < -CONFIG.maxDailyLossPerSymbol) {
         const msg = `🛑 Limite de perda diária por par atingido em ${sym}: $${symbolPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossPerSymbol})`;
         console.log(`  ${msg}`);
-        await sendTelegram(`🛑 <b>Bot v2 ${sym}</b> — Bloqueado\n${msg}`);
+        await sendTelegram(`🛑 <b>Bot v3 ${sym}</b> — Bloqueado\n${msg}`);
         return;
       }
 
       if (CONFIG.maxDailyLossTotal > 0 && totalPnl < -CONFIG.maxDailyLossTotal) {
         const msg = `🛑 Limite de perda diária global atingido: $${totalPnl.toFixed(2)} (limite: -$${CONFIG.maxDailyLossTotal})`;
         console.log(`  ${msg}`);
-        await sendTelegram(`🛑 <b>Bot v2</b> — Bloqueado (todos os pares)\n${msg}`);
+        await sendTelegram(`🛑 <b>Bot v3</b> — Bloqueado (todos os pares)\n${msg}`);
         return;
       }
 
@@ -2173,7 +2125,7 @@ async function handleWebhook(body) {
       if (cooldownCheck.blocked) {
         console.log(`  ${cooldownCheck.reason}`);
         logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "BLOCKED", cooldownCheck.reason);
-        await sendTelegram(`${cooldownCheck.reason}\n<b>Bot v2 ${sym}</b> — sinal ${actionLower.toUpperCase()} ignorado`);
+        await sendTelegram(`${cooldownCheck.reason}\n<b>Bot v3 ${sym}</b> — sinal ${actionLower.toUpperCase()} ignorado`);
         return;
       }
 
@@ -2181,14 +2133,14 @@ async function handleWebhook(body) {
       if (openPos && openPos.side.toLowerCase() === actionLower) {
         console.log(`  ⚠️  Already ${openPos.side} (qty=${openPos.size}) — skipping duplicate signal`);
         logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "SKIPPED", `Already ${openPos.side}`);
-        await sendTelegram(`⏭ <b>Bot v2 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
+        await sendTelegram(`⏭ <b>Bot v3 ${sym}</b> — Sinal ignorado\nJá tem posição ${openPos.side} aberta (qty=${openPos.size})`);
         return;
       }
 
       // ── Trend filter ────────────────────────────────────────────────────────
       if (CONFIG.trendMarginPct > 0) {
         try {
-          const trendInt = toBybitInterval(CONFIG.trendInterval);
+          const trendInt = toBingXInterval(CONFIG.trendInterval);
           const ema      = await fetchTrendEMA(sym, trendInt, CONFIG.trendEmaPeriod);
           const diff     = (priceNum - ema) / ema; // >0 = price above EMA (bullish)
           const trendDir = diff >= 0 ? "BULLISH" : "BEARISH";
@@ -2211,7 +2163,7 @@ async function handleWebhook(body) {
             }
 
             await sendTelegram(
-              `🚫 <b>Bot v2 ${sym}</b> — ${actionLower.toUpperCase()} bloqueado\n` +
+              `🚫 <b>Bot v3 ${sym}</b> — ${actionLower.toUpperCase()} bloqueado\n` +
               `Sinal ${diffPct}% contra tendência ${trendDir}\n` +
               `EMA${CONFIG.trendEmaPeriod}(${trendInt}m): $${ema.toFixed(4)} | Preço: $${priceNum}\n` +
               (openPos ? `📤 Posição ${openPos.side} fechada` : "Sem posição aberta")
@@ -2244,7 +2196,7 @@ async function handleWebhook(body) {
           console.log(`  ✅ POSITION CLOSED (hard cap) — ${closeResult.orderId}`);
           logTrade(sym, openPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Hard-cap close: perda $${openPos.unrealizedPnl.toFixed(2)} > teto $${CONFIG.maxReversalHardCapUSD}`);
           await sendTelegram(
-            `🛑 <b>Bot v2 ${sym}</b> — Perdedor fechado (teto de perda)\n` +
+            `🛑 <b>Bot v3 ${sym}</b> — Perdedor fechado (teto de perda)\n` +
             `${openPos.side} PnL $${openPos.unrealizedPnl.toFixed(2)} > teto -$${CONFIG.maxReversalHardCapUSD}\n` +
             `Perda cortada — nova entrada ${actionLower.toUpperCase()} ignorada`
           );
@@ -2255,7 +2207,7 @@ async function handleWebhook(body) {
           const pnlDisplay = `$${openPos.unrealizedPnl.toFixed(2)}`;
           const msg = `⏸ Reversão bloqueada — ${openPos.side} tem PnL não realizado ${pnlDisplay} (limite: -$${CONFIG.maxReversalLossUSD})\nA aguardar recuperação antes de reverter para ${actionLower.toUpperCase()}`;
           console.log(`  ${msg}`);
-          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Reversão bloqueada\n${msg}`);
+          await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Reversão bloqueada\n${msg}`);
           return;
         }
         const pnlInfo = CONFIG.maxReversalLossUSD > 0 ? ` | PnL: $${openPos.unrealizedPnl.toFixed(2)}` : "";
@@ -2267,10 +2219,10 @@ async function handleWebhook(body) {
     }
 
     // Resolve interval — payload {{interval}} takes priority over CANDLE_INTERVAL env var
-    const candleInterval = toBybitInterval(payloadInterval || CONFIG.candleInterval);
-    if (payloadInterval) console.log(`  Intervalo do payload: ${payloadInterval} → Bybit: ${candleInterval}m`);
+    const candleInterval = toBingXInterval(payloadInterval || CONFIG.candleInterval);
+    if (payloadInterval) console.log(`  Intervalo do payload: ${payloadInterval} → BingX: ${candleInterval}m`);
 
-    // Resolve ATR — payload first, then fetch from Bybit candles using signal's own interval
+    // Resolve ATR — payload first, then fetch from BingX candles using signal's own interval
     const atrNum = payloadAtr ? parseFloat(payloadAtr) : null;
     let resolvedAtr = atrNum;
     if (resolvedAtr) {
@@ -2308,7 +2260,7 @@ async function handleWebhook(body) {
         if (ratio < CONFIG.volumeFilterMult) {
           const msg = `⏸ Volume baixo: ${ratio.toFixed(2)}× média — mínimo ${CONFIG.volumeFilterMult}× — sinal ignorado`;
           console.log(`  ${msg}`);
-          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nVol atual: ${currentVol.toFixed(0)} | Média(${CONFIG.volumeFilterPeriods}): ${avgVol.toFixed(0)}`);
+          await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n${msg}\nVol atual: ${currentVol.toFixed(0)} | Média(${CONFIG.volumeFilterPeriods}): ${avgVol.toFixed(0)}`);
           return;
         }
         console.log(`  ✅ Filtro volume OK: ${ratio.toFixed(2)}× média (mínimo ${CONFIG.volumeFilterMult}×)`);
@@ -2340,7 +2292,7 @@ async function handleWebhook(body) {
       if (expectedTp1 < minRequired) {
         const msg = `⏸ Trade ignorado — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas ($${feesRoundTrip.toFixed(2)}) × ${CONFIG.feeViabilityThreshold}`;
         console.log(`  ${msg}`);
-        await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nSL (${slSource}): ${(effectiveSlPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
+        await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n${msg}\nSL (${slSource}): ${(effectiveSlPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
         return;
       }
       console.log(`  ✅ Viabilidade taxas OK: TP1 $${expectedTp1.toFixed(2)} ≥ taxas $${feesRoundTrip.toFixed(2)} × ${CONFIG.feeViabilityThreshold}`);
@@ -2354,7 +2306,7 @@ async function handleWebhook(body) {
         const msg = `⏸ Sinal ignorado — SL demasiado largo: ${slPctStr}% > limite ${limitPctStr}%`;
         console.log(`  ${msg}`);
         await sendTelegram(
-          `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
+          `⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n` +
           `SL (${slSource}) demasiado largo\n` +
           `SL: ${slPctStr}% | Limite: ${limitPctStr}%`
         );
@@ -2370,7 +2322,7 @@ async function handleWebhook(body) {
         const msg = `⏸ TP implícito ${(impliedTpPct * 100).toFixed(2)}% (SL ${(effectiveSlPct * 100).toFixed(2)}% × ${CONFIG.minRR}) > máx ${(CONFIG.maxTpPct * 100).toFixed(2)}% — sinal ignorado`;
         console.log(`  ${msg}`);
         await sendTelegram(
-          `⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n` +
+          `⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n` +
           `${msg}\n` +
           `SL (${slSource}): ${(effectiveSlPct * 100).toFixed(2)}%\n` +
           `Para R:R≥${CONFIG.minRR} o TradingView teria de alvo ≥${(impliedTpPct * 100).toFixed(2)}% — demasiado`
@@ -2387,7 +2339,7 @@ async function handleWebhook(body) {
         if (spreadPct > CONFIG.maxSpreadPct) {
           const msg = `⏸ Spread demasiado largo: ${(spreadPct * 100).toFixed(4)}% (máx ${(CONFIG.maxSpreadPct * 100).toFixed(4)}%) — sinal ignorado`;
           console.log(`  ${msg}`);
-          await sendTelegram(`⏸ <b>Bot v2 ${sym}</b> — Sinal ignorado\n${msg}\nBid: $${bid} | Ask: $${ask}`);
+          await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n${msg}\nBid: $${bid} | Ask: $${ask}`);
           return;
         }
         console.log(`  ✅ Spread OK: ${(spreadPct * 100).toFixed(4)}% ≤ ${(CONFIG.maxSpreadPct * 100).toFixed(4)}% (bid $${bid} / ask $${ask})`);
@@ -2414,7 +2366,7 @@ async function handleWebhook(body) {
 
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", `SL=$${order.slPrice} | fee=${order.filledAs}`);
     await sendTelegram(
-      `✅ <b>Bot v2 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
+      `✅ <b>Bot v3 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
       `Preço: $${priceNum} | Size: $${order.tradeSize ?? CONFIG.tradeSize}\n` +
       `SL: ${slLabel} | TP: via TradingView\n` +
       `Taxa: ${feeLabel}\n` +
@@ -2424,7 +2376,7 @@ async function handleWebhook(body) {
   } catch (err) {
     console.log(`  ❌ ERROR — ${err.message}`);
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, "", "ERROR", err.message);
-    await sendTelegram(`❌ <b>Bot v2 ${sym}</b> — Erro na ordem\n${err.message}`);
+    await sendTelegram(`❌ <b>Bot v3 ${sym}</b> — Erro na ordem\n${err.message}`);
   }
 }
 
@@ -2434,7 +2386,7 @@ initCsv();
 loadSymbolState();
 app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  TradingView Webhook Bot v2");
+  console.log("  TradingView Webhook Bot v3 — BingX");
   console.log(`  Port     : ${PORT}`);
   console.log(`  Data dir : ${DATA_DIR}${DATA_DIR === "." ? " (efémero — define DATA_DIR p/ Volume Railway)" : " (persistente)"} | estado: ${SYMBOL_STATE_FILE}`);
   console.log(`  Mode     : ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
@@ -2458,7 +2410,7 @@ app.listen(PORT, () => {
   console.log(`  Cooldown  : ${CONFIG.cooldownAfterSlMs > 0 ? `${CONFIG.cooldownAfterSlMs / 60000}min após SL inferido` : "desativado"}${CONFIG.maxSlPerSymbol > 0 ? ` | bloqueia após ${CONFIG.maxSlPerSymbol} SL/dia` : ""}`);
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
-  console.log(`  /commit2  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na Bybit @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
+  console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem (verifica 1min)` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
@@ -2470,10 +2422,10 @@ app.listen(PORT, () => {
     console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
   }
 
-  // Start background re-entry checker (every 1 min). Always on so manual /commit2 pullback
+  // Start background re-entry checker (every 1 min). Always on so manual /commit3 pullback
   // watches are serviced; breakout auto-detection is still gated by TRAILING_REENTRY_ENABLED.
   setInterval(checkTrailingReentries, 60 * 1000);
-  console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit2: on`);
+  console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit3: on`);
 
   // Start background auto-commit checker (every 1 min)
   if (CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0) {
@@ -2481,12 +2433,9 @@ app.listen(PORT, () => {
     console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}`);
   }
 
-  // API-key expiry check: once shortly after boot, then every 24h
-  if (CONFIG.apiKeyExpiryWarnDays > 0) {
-    setTimeout(checkApiKeyExpiry, 30 * 1000);
-    setInterval(checkApiKeyExpiry, 24 * 3600 * 1000);
-    console.log(`🔑 Aviso de expiração da API key ativo — alerta quando faltarem ≤ ${CONFIG.apiKeyExpiryWarnDays} dias`);
-  }
+  // BingX: garantir modo one-way (uma posição por símbolo, positionSide=BOTH).
+  // O bot assume esta semântica em todo o lado (reversões, reduceOnly, fechos parciais).
+  setOneWayMode();
 
   // Start Telegram command polling
   startTelegramPolling();

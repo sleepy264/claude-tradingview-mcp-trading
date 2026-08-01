@@ -1,7 +1,7 @@
 {
-  "name": "claude-tradingview-mcp-trading",
+  "name": "claude-tradingview-mcp-trading-v3",
   "version": "1.0.0",
-  "description": "Automated trading bot — Claude + TradingView strategy + BitGet execution",
+  "description": "Automated trading bot — Claude + TradingView strategy + BingX execution (bot v3)",
   "main": "bot.js",
   "scripts": {
     "start": "node webhook.js",
