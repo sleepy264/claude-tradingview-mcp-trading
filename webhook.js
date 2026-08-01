@@ -920,18 +920,48 @@ async function setLeverage(symbol, lev) {
 }
 
 // Contract specs. BingX exposes precisions, not tick/step sizes — converted here.
-async function getInstrumentInfo(symbol) {
+// The contracts endpoint does NOT carry leverage limits (unlike Bybit's instruments-info),
+// so maxLeverage comes from the signed leverage endpoint. Both are cached: the contracts
+// list is a single large payload and getInstrumentInfo is called on every order path.
+const _contractsCache = { list: null, at: 0 };
+const _levCache = new Map(); // symbol → { max, at }
+const CONTRACTS_TTL = 10 * 60 * 1000;
+const LEV_TTL       = 60 * 60 * 1000;
+
+async function getContracts() {
+  if (_contractsCache.list && Date.now() - _contractsCache.at < CONTRACTS_TTL) return _contractsCache.list;
   const data = await bxPublic("/openApi/swap/v2/quote/contracts");
+  _contractsCache.list = Array.isArray(data) ? data : [];
+  _contractsCache.at   = Date.now();
+  return _contractsCache.list;
+}
+
+async function getMaxLeverage(symbol) {
+  const bx     = toBingxSymbol(symbol);
+  const cached = _levCache.get(bx);
+  if (cached && Date.now() - cached.at < LEV_TTL) return cached.max;
+  try {
+    const d   = await bxRequest("GET", "/openApi/swap/v2/trade/leverage", { symbol: bx });
+    const max = parseFloat(d?.maxLongLeverage ?? d?.maxLeverage ?? "0") || 0;
+    _levCache.set(bx, { max, at: Date.now() });
+    return max;
+  } catch {
+    return 0; // desconhecido → sem clamp (a BingX rejeita se for demais)
+  }
+}
+
+async function getInstrumentInfo(symbol) {
   const bx   = toBingxSymbol(symbol);
-  const inst = (Array.isArray(data) ? data : []).find(c => c.symbol === bx);
-  if (!inst) return { minQty: 0.001, qtyStep: 0.001, maxLeverage: 0, tickSize: 0 };
+  const inst = (await getContracts()).find(c => c.symbol === bx);
+  if (!inst) return { minQty: 0.001, qtyStep: 0.001, maxLeverage: 0, tickSize: 0, minNotional: 0 };
   const qtyPrec   = parseInt(inst.quantityPrecision ?? 3);
   const pricePrec = parseInt(inst.pricePrecision    ?? 2);
   return {
     minQty:      parseFloat(inst.tradeMinQuantity ?? Math.pow(10, -qtyPrec)),
     qtyStep:     Math.pow(10, -qtyPrec),
-    maxLeverage: parseFloat(inst.maxLongLeverage ?? "0"),
+    maxLeverage: await getMaxLeverage(symbol),   // não vem no contracts — endpoint próprio
     tickSize:    Math.pow(10, -pricePrec),
+    minNotional: parseFloat(inst.tradeMinUSDT ?? "0"),  // ordem mínima em USDT
   };
 }
 
@@ -1488,7 +1518,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
     ? `risk-based ($${CONFIG.riskPerTradeUSD} risco → $${tradeSize} margem, perda máx $${(CONFIG.riskPerTradeUSD).toFixed(2)})`
     : `fixo ($${tradeSize})`;
 
-  const { minQty, qtyStep, maxLeverage, tickSize } = await getInstrumentInfo(symbol);
+  const { minQty, qtyStep, maxLeverage, tickSize, minNotional } = await getInstrumentInfo(symbol);
   // Round SL to the instrument tick size (was toFixed(2) — wrong for sub-$1 / fine-tick assets)
   stopLoss = roundToTick(stopLoss, tickSize);
   console.log(`  SL: $${stopLoss}${tickSize > 0 ? ` (tick ${tickSize})` : ""}`);
@@ -1499,6 +1529,13 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   }
   const quantity = calcQty(tradeSize, lev, price, minQty, qtyStep);
   console.log(`  Size: ${tradeSizeMode} | Qty: ${quantity} (${lev}x ÷ $${price.toFixed(2)}, min=${minQty}, step=${qtyStep})`);
+
+  // BingX rejects orders below the instrument's minimum notional (tradeMinUSDT) — fail
+  // with a clear message instead of an opaque exchange error.
+  const notional = parseFloat(quantity) * price;
+  if (minNotional > 0 && notional < minNotional) {
+    throw new Error(`Ordem abaixo do mínimo da BingX: $${notional.toFixed(2)} < $${minNotional} (${symbol}) — aumenta MAX_TRADE_SIZE_USD ou a leverage`);
+  }
 
   // ── Chase Limit → Market fallback ────────────────────────────────────────
   // 1st attempt: Limit order at current bid (buy) or ask (sell) → maker fee 0.02%
