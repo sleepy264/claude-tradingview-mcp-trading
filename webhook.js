@@ -433,27 +433,41 @@ async function handleTelegramCommand(text, chatId) {
       todayMidnight.setHours(0, 0, 0, 0);
       const list = await fetchIncomeRange(todayMidnight.getTime(), Date.now());
 
-      // Group by symbol
+      // Group by symbol and by income type (liquidations/fees/funding are separate
+      // records on BingX — the breakdown shows WHY the total is what it is)
       const bySymbol = {};
+      const byType   = {};
       let total = 0;
       for (const item of list) {
         const sym = item.symbol;
         const pnl = parseFloat(item.closedPnl || 0);
-        bySymbol[sym] = (bySymbol[sym] || 0) + pnl;
+        if (sym) bySymbol[sym] = (bySymbol[sym] || 0) + pnl;
+        byType[item.incomeType || "?"] = (byType[item.incomeType || "?"] || 0) + pnl;
         total += pnl;
       }
+
+      const TYPE_LABEL = {
+        REALIZED_PNL:    "💵 Trades fechadas",
+        INSURANCE_CLEAR: "💥 Liquidações",
+        TRADING_FEE:     "🧾 Taxas",
+        FUNDING_FEE:     "⏳ Funding",
+      };
 
       const todayStr = new Date().toISOString().slice(0, 10);
       const lines = Object.entries(bySymbol)
         .sort((a, b) => b[1] - a[1])
         .map(([sym, pnl]) => `  ${sym}: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`);
+      const typeLines = Object.entries(byType)
+        .sort((a, b) => a[1] - b[1])
+        .map(([t, v]) => `  ${TYPE_LABEL[t] || t}: ${v >= 0 ? "+" : ""}$${v.toFixed(2)}`);
 
       const emoji = total >= 0 ? "🟢" : "🔴";
       const msg = [
         `${emoji} <b>PnL do dia — Bot v3</b> (${todayStr})`,
         `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>`,
+        typeLines.length > 0 ? "\nDecomposição:\n" + typeLines.join("\n") : "",
         lines.length > 0 ? "\nPor símbolo:\n" + lines.join("\n") : "\nNenhuma trade fechada hoje.",
-      ].join("\n");
+      ].filter(Boolean).join("\n");
 
       await sendTelegram(msg, chatId);
     } catch (e) {
@@ -1698,17 +1712,27 @@ async function setBreakEvenStop(symbol, entryPrice) {
   });
 }
 
-// Realized-PnL income records in [startTime, endTime] — the building block for the
-// daily/period PnL views. BingX income REALIZED_PNL is per-close, per-symbol.
+// Income records in [startTime, endTime] — the building block for the daily/period PnL
+// views. Fetched WITHOUT an incomeType filter on purpose: on BingX a liquidation is
+// recorded as INSURANCE_CLEAR, not REALIZED_PNL, so filtering by REALIZED_PNL alone
+// reported a profit on a day that was actually a loss. Fees and funding are separate
+// records too, and Bybit's closedPnl (what v2 reports) is net of fees — so summing all
+// trading-related types is also what keeps the two bots comparable.
+// Only account movements (deposits/withdrawals/transfers) are excluded.
+const NON_PNL_INCOME = ["TRANSFER", "DEPOSIT", "WITHDRAW"];
+
 async function fetchIncomeRange(startTime, endTime) {
   const data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
-    incomeType: "REALIZED_PNL", startTime, endTime, limit: 1000,
+    startTime, endTime, limit: 1000,
   });
-  return (Array.isArray(data) ? data : []).map(r => ({
-    symbol:      fromBingxSymbol(r.symbol),
-    closedPnl:   r.income,
-    updatedTime: String(r.time),
-  }));
+  return (Array.isArray(data) ? data : [])
+    .filter(r => !NON_PNL_INCOME.some(t => String(r.incomeType || "").toUpperCase().includes(t)))
+    .map(r => ({
+      symbol:      fromBingxSymbol(r.symbol),
+      closedPnl:   r.income,
+      incomeType:  r.incomeType,
+      updatedTime: String(r.time),
+    }));
 }
 
 // Returns today's total realised PnL (negative = loss).
@@ -1725,19 +1749,29 @@ async function getDailyClosedPnl(symbol = null) {
 // Returns the most recently closed position record for a symbol (or null), shaped like
 // BingX's closed-pnl entry ({ closedPnl, avgExitPrice, updatedTime }) so the re-entry
 // and cooldown logic stay unchanged. Uses BingX position history.
+// (positionHistory returns an empty list on this account type, so the closing order
+// itself is the source: a filled order carrying a non-zero `profit` is a close, and it
+// gives both the realized PnL and the exit price the re-entry logic needs.)
 async function getLastClosedPnl(symbol) {
   try {
-    const now = Date.now();
-    const data = await bxRequest("GET", "/openApi/swap/v1/trade/positionHistory", {
-      symbol: toBingxSymbol(symbol), startTs: now - 7 * 86_400_000, endTs: now, pageIndex: 1, pageSize: 10,
+    const now  = Date.now();
+    const data = await bxRequest("GET", "/openApi/swap/v2/trade/allOrders", {
+      symbol: toBingxSymbol(symbol), startTime: now - 7 * 86_400_000, endTime: now, limit: 100,
     });
-    const list = data?.positionHistory || (Array.isArray(data) ? data : []);
-    if (!list.length) return null;
-    const last = [...list].sort((a, b) => parseInt(b.updateTime || b.closeTime || 0) - parseInt(a.updateTime || a.closeTime || 0))[0];
+    const orders = data?.orders || (Array.isArray(data) ? data : []);
+    const closes = orders.filter(o =>
+      String(o.status).toUpperCase() === "FILLED" &&
+      parseFloat(o.executedQty || "0") > 0 &&
+      parseFloat(o.profit || "0") !== 0
+    );
+    if (!closes.length) return null;
+    const last = closes.sort((a, b) => parseInt(b.updateTime || b.time || 0) - parseInt(a.updateTime || a.time || 0))[0];
+    // profit is gross; subtract the closing commission so the sign matches Bybit's closedPnl
+    const net = parseFloat(last.profit || "0") - Math.abs(parseFloat(last.commission || "0"));
     return {
-      closedPnl:    last.netProfit ?? last.realisedProfit ?? "0",
-      avgExitPrice: last.avgClosePrice ?? last.closePrice ?? "0",
-      updatedTime:  String(last.updateTime ?? last.closeTime ?? now),
+      closedPnl:    String(net),
+      avgExitPrice: last.avgPrice ?? "0",
+      updatedTime:  String(last.updateTime ?? last.time ?? now),
     };
   } catch (e) {
     console.log(`  ⚠️  getLastClosedPnl ${symbol}: ${e.message}`);
