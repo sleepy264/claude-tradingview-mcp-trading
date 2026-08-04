@@ -555,13 +555,27 @@ async function handleTelegramCommand(text, chatId) {
       await sendTelegram(`📋 <b>Bot v3</b> — /close3 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
+    // Sintaxe: /close3 [SYMBOL] [quantidade] [confirmar]
+    //   /close3                    → menu com as posições abertas
+    //   /close3 BTCUSDT            → pede confirmação (fecho TOTAL)
+    //   /close3 BTCUSDT 10         → pede confirmação (fecho PARCIAL de 10 unidades)
+    //   /close3 BTCUSDT confirmar  → executa o fecho total
+    //   /close3 BTCUSDT 10 confirmar → executa o fecho parcial
     const parts  = (text || "").trim().split(/\s+/);
     const argSym = (parts[1] || "").toUpperCase();
+    const rest   = parts.slice(2).map(p => p.toLowerCase());
+    const confirmed = rest.includes("confirmar");
+    const qtyArg    = rest.find(p => p !== "confirmar");
+    const qtyNum    = qtyArg !== undefined ? parseFloat(qtyArg.replace(",", ".")) : null;
 
     if (argSym) {
+      if (qtyArg !== undefined && !(qtyNum > 0)) {
+        await sendTelegram(`⚠️ Quantidade inválida: <code>${qtyArg}</code>\nUso: <code>/close3 ${argSym} 10</code> (10 unidades) ou <code>/close3 ${argSym}</code> (fecho total)`, chatId);
+        return;
+      }
       // Second step: only close when explicitly confirmed
-      if ((parts[2] || "").toLowerCase() === "confirmar") {
-        await closeSymbol(argSym, chatId);
+      if (confirmed) {
+        await closeSymbol(argSym, chatId, qtyNum);
         return;
       }
       // First step: show the position and ask for confirmation. The "Cancelar" button
@@ -572,12 +586,20 @@ async function handleTelegramCommand(text, chatId) {
           await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
           return;
         }
+        const partial = qtyNum > 0 && qtyNum < pos.size;
+        if (qtyNum > pos.size) {
+          await sendTelegram(`⚠️ <b>${argSym}</b> — pediste ${qtyNum} mas a posição só tem ${pos.size}. Usa <code>/close3 ${argSym}</code> para fechar tudo.`, chatId);
+          return;
+        }
+        const cmdConfirm = partial ? `/close3 ${argSym} ${qtyNum} confirmar` : `/close3 ${argSym} confirmar`;
         await sendTelegramKeyboard(
-          `⚠️ <b>Confirmas fechar ${argSym}?</b>\n` +
+          `⚠️ <b>Confirmas ${partial ? `fechar ${qtyNum} de ${argSym}` : `fechar ${argSym}`}?</b>\n` +
           `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
           `PnL atual: ${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}\n` +
-          `Fecha a mercado, SEM re-entrada (cancela re-entradas pendentes).`,
-          [[`/close3 ${argSym} confirmar`], ["❌ Cancelar"]],
+          (partial
+            ? `Fecho PARCIAL a mercado — restam ${(pos.size - qtyNum).toFixed(8).replace(/\.?0+$/, "")} (posição mantém-se aberta).`
+            : `Fecha a mercado, SEM re-entrada (cancela re-entradas pendentes).`),
+          [[cmdConfirm], ["❌ Cancelar"]],
           chatId
         );
       } catch (e) {
@@ -607,10 +629,13 @@ async function handleTelegramCommand(text, chatId) {
   }
 }
 
-// Close a symbol's position with NO re-entry — /close3. Also cancels any pending
-// re-entry (software watch or resting BingX limit order) and clears positionOpenTime
-// so the breakout auto-detector doesn't re-arm a watch for this closure.
-async function closeSymbol(argSym, chatId) {
+// Close a symbol's position with NO re-entry — /close3.
+// qty = null (default) closes the whole position: also cancels any pending re-entry
+// (software watch or resting BingX limit order) and clears positionOpenTime so the
+// breakout auto-detector doesn't re-arm a watch for this closure.
+// qty > 0 closes only that many contracts: the position stays open, so the state,
+// SL/trailing and any pending re-entry are deliberately left untouched.
+async function closeSymbol(argSym, chatId, qty = null) {
   try {
     const pos = await getOpenPosition(argSym);
     if (!pos) {
@@ -619,7 +644,25 @@ async function closeSymbol(argSym, chatId) {
     }
     const pnl       = pos.unrealizedPnl;
     const exitPrice = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
+    const partial   = qty > 0 && qty < pos.size;
 
+    // ── Fecho PARCIAL ────────────────────────────────────────────────────────
+    if (partial) {
+      const result = await closePartialPosition(argSym, pos, qty);
+      const pnlShare = pnl * (parseFloat(result.closedQty) / pos.size); // PnL proporcional
+      console.log(`  ✂️ /close3 ${argSym}: fecho parcial ${result.closedQty}/${pos.size} @ $${exitPrice} (PnL ~$${pnlShare.toFixed(2)}) — ${result.orderId}`);
+      logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close3 parcial — ${result.closedQty} de ${pos.size} (PnL ~$${pnlShare.toFixed(2)})`);
+      await sendTelegram(
+        `${pnlShare >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Fecho parcial (/close3)\n` +
+        `Fechado: ${result.closedQty} de ${pos.size} ${pos.side} @ $${formatPrice(exitPrice)}\n` +
+        `PnL da parte fechada: ~${pnlShare >= 0 ? "+" : ""}$${pnlShare.toFixed(2)}\n` +
+        `📌 Resta ${result.remainingQty} aberto (SL/trailing mantidos)`,
+        chatId
+      );
+      return;
+    }
+
+    // ── Fecho TOTAL ──────────────────────────────────────────────────────────
     const result = await closePosition(argSym, pos);
     console.log(`  ✂️ /close3 ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
 
@@ -863,7 +906,7 @@ async function startTelegramPolling() {
       { command: "stats30", description: "📈 PnL últimos 30 dias (gráfico)" },
       { command: "pos3", description: "📈 Posições abertas" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
-      { command: "close3", description: "✂️ Fechar posição sem re-entrada (ou /close3 SYMBOL)" },
+      { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
     ]}),
   }).catch(() => {});
 
@@ -1681,20 +1724,28 @@ async function closePosition(symbol, position) {
   return { orderId: data?.order?.orderId ?? data?.orderId };
 }
 
-async function closeHalfPosition(symbol, position) {
+// Reduce-only market close of `qty` contracts. qty is floored to the instrument's
+// qtyStep and capped at the position size. Used by closeHalfPosition (TP) and by
+// /close3 SYMBOL <qty> (manual partial close).
+async function closePartialPosition(symbol, position, qty) {
   const { qtyStep } = await getInstrumentLotSize(symbol);
   const decimals    = (qtyStep.toString().split(".")[1] || "").length;
-  // Round half down to nearest qtyStep to avoid over-reducing
-  const halfRaw  = position.size / 2;
-  const halfQty  = (Math.floor(halfRaw / qtyStep) * qtyStep).toFixed(decimals);
-  if (parseFloat(halfQty) <= 0) throw new Error(`Half qty (${halfQty}) is zero — position too small to split`);
+  // Floor to qtyStep and never exceed the open size
+  const wanted   = Math.min(parseFloat(qty), position.size);
+  const closeQty = (Math.floor(wanted / qtyStep) * qtyStep).toFixed(decimals);
+  if (parseFloat(closeQty) <= 0)
+    throw new Error(`Quantidade ${qty} inválida — mínimo ${qtyStep} (posição: ${position.size})`);
 
   const closeSide = position.side === "Buy" ? "SELL" : "BUY";
   const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
     symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
-    type: "MARKET", quantity: halfQty, reduceOnly: "true",
+    type: "MARKET", quantity: closeQty, reduceOnly: "true",
   });
-  return { orderId: data?.order?.orderId ?? data?.orderId, closedQty: halfQty, remainingQty: (position.size - parseFloat(halfQty)).toFixed(decimals) };
+  return { orderId: data?.order?.orderId ?? data?.orderId, closedQty: closeQty, remainingQty: (position.size - parseFloat(closeQty)).toFixed(decimals) };
+}
+
+async function closeHalfPosition(symbol, position) {
+  return closePartialPosition(symbol, position, position.size / 2);
 }
 
 // Move the position SL to a new price. On BingX the SL is a separate STOP_MARKET order:
