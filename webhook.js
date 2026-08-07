@@ -298,6 +298,7 @@ async function sendTelegram(message, chatId = null) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: target, text: message, parse_mode: "HTML" }),
+    signal: AbortSignal.timeout(15000),  // sem timeout, um envio podia ficar pendurado
   }).catch((e) => console.log("Telegram error:", e.message));
 }
 
@@ -316,6 +317,7 @@ async function sendTelegramKeyboard(message, rows, chatId = null) {
       chat_id: target, text: message, parse_mode: "HTML",
       reply_markup: { keyboard, one_time_keyboard: true, resize_keyboard: true },
     }),
+    signal: AbortSignal.timeout(15000),
   }).catch((e) => console.log("Telegram error:", e.message));
 }
 
@@ -874,44 +876,66 @@ async function startTelegramPolling() {
   let offset = 0;
   console.log(`📡 Telegram polling ativo — comandos: /pnl2, /pos2 | chat_id=${chatId}`);
 
+  // Long-poll: o Telegram segura a ligação LONGPOLL_S segundos e responde vazio se não
+  // houver mensagens — expirar é NORMAL, não é erro. O abort tem de dar folga generosa
+  // para a latência de rede (antes: 25s de long-poll vs abort a 30s — 5s de margem,
+  // insuficiente no Railway; o abort disparava, o retry abria um getUpdates novo e o
+  // Telegram podia responder 409 Conflict, criando instabilidade em cadeia).
+  const LONGPOLL_S  = 20;
+  const ABORT_MS    = (LONGPOLL_S + 25) * 1000;  // 45s — margem larga
+  let polling = false;                            // impede ciclos de poll sobrepostos
+
   const poll = async () => {
+    if (polling) return;                          // já há um poll em curso
+    polling = true;
+    let nextDelay = 500;
     try {
       // Use POST to avoid URL-encoding issues with array parameters
       const res  = await fetch(`https://api.telegram.org/bot${token}/getUpdates`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ timeout: 25, offset, allowed_updates: ["message"] }),
-        signal:  AbortSignal.timeout(30000),
+        body:    JSON.stringify({ timeout: LONGPOLL_S, offset, allowed_updates: ["message"] }),
+        signal:  AbortSignal.timeout(ABORT_MS),
       });
       const data = await res.json();
 
       if (!data.ok) {
-        console.log(`[Telegram poll] erro: ${data.description}`);
-        setTimeout(poll, 5000);
-        return;
-      }
+        // 409 = outro processo a fazer polling com o mesmo token (deploy duplicado,
+        // instância local a correr...). Vale a pena gritar: os comandos ficam a saltar
+        // entre instâncias e as respostas parecem perder-se.
+        if (/conflict/i.test(data.description || "")) {
+          console.log(`[Telegram poll] ⚠️  CONFLITO: outro processo está a fazer polling com este token — verifica se há um deploy/instância duplicada`);
+        } else {
+          console.log(`[Telegram poll] erro: ${data.description}`);
+        }
+        nextDelay = 5000;
+      } else {
+        for (const update of data.result || []) {
+          offset = update.update_id + 1;
+          const msg    = update.message;
+          const text   = (msg?.text || "").trim();
+          const fromId = String(msg?.chat?.id || "").trim();
 
-      for (const update of data.result || []) {
-        offset = update.update_id + 1;
-        const msg    = update.message;
-        const text   = (msg?.text || "").trim();
-        const fromId = String(msg?.chat?.id || "").trim();
+          // Only respond to messages from the configured chat
+          if (fromId !== chatId) continue;
+          if (!text.startsWith("/")) continue;
 
-        // Only respond to messages from the configured chat
-        if (fromId !== chatId) continue;
-        if (!text.startsWith("/")) continue;
-
-        console.log(`[Telegram cmd] ${text}`);
-        handleTelegramCommand(text, fromId).catch((e) =>
-          console.log(`[Telegram cmd] erro: ${e.message}`)
-        );
+          console.log(`[Telegram cmd] ${text}`);
+          handleTelegramCommand(text, fromId).catch((e) =>
+            console.log(`[Telegram cmd] erro: ${e.message}`)
+          );
+        }
       }
     } catch (e) {
-      console.log(`[Telegram poll] ${e.message} — a tentar novamente em 5s`);
-      setTimeout(poll, 5000);
-      return;
+      // Timeout/abort do long-poll: esperado quando não há mensagens — reconecta já,
+      // sem ruído nos logs. Nada se perde: o offset só avança com resposta recebida.
+      const benign = e.name === "TimeoutError" || /aborted|timeout/i.test(e.message || "");
+      if (!benign) console.log(`[Telegram poll] ${e.message} — a tentar novamente em 5s`);
+      nextDelay = benign ? 300 : 5000;
+    } finally {
+      polling = false;
+      setTimeout(poll, nextDelay);
     }
-    setTimeout(poll, 500);
   };
 
   // Register bot commands so the "/" menu appears in Telegram
