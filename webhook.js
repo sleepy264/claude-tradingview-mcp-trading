@@ -10,6 +10,18 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 const DATA_DIR = process.env.DATA_DIR || ".";
 try { if (DATA_DIR !== "." && !existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); } catch {}
 
+// Default timeout for every outgoing HTTP call. Node's fetch has NO timeout: a hung
+// connection to the exchange would leave a command waiting forever — no reply, no error,
+// no recovery. Shadowing fetch module-wide applies the timeout to all call sites at once
+// while respecting any explicit `signal` (Telegram's long-poll and sends set their own).
+const _rawFetch = globalThis.fetch;
+const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "20000");
+function fetch(url, opts = {}) {
+  return opts.signal
+    ? _rawFetch(url, opts)
+    : _rawFetch(url, { ...opts, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
