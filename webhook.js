@@ -392,18 +392,42 @@ function isProtectiveOrder(o) {
   return o.reduceOnly && (o.triggerPrice > 0 || /untriggered/i.test(o.status || ""));
 }
 
+// Current price for every symbol in a list of orders, fetched in parallel.
+// Returns a { SYMBOL: price } map; symbols whose price can't be read are omitted.
+async function fetchPricesFor(orders) {
+  const symbols = [...new Set(orders.map(o => o.symbol))];
+  const prices  = await Promise.all(symbols.map(s => fetchCurrentPrice(s).catch(() => null)));
+  const map = {};
+  symbols.forEach((s, i) => { if (prices[i]) map[s] = prices[i]; });
+  return map;
+}
+
 // Human-readable line for a pending order, flagging protective stops and the ones the
 // bot itself is tracking as /commit3 re-entries (so a manual cancel is an informed decision).
-function describePendingOrder(o) {
+// `prices` (optional) adds the current price and how far it still is from triggering —
+// the number that actually says whether an order is about to fill or is parked far away.
+function describePendingOrder(o, prices = {}) {
   const isReentry = Object.values(symbolState).some(s => s.reentry?.orderId === o.orderId);
   const prot      = isProtectiveOrder(o);
   const ageMin    = o.createdTime ? Math.round((Date.now() - o.createdTime) / 60000) : null;
   const level     = o.triggerPrice > 0 ? o.triggerPrice : o.price;
   const dir       = prot ? "PROTEÇÃO da posição" : o.reduceOnly ? "fecho" : "abertura";
+
+  const cur = prices[o.symbol];
+  let curLine = "";
+  if (cur > 0 && level > 0) {
+    const diffPct = ((level - cur) / cur) * 100;
+    const arrow   = diffPct > 0 ? "▲" : "▼";           // para onde o preço tem de ir
+    curLine = `\n   atual $${formatPrice(cur)} · ${arrow} ${Math.abs(diffPct).toFixed(2)}% para executar`;
+  } else if (cur > 0) {
+    curLine = `\n   atual $${formatPrice(cur)}`;
+  }
+
   return `${prot ? "🛡" : o.reduceOnly ? "📤" : "📥"} <b>${o.symbol}</b> ${o.side} ${o.orderType} (${dir})\n` +
          `   qty=${o.qty} @ $${formatPrice(level)}${o.triggerPrice > 0 ? " (gatilho)" : ""}` +
-         `${o.stopLoss ? ` | SL $${o.stopLoss}` : ""}${o.takeProfit ? ` | TP $${o.takeProfit}` : ""}\n` +
-         `   ${o.status}${ageMin !== null ? ` · há ${ageMin < 60 ? `${ageMin}min` : `${(ageMin / 60).toFixed(1)}h`}` : ""}` +
+         `${o.stopLoss ? ` | SL $${o.stopLoss}` : ""}${o.takeProfit ? ` | TP $${o.takeProfit}` : ""}` +
+         curLine +
+         `\n   ${o.status}${ageMin !== null ? ` · há ${ageMin < 60 ? `${ageMin}min` : `${(ageMin / 60).toFixed(1)}h`}` : ""}` +
          `${isReentry ? " · 🔁 re-entrada do bot" : ""}`;
 }
 
@@ -704,13 +728,14 @@ async function handleTelegramCommand(text, chatId) {
         return;
       }
       orders.sort((a, b) => b.createdTime - a.createdTime);
+      const prices = await fetchPricesFor(orders);
       const nProt  = orders.filter(isProtectiveOrder).length;
       const nEntry = orders.filter(o => !o.reduceOnly).length;
       const nExit  = orders.length - nEntry - nProt;
       await sendTelegram(
         `⏳ <b>Ordens pendentes — Bot v3</b> (${orders.length})\n` +
         `📥 abertura: ${nEntry}${nExit ? ` | 📤 fecho: ${nExit}` : ""}${nProt ? ` | 🛡 proteção: ${nProt}` : ""}\n\n` +
-        orders.map(describePendingOrder).join("\n\n") +
+        orders.map(o => describePendingOrder(o, prices)).join("\n\n") +
         (nProt ? `\n\n🛡 <i>As ordens de proteção são os stops das posições abertas — o /closewait3 não lhes toca.</i>` : "") +
         `\n\n<i>Cancelar: /closewait3${filterSym ? ` ${filterSym}` : ""}</i>`,
         chatId
@@ -755,9 +780,10 @@ async function handleTelegramCommand(text, chatId) {
       // Primeiro passo: mostrar o que vai ser cancelado e pedir confirmação
       if (!confirmed) {
         const suffix = `${filterSym ? ` ${filterSym}` : ""}${inclProt ? " all" : ""}`;
+        const prices = await fetchPricesFor(orders);
         await sendTelegramKeyboard(
           `⚠️ <b>Cancelar ${orders.length} ordem(ns) pendente(s)${filterSym ? ` de ${filterSym}` : ""}?</b>\n\n` +
-          orders.map(describePendingOrder).join("\n\n") +
+          orders.map(o => describePendingOrder(o, prices)).join("\n\n") +
           `\n\n<i>As posições ABERTAS não são afetadas — só ordens por executar.</i>` +
           (protective.length && !inclProt
             ? `\n🛡 <b>${protective.length} ordem(ns) de proteção NÃO serão canceladas</b> (stops de posições abertas). Para as incluir: <code>/closewait3${filterSym ? ` ${filterSym}` : ""} all</code>`
