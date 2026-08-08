@@ -356,6 +356,57 @@ async function getAllOpenPositions() {
   return out;
 }
 
+// Pending (still unfilled) orders across all symbols: resting limit entries — e.g. the
+// /commit3 re-entry orders — and untriggered conditional orders (SL/TP/trailing).
+async function getPendingOrders() {
+  try {
+    const data = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", {});
+    const orders = data?.orders || (Array.isArray(data) ? data : []);
+    return orders.map(o => ({
+      symbol:       fromBingxSymbol(o.symbol),
+      orderId:      o.orderId,
+      side:         o.side === "BUY" ? "Buy" : "Sell",
+      orderType:    o.type,
+      qty:          o.origQty,
+      price:        parseFloat(o.price     || "0"),
+      triggerPrice: parseFloat(o.stopPrice || "0"),
+      stopLoss:     o.stopLoss?.stopPrice   ? String(o.stopLoss.stopPrice)   : "",
+      takeProfit:   o.takeProfit?.stopPrice ? String(o.takeProfit.stopPrice) : "",
+      status:       o.status,
+      createdTime:  parseInt(o.time || o.updateTime || "0"),
+      // BingX marca as ordens de fecho por reduceOnly/closePosition; os tipos
+      // condicionais (STOP/TAKE_PROFIT/TRAILING) são sempre protecções da posição.
+      reduceOnly:   !!o.reduceOnly || String(o.closePosition) === "true" ||
+                    /STOP|TAKE_PROFIT|TRAILING/i.test(o.type || ""),
+    }));
+  } catch (e) {
+    console.log(`  ⚠️  getPendingOrders: ${e.message}`);
+    return [];
+  }
+}
+
+// A reduce-only conditional order is NOT a queued trade — it is the stop/target
+// protecting an open position. Cancelling one silently leaves that position naked,
+// so these are marked apart and excluded from /closewait3 unless explicitly asked for.
+function isProtectiveOrder(o) {
+  return o.reduceOnly && (o.triggerPrice > 0 || /untriggered/i.test(o.status || ""));
+}
+
+// Human-readable line for a pending order, flagging protective stops and the ones the
+// bot itself is tracking as /commit3 re-entries (so a manual cancel is an informed decision).
+function describePendingOrder(o) {
+  const isReentry = Object.values(symbolState).some(s => s.reentry?.orderId === o.orderId);
+  const prot      = isProtectiveOrder(o);
+  const ageMin    = o.createdTime ? Math.round((Date.now() - o.createdTime) / 60000) : null;
+  const level     = o.triggerPrice > 0 ? o.triggerPrice : o.price;
+  const dir       = prot ? "PROTEÇÃO da posição" : o.reduceOnly ? "fecho" : "abertura";
+  return `${prot ? "🛡" : o.reduceOnly ? "📤" : "📥"} <b>${o.symbol}</b> ${o.side} ${o.orderType} (${dir})\n` +
+         `   qty=${o.qty} @ $${formatPrice(level)}${o.triggerPrice > 0 ? " (gatilho)" : ""}` +
+         `${o.stopLoss ? ` | SL $${o.stopLoss}` : ""}${o.takeProfit ? ` | TP $${o.takeProfit}` : ""}\n` +
+         `   ${o.status}${ageMin !== null ? ` · há ${ageMin < 60 ? `${ageMin}min` : `${(ageMin / 60).toFixed(1)}h`}` : ""}` +
+         `${isReentry ? " · 🔁 re-entrada do bot" : ""}`;
+}
+
 // ─── Telegram Command Polling ─────────────────────────────────────────────────
 // Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
 // Supported commands:
@@ -638,6 +689,115 @@ async function handleTelegramCommand(text, chatId) {
       );
     } catch (e) {
       await sendTelegram(`❌ Erro ao listar posições: ${e.message}`, chatId);
+    }
+    return;
+  }
+  // /wait3 [SYMBOL] — ordens pendentes (por encher/disparar), opcionalmente de um par
+  if (cmd === "/wait3") {
+    try {
+      const filterSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+      let orders = await getPendingOrders();
+      if (filterSym) orders = orders.filter(o => o.symbol === filterSym);
+
+      if (orders.length === 0) {
+        await sendTelegram(`📭 <b>Bot v3</b> — Sem ordens pendentes${filterSym ? ` em ${filterSym}` : ""}`, chatId);
+        return;
+      }
+      orders.sort((a, b) => b.createdTime - a.createdTime);
+      const nProt  = orders.filter(isProtectiveOrder).length;
+      const nEntry = orders.filter(o => !o.reduceOnly).length;
+      const nExit  = orders.length - nEntry - nProt;
+      await sendTelegram(
+        `⏳ <b>Ordens pendentes — Bot v3</b> (${orders.length})\n` +
+        `📥 abertura: ${nEntry}${nExit ? ` | 📤 fecho: ${nExit}` : ""}${nProt ? ` | 🛡 proteção: ${nProt}` : ""}\n\n` +
+        orders.map(describePendingOrder).join("\n\n") +
+        (nProt ? `\n\n🛡 <i>As ordens de proteção são os stops das posições abertas — o /closewait3 não lhes toca.</i>` : "") +
+        `\n\n<i>Cancelar: /closewait3${filterSym ? ` ${filterSym}` : ""}</i>`,
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao listar ordens pendentes: ${e.message}`, chatId);
+    }
+    return;
+  }
+
+  // /closewait3 [SYMBOL] [confirmar] — cancela as ordens pendentes (todas ou de um par)
+  if (cmd === "/closewait3") {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(`📋 <b>Bot v3</b> — /closewait3 só funciona em modo LIVE (atual: paper)`, chatId);
+      return;
+    }
+    try {
+      // Sintaxe: /closewait3 [SYMBOL] [all] [confirmar]
+      //   "all" inclui as ordens de proteção (stops de posições abertas), que por
+      //   omissão são preservadas — cancelá-las deixaria a posição sem stop.
+      const parts     = (text || "").trim().split(/\s+/).slice(1).map(p => p.trim()).filter(Boolean);
+      const lower     = parts.map(p => p.toLowerCase());
+      const confirmed = lower.includes("confirmar");
+      const inclProt  = lower.includes("all");
+      const filterSym = (parts.find(p => !["confirmar", "all"].includes(p.toLowerCase())) || "").toUpperCase();
+
+      let orders = await getPendingOrders();
+      if (filterSym) orders = orders.filter(o => o.symbol === filterSym);
+
+      const protective = orders.filter(isProtectiveOrder);
+      if (!inclProt) orders = orders.filter(o => !isProtectiveOrder(o));
+
+      if (orders.length === 0) {
+        await sendTelegram(
+          `📭 <b>Bot v3</b> — Sem ordens pendentes para cancelar${filterSym ? ` em ${filterSym}` : ""}` +
+          (protective.length && !inclProt ? `\n\n🛡 ${protective.length} ordem(ns) de proteção preservada(s). Para as cancelar também: <code>/closewait3${filterSym ? ` ${filterSym}` : ""} all</code>` : ""),
+          chatId
+        );
+        return;
+      }
+
+      // Primeiro passo: mostrar o que vai ser cancelado e pedir confirmação
+      if (!confirmed) {
+        const suffix = `${filterSym ? ` ${filterSym}` : ""}${inclProt ? " all" : ""}`;
+        await sendTelegramKeyboard(
+          `⚠️ <b>Cancelar ${orders.length} ordem(ns) pendente(s)${filterSym ? ` de ${filterSym}` : ""}?</b>\n\n` +
+          orders.map(describePendingOrder).join("\n\n") +
+          `\n\n<i>As posições ABERTAS não são afetadas — só ordens por executar.</i>` +
+          (protective.length && !inclProt
+            ? `\n🛡 <b>${protective.length} ordem(ns) de proteção NÃO serão canceladas</b> (stops de posições abertas). Para as incluir: <code>/closewait3${filterSym ? ` ${filterSym}` : ""} all</code>`
+            : "") +
+          (inclProt && protective.length ? `\n\n🚨 <b>ATENÇÃO: inclui ${protective.length} stop(s) de proteção — as posições ficam SEM stop.</b>` : ""),
+          [[`/closewait3${suffix} confirmar`], ["❌ Cancelar"]],
+          chatId
+        );
+        return;
+      }
+
+      // Segundo passo: cancelar uma a uma (só as que foram listadas, em vez de um
+      // cancel-all cego que poderia apanhar ordens criadas entretanto)
+      let ok = 0;
+      const failed = [];
+      for (const o of orders) {
+        try {
+          const r = await cancelOrder(o.symbol, o.orderId);
+          if (r?.retCode === 0) ok++; else failed.push(`${o.symbol}: ${r?.retMsg || "erro"}`);
+        } catch (e) {
+          failed.push(`${o.symbol}: ${e.message}`);
+        }
+        // Se era uma re-entrada vigiada pelo bot, limpar o estado para o poller não
+        // ficar a consultar uma ordem que já não existe
+        for (const [sym, st] of Object.entries(symbolState)) {
+          if (st.reentry?.orderId === o.orderId) { delete st.reentry; console.log(`  ✖ ${sym}: watch de re-entrada removida (/closewait3)`); }
+        }
+      }
+      saveSymbolState();
+
+      console.log(`  ✖ /closewait3: ${ok}/${orders.length} ordens canceladas${filterSym ? ` (${filterSym})` : ""}`);
+      await sendTelegram(
+        `✖️ <b>Bot v3</b> — Ordens pendentes canceladas\n` +
+        `${ok} de ${orders.length}${filterSym ? ` em ${filterSym}` : ""}` +
+        (protective.length && !inclProt ? `\n🛡 ${protective.length} ordem(ns) de proteção preservada(s)` : "") +
+        (failed.length ? `\n\n⚠️ Falhas:\n${failed.join("\n")}` : ""),
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao cancelar ordens pendentes: ${e.message}`, chatId);
     }
     return;
   }
@@ -943,6 +1103,8 @@ async function startTelegramPolling() {
       { command: "pos3", description: "📈 Posições abertas" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
       { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
+      { command: "wait3", description: "⏳ Ordens pendentes (por executar)" },
+      { command: "closewait3", description: "✖️ Cancelar ordens pendentes (ou /closewait3 SYMBOL)" },
     ]}),
   }).catch(() => {});
 
