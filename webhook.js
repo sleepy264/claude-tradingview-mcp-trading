@@ -761,14 +761,14 @@ async function handleTelegramCommand(text, chatId) {
       return;
     }
     try {
-      // Sintaxe: /closewait2 [SYMBOL] [tudo] [confirmar]
-      //   "tudo" inclui as ordens de proteção (stops de posições abertas), que por
+      // Sintaxe: /closewait2 [SYMBOL] [all] [confirmar]
+      //   "all" inclui as ordens de proteção (stops de posições abertas), que por
       //   omissão são preservadas — cancelá-las deixaria a posição sem stop.
       const parts     = (text || "").trim().split(/\s+/).slice(1).map(p => p.trim()).filter(Boolean);
       const lower     = parts.map(p => p.toLowerCase());
       const confirmed = lower.includes("confirmar");
-      const inclProt  = lower.includes("tudo");
-      const filterSym = (parts.find(p => !["confirmar", "tudo"].includes(p.toLowerCase())) || "").toUpperCase();
+      const inclProt  = lower.includes("all");
+      const filterSym = (parts.find(p => !["confirmar", "all"].includes(p.toLowerCase())) || "").toUpperCase();
 
       let orders = await getPendingOrders();
       if (filterSym) orders = orders.filter(o => o.symbol === filterSym);
@@ -779,7 +779,7 @@ async function handleTelegramCommand(text, chatId) {
       if (orders.length === 0) {
         await sendTelegram(
           `📭 <b>Bot v2</b> — Sem ordens pendentes para cancelar${filterSym ? ` em ${filterSym}` : ""}` +
-          (protective.length && !inclProt ? `\n\n🛡 ${protective.length} ordem(ns) de proteção preservada(s). Para as cancelar também: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} tudo</code>` : ""),
+          (protective.length && !inclProt ? `\n\n🛡 ${protective.length} ordem(ns) de proteção preservada(s). Para as cancelar também: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} all</code>` : ""),
           chatId
         );
         return;
@@ -787,13 +787,13 @@ async function handleTelegramCommand(text, chatId) {
 
       // Primeiro passo: mostrar o que vai ser cancelado e pedir confirmação
       if (!confirmed) {
-        const suffix = `${filterSym ? ` ${filterSym}` : ""}${inclProt ? " tudo" : ""}`;
+        const suffix = `${filterSym ? ` ${filterSym}` : ""}${inclProt ? " all" : ""}`;
         await sendTelegramKeyboard(
           `⚠️ <b>Cancelar ${orders.length} ordem(ns) pendente(s)${filterSym ? ` de ${filterSym}` : ""}?</b>\n\n` +
           orders.map(describePendingOrder).join("\n\n") +
           `\n\n<i>As posições ABERTAS não são afetadas — só ordens por executar.</i>` +
           (protective.length && !inclProt
-            ? `\n🛡 <b>${protective.length} ordem(ns) de proteção NÃO serão canceladas</b> (stops de posições abertas). Para as incluir: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} tudo</code>`
+            ? `\n🛡 <b>${protective.length} ordem(ns) de proteção NÃO serão canceladas</b> (stops de posições abertas). Para as incluir: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} all</code>`
             : "") +
           (inclProt && protective.length ? `\n\n🚨 <b>ATENÇÃO: inclui ${protective.length} stop(s) de proteção — as posições ficam SEM stop.</b>` : ""),
           [[`/closewait2${suffix} confirmar`], ["❌ Cancelar"]],
