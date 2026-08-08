@@ -365,11 +365,76 @@ async function getAllOpenPositions() {
   return out;
 }
 
+// Pending (still unfilled) orders across all symbols: resting limit entries — e.g. the
+// /commit2 re-entry orders — and untriggered conditional orders. Bybit splits these by
+// orderFilter, so both are queried; results are de-duplicated by orderId.
+async function getPendingOrders() {
+  const seen = new Map();
+  for (const settleCoin of ["USDT", "USDC"]) {
+    for (const orderFilter of ["Order", "StopOrder"]) {
+      const timestamp  = (Date.now() - 1500).toString();
+      const recvWindow = "10000";
+      const params     = `category=linear&settleCoin=${settleCoin}&orderFilter=${orderFilter}&limit=50`;
+      const sig        = sign(timestamp, recvWindow, params);
+      try {
+        const res = await fetch(`${CONFIG.bybit.baseUrl}/v5/order/realtime?${params}`, {
+          headers: { "X-BAPI-API-KEY": CONFIG.bybit.apiKey, "X-BAPI-SIGN": sig, "X-BAPI-SIGN-TYPE": "2", "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recvWindow },
+        });
+        const data = await res.json();
+        if (data.retCode !== 0) continue;
+        for (const o of (data.result?.list || [])) {
+          if (seen.has(o.orderId)) continue;
+          seen.set(o.orderId, {
+            symbol:       o.symbol,
+            orderId:      o.orderId,
+            side:         o.side,
+            orderType:    o.orderType,
+            qty:          o.qty,
+            price:        parseFloat(o.price        || "0"),
+            triggerPrice: parseFloat(o.triggerPrice || "0"),
+            stopLoss:     o.stopLoss   || "",
+            takeProfit:   o.takeProfit || "",
+            status:       o.orderStatus,
+            createdTime:  parseInt(o.createdTime || "0"),
+            reduceOnly:   !!o.reduceOnly,
+          });
+        }
+      } catch (e) {
+        console.log(`  ⚠️  getPendingOrders (${settleCoin}/${orderFilter}): ${e.message}`);
+      }
+    }
+  }
+  return [...seen.values()];
+}
+
+// A reduce-only conditional order is NOT a queued trade — it is the stop/target
+// protecting an open position. Cancelling one silently leaves that position naked,
+// so these are marked apart and excluded from /closewait2 unless explicitly asked for.
+function isProtectiveOrder(o) {
+  return o.reduceOnly && (o.triggerPrice > 0 || /untriggered/i.test(o.status || ""));
+}
+
+// Human-readable line for a pending order, flagging protective stops and the ones the
+// bot itself is tracking as /commit2 re-entries (so a manual cancel is an informed decision).
+function describePendingOrder(o) {
+  const isReentry = Object.values(symbolState).some(s => s.reentry?.orderId === o.orderId);
+  const prot      = isProtectiveOrder(o);
+  const ageMin    = o.createdTime ? Math.round((Date.now() - o.createdTime) / 60000) : null;
+  const level     = o.triggerPrice > 0 ? o.triggerPrice : o.price;
+  const dir       = prot ? "PROTEÇÃO da posição" : o.reduceOnly ? "fecho" : "abertura";
+  return `${prot ? "🛡" : o.reduceOnly ? "📤" : "📥"} <b>${o.symbol}</b> ${o.side} ${o.orderType} (${dir})\n` +
+         `   qty=${o.qty} @ $${formatPrice(level)}${o.triggerPrice > 0 ? " (gatilho)" : ""}` +
+         `${o.stopLoss ? ` | SL $${o.stopLoss}` : ""}${o.takeProfit ? ` | TP $${o.takeProfit}` : ""}\n` +
+         `   ${o.status}${ageMin !== null ? ` · há ${ageMin < 60 ? `${ageMin}min` : `${(ageMin / 60).toFixed(1)}h`}` : ""}` +
+         `${isReentry ? " · 🔁 re-entrada do bot" : ""}`;
+}
+
 // ─── Telegram Command Polling ─────────────────────────────────────────────────
 // Polls getUpdates in a loop so the bot can respond to commands sent in the chat.
 // Supported commands:
 //   /pnl2  — daily closed PnL (total + per symbol)
 //   /pos2  — open positions summary
+//   /wait2 — pending (unfilled) orders | /closewait2 — cancel them
 
 // Fetch all closed-pnl records in [startTime, endTime], chunked into ≤6-day windows
 // (Bybit limits closed-pnl queries to ~7-day ranges) with cursor pagination per chunk.
@@ -656,6 +721,116 @@ async function handleTelegramCommand(text, chatId) {
       );
     } catch (e) {
       await sendTelegram(`❌ Erro ao listar posições: ${e.message}`, chatId);
+    }
+    return;
+  }
+
+  // /wait2 [SYMBOL] — ordens pendentes (por encher/disparar), opcionalmente de um par
+  if (cmd === "/wait2") {
+    try {
+      const filterSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+      let orders = await getPendingOrders();
+      if (filterSym) orders = orders.filter(o => o.symbol === filterSym);
+
+      if (orders.length === 0) {
+        await sendTelegram(`📭 <b>Bot v2</b> — Sem ordens pendentes${filterSym ? ` em ${filterSym}` : ""}`, chatId);
+        return;
+      }
+      orders.sort((a, b) => b.createdTime - a.createdTime);
+      const nProt  = orders.filter(isProtectiveOrder).length;
+      const nEntry = orders.filter(o => !o.reduceOnly).length;
+      const nExit  = orders.length - nEntry - nProt;
+      await sendTelegram(
+        `⏳ <b>Ordens pendentes — Bot v2</b> (${orders.length})\n` +
+        `📥 abertura: ${nEntry}${nExit ? ` | 📤 fecho: ${nExit}` : ""}${nProt ? ` | 🛡 proteção: ${nProt}` : ""}\n\n` +
+        orders.map(describePendingOrder).join("\n\n") +
+        (nProt ? `\n\n🛡 <i>As ordens de proteção são os stops das posições abertas — o /closewait2 não lhes toca.</i>` : "") +
+        `\n\n<i>Cancelar: /closewait2${filterSym ? ` ${filterSym}` : ""}</i>`,
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao listar ordens pendentes: ${e.message}`, chatId);
+    }
+    return;
+  }
+
+  // /closewait2 [SYMBOL] [confirmar] — cancela as ordens pendentes (todas ou de um par)
+  if (cmd === "/closewait2") {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(`📋 <b>Bot v2</b> — /closewait2 só funciona em modo LIVE (atual: paper)`, chatId);
+      return;
+    }
+    try {
+      // Sintaxe: /closewait2 [SYMBOL] [tudo] [confirmar]
+      //   "tudo" inclui as ordens de proteção (stops de posições abertas), que por
+      //   omissão são preservadas — cancelá-las deixaria a posição sem stop.
+      const parts     = (text || "").trim().split(/\s+/).slice(1).map(p => p.trim()).filter(Boolean);
+      const lower     = parts.map(p => p.toLowerCase());
+      const confirmed = lower.includes("confirmar");
+      const inclProt  = lower.includes("tudo");
+      const filterSym = (parts.find(p => !["confirmar", "tudo"].includes(p.toLowerCase())) || "").toUpperCase();
+
+      let orders = await getPendingOrders();
+      if (filterSym) orders = orders.filter(o => o.symbol === filterSym);
+
+      const protective = orders.filter(isProtectiveOrder);
+      if (!inclProt) orders = orders.filter(o => !isProtectiveOrder(o));
+
+      if (orders.length === 0) {
+        await sendTelegram(
+          `📭 <b>Bot v2</b> — Sem ordens pendentes para cancelar${filterSym ? ` em ${filterSym}` : ""}` +
+          (protective.length && !inclProt ? `\n\n🛡 ${protective.length} ordem(ns) de proteção preservada(s). Para as cancelar também: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} tudo</code>` : ""),
+          chatId
+        );
+        return;
+      }
+
+      // Primeiro passo: mostrar o que vai ser cancelado e pedir confirmação
+      if (!confirmed) {
+        const suffix = `${filterSym ? ` ${filterSym}` : ""}${inclProt ? " tudo" : ""}`;
+        await sendTelegramKeyboard(
+          `⚠️ <b>Cancelar ${orders.length} ordem(ns) pendente(s)${filterSym ? ` de ${filterSym}` : ""}?</b>\n\n` +
+          orders.map(describePendingOrder).join("\n\n") +
+          `\n\n<i>As posições ABERTAS não são afetadas — só ordens por executar.</i>` +
+          (protective.length && !inclProt
+            ? `\n🛡 <b>${protective.length} ordem(ns) de proteção NÃO serão canceladas</b> (stops de posições abertas). Para as incluir: <code>/closewait2${filterSym ? ` ${filterSym}` : ""} tudo</code>`
+            : "") +
+          (inclProt && protective.length ? `\n\n🚨 <b>ATENÇÃO: inclui ${protective.length} stop(s) de proteção — as posições ficam SEM stop.</b>` : ""),
+          [[`/closewait2${suffix} confirmar`], ["❌ Cancelar"]],
+          chatId
+        );
+        return;
+      }
+
+      // Segundo passo: cancelar uma a uma (só as que foram listadas, em vez de um
+      // cancel-all cego que poderia apanhar ordens criadas entretanto)
+      let ok = 0;
+      const failed = [];
+      for (const o of orders) {
+        try {
+          const r = await cancelOrder(o.symbol, o.orderId);
+          if (r?.retCode === 0) ok++; else failed.push(`${o.symbol}: ${r?.retMsg || "erro"}`);
+        } catch (e) {
+          failed.push(`${o.symbol}: ${e.message}`);
+        }
+        // Se era uma re-entrada vigiada pelo bot, limpar o estado para o poller não
+        // ficar a consultar uma ordem que já não existe
+        for (const [sym, st] of Object.entries(symbolState)) {
+          if (st.reentry?.orderId === o.orderId) { delete st.reentry; console.log(`  ✖ ${sym}: watch de re-entrada removida (/closewait2)`); }
+        }
+      }
+      saveSymbolState();
+
+      console.log(`  ✖ /closewait2: ${ok}/${orders.length} ordens canceladas${filterSym ? ` (${filterSym})` : ""}`);
+      await sendTelegram(
+        `✖️ <b>Bot v2</b> — Ordens pendentes canceladas\n` +
+        `${ok} de ${orders.length}${filterSym ? ` em ${filterSym}` : ""}` +
+        (protective.length && !inclProt ? `\n🛡 ${protective.length} ordem(ns) de proteção preservada(s)` : "") +
+        (failed.length ? `\n\n⚠️ Falhas:\n${failed.join("\n")}` : ""),
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao cancelar ordens pendentes: ${e.message}`, chatId);
     }
     return;
   }
@@ -961,6 +1136,8 @@ async function startTelegramPolling() {
       { command: "pos2", description: "📈 Posições abertas" },
       { command: "commit2", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit2 SYMBOL)" },
       { command: "close2", description: "✂️ Fechar posição (ou /close2 SYMBOL [qty] p/ parcial)" },
+      { command: "wait2", description: "⏳ Ordens pendentes (por executar)" },
+      { command: "closewait2", description: "✖️ Cancelar ordens pendentes (ou /closewait2 SYMBOL)" },
     ]}),
   }).catch(() => {});
 
