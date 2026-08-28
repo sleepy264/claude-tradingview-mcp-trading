@@ -439,26 +439,33 @@ function describePendingOrder(o, prices = {}) {
 
 // Fetch all realized-PnL records in [startTime, endTime], shaped like Bybit's closed-pnl
 // entries ({ symbol, closedPnl, updatedTime }) so the stats renderer stays unchanged.
-// Chunked in 30-day windows: unlike Bybit (~7-day cap), BingX accepts wide ranges — the
-// chunking exists only to stay well under the per-call record cap, so a year costs ~12
-// calls instead of ~61. A chunk that comes back full is flagged: it may be truncated.
-const INCOME_CHUNK_DAYS = 30;
+//
+// BingX accepts wide ranges in a SINGLE call (unlike Bybit's ~7-day cap): one request
+// covers a whole year. Splitting a year into 30-day windows tripped the endpoint's
+// frequency limit (code 100410) and blocked every PnL command for ~1 minute, so the
+// range is fetched in one call and only split if the response comes back full — the
+// one case where records could be silently truncated. Splits are spaced out.
 const INCOME_PAGE_LIMIT = 1000;
+const INCOME_SPLIT_DAYS = 30;
+const INCOME_SPLIT_GAP_MS = 400;
 
 async function fetchClosedPnlRange(startTime, endTime) {
+  // Errors propagate on purpose: reporting $0.00 because the fetch failed would be
+  // indistinguishable from a genuinely flat period.
+  const single = await fetchIncomeRange(startTime, endTime);
+  if (single.length < INCOME_PAGE_LIMIT) return single;
+
+  console.log(`  ℹ️  ${single.length} registos (página cheia) — a dividir o período para não truncar`);
   const records = [];
-  const CHUNK = INCOME_CHUNK_DAYS * 86_400_000;
+  const CHUNK = INCOME_SPLIT_DAYS * 86_400_000;
   for (let from = startTime; from < endTime; from += CHUNK) {
     const to = Math.min(from + CHUNK, endTime);
-    try {
-      const chunk = await fetchIncomeRange(from, to);
-      records.push(...chunk);
-      if (chunk.length >= INCOME_PAGE_LIMIT) {
-        console.log(`  ⚠️  Janela ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)} devolveu ${chunk.length} registos (limite) — o total pode estar incompleto`);
-      }
-    } catch (e) {
-      console.log(`  ⚠️  fetchClosedPnlRange chunk falhou: ${e.message}`);
+    const chunk = await fetchIncomeRange(from, to);
+    records.push(...chunk);
+    if (chunk.length >= INCOME_PAGE_LIMIT) {
+      console.log(`  ⚠️  Janela ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)} devolveu ${chunk.length} registos (limite) — pode estar incompleta`);
     }
+    if (from + CHUNK < endTime) await new Promise(r => setTimeout(r, INCOME_SPLIT_GAP_MS));
   }
   return records;
 }
@@ -1220,7 +1227,17 @@ async function bxRequest(method, path, params = {}) {
   const url = `${CONFIG.bingx.baseUrl}${path}?${encQs}&signature=${bxSignature(rawQs)}`;
   const res  = await fetch(url, { method, headers: { "X-BX-APIKEY": CONFIG.bingx.apiKey } });
   const data = await res.json();
-  if (data.code !== undefined && data.code !== 0) throw new Error(`BingX ${path}: ${data.msg || `code ${data.code}`}`);
+  if (data.code !== undefined && data.code !== 0) {
+    // 100410 = limite de frequência do endpoint. A mensagem traz o instante de
+    // desbloqueio em epoch-ms; traduzi-lo evita a mensagem críptica no Telegram.
+    if (data.code === 100410) {
+      const m  = /(\d{13})/.exec(data.msg || "");
+      const at = m ? parseInt(m[1]) : 0;
+      const s  = at ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) : null;
+      throw new Error(`limite de frequência da BingX atingido${s !== null ? ` — desbloqueia em ~${s}s` : ""}. Aguarda e tenta de novo.`);
+    }
+    throw new Error(`BingX ${path}: ${data.msg || `code ${data.code}`}`);
+  }
   return data.data;
 }
 
@@ -2051,11 +2068,22 @@ async function setBreakEvenStop(symbol, entryPrice) {
 // Only account movements (deposits/withdrawals/transfers) are excluded.
 const NON_PNL_INCOME = ["TRANSFER", "DEPOSIT", "WITHDRAW"];
 
+// Cache curto: os comandos de PnL são normalmente usados em sequência (/pnl3, /stats7,
+// /stats30) e pediriam períodos sobrepostos ao mesmo endpoint em segundos — foi assim
+// que se atingiu o limite de frequência da BingX. A chave arredonda o fim do intervalo
+// ao minuto, para pedidos "até agora" feitos de seguida partilharem a mesma entrada.
+const _incomeCache = new Map();
+const INCOME_CACHE_TTL = 60_000;
+
 async function fetchIncomeRange(startTime, endTime) {
+  const key = `${startTime}-${Math.floor(endTime / 60_000)}`;
+  const hit = _incomeCache.get(key);
+  if (hit && Date.now() - hit.at < INCOME_CACHE_TTL) return hit.data;
+
   const data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
-    startTime, endTime, limit: 1000,
+    startTime, endTime, limit: INCOME_PAGE_LIMIT,
   });
-  return (Array.isArray(data) ? data : [])
+  const out = (Array.isArray(data) ? data : [])
     .filter(r => !NON_PNL_INCOME.some(t => String(r.incomeType || "").toUpperCase().includes(t)))
     .map(r => ({
       symbol:      fromBingxSymbol(r.symbol),
@@ -2063,6 +2091,10 @@ async function fetchIncomeRange(startTime, endTime) {
       incomeType:  r.incomeType,
       updatedTime: String(r.time),
     }));
+
+  _incomeCache.set(key, { data: out, at: Date.now() });
+  if (_incomeCache.size > 50) _incomeCache.delete(_incomeCache.keys().next().value);
+  return out;
 }
 
 // Returns today's total realised PnL (negative = loss).
