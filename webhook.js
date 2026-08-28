@@ -437,16 +437,25 @@ function describePendingOrder(o, prices = {}) {
 //   /pnl3  — daily closed PnL (total + per symbol)
 //   /pos3  — open positions summary
 
-// Fetch all realized-PnL records in [startTime, endTime], chunked into ≤6-day windows
-// (income queries are range-limited) — records shaped like BingX's closed-pnl entries
-// ({ symbol, closedPnl, updatedTime }) so the stats renderer stays unchanged.
+// Fetch all realized-PnL records in [startTime, endTime], shaped like Bybit's closed-pnl
+// entries ({ symbol, closedPnl, updatedTime }) so the stats renderer stays unchanged.
+// Chunked in 30-day windows: unlike Bybit (~7-day cap), BingX accepts wide ranges — the
+// chunking exists only to stay well under the per-call record cap, so a year costs ~12
+// calls instead of ~61. A chunk that comes back full is flagged: it may be truncated.
+const INCOME_CHUNK_DAYS = 30;
+const INCOME_PAGE_LIMIT = 1000;
+
 async function fetchClosedPnlRange(startTime, endTime) {
   const records = [];
-  const CHUNK = 6 * 86_400_000;
+  const CHUNK = INCOME_CHUNK_DAYS * 86_400_000;
   for (let from = startTime; from < endTime; from += CHUNK) {
     const to = Math.min(from + CHUNK, endTime);
     try {
-      records.push(...await fetchIncomeRange(from, to));
+      const chunk = await fetchIncomeRange(from, to);
+      records.push(...chunk);
+      if (chunk.length >= INCOME_PAGE_LIMIT) {
+        console.log(`  ⚠️  Janela ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)} devolveu ${chunk.length} registos (limite) — o total pode estar incompleto`);
+      }
     } catch (e) {
       console.log(`  ⚠️  fetchClosedPnlRange chunk falhou: ${e.message}`);
     }
@@ -492,19 +501,28 @@ async function sendPnlStats(nDays, chatId, groupDays = 1) {
       total += pnl;
     }
 
+    // Períodos sem qualquer atividade ANTES do primeiro com dados são cortados: numa
+    // vista de um ano seriam várias linhas vazias antes de a conta sequer existir.
+    const firstActive = buckets.findIndex(b => b.trades > 0);
+    const shown  = firstActive > 0 ? buckets.slice(firstActive) : buckets;
+    const hidden = buckets.length - shown.length;
+
     // Bar chart: blocks scaled to the biggest bucket (🟩 gain / 🟥 loss / — no trades)
-    const maxAbs = Math.max(...buckets.map(b => Math.abs(b.pnl)), 0.01);
-    const lines = buckets.map(b => {
+    const maxAbs = Math.max(...shown.map(b => Math.abs(b.pnl)), 0.01);
+    const lines = shown.map(b => {
       const blocks = b.pnl === 0 ? 0 : Math.max(1, Math.round((Math.abs(b.pnl) / maxAbs) * 6));
       const bar    = b.trades === 0 && b.pnl === 0 ? "—" : (b.pnl >= 0 ? "🟩" : "🟥").repeat(blocks) || "·";
       return `${b.label} ${bar} ${b.pnl >= 0 ? "+" : ""}$${b.pnl.toFixed(2)}${b.trades > 0 ? ` (${b.trades})` : ""}`;
     });
 
-    const emoji = total >= 0 ? "🟢" : "🔴";
+    const period = groupDays === 1 ? "" : groupDays === 7 ? " <i>(por semana)</i>" : ` <i>(por ${groupDays} dias)</i>`;
+    const emoji  = total >= 0 ? "🟢" : "🔴";
+    const nTrades = buckets.reduce((s, b) => s + b.trades, 0);
     await sendTelegram(
-      `${emoji} <b>PnL últimos ${nDays} dias — Bot v3</b>${groupDays > 1 ? ` <i>(por semana)</i>` : ""}\n` +
-      `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>\n\n` +
-      lines.join("\n"),
+      `${emoji} <b>PnL últimos ${nDays} dias — Bot v3</b>${period}\n` +
+      `<b>Total: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}</b>${nTrades ? ` · ${nTrades} registos` : ""}\n\n` +
+      lines.join("\n") +
+      (hidden ? `\n\n<i>(${hidden} período(s) anteriores sem atividade omitidos)</i>` : ""),
       chatId
     );
   } catch (e) {
@@ -566,8 +584,14 @@ async function handleTelegramCommand(text, chatId) {
   }
 
   // /stats7 (por dia) e /stats30 (agregado por semana)
-  if (cmd === "/stats7" || cmd === "/stats30") {
-    await sendPnlStats(cmd === "/stats30" ? 30 : 7, chatId, cmd === "/stats30" ? 7 : 1);
+  // /stats7 (linha por dia) · /stats30 (por semana) · /stats365 (por mês)
+  if (cmd === "/stats7" || cmd === "/stats30" || cmd === "/stats365") {
+    const spec = { "/stats7": [7, 1], "/stats30": [30, 7], "/stats365": [365, 30] }[cmd];
+    if (cmd === "/stats365") {
+      // ~12 chamadas à API: avisar que demora, senão parece que o bot não respondeu
+      await sendTelegram(`⏳ A juntar 365 dias de histórico… (pode demorar alguns segundos)`, chatId);
+    }
+    await sendPnlStats(spec[0], chatId, spec[1]);
     return;
   }
 
@@ -837,6 +861,10 @@ async function handleTelegramCommand(text, chatId) {
 // SL/trailing and any pending re-entry are deliberately left untouched.
 async function closeSymbol(argSym, chatId, qty = null) {
   try {
+    if (isNonCryptoSymbol(argSym)) {
+      await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
+      return;
+    }
     const pos = await getOpenPosition(argSym);
     if (!pos) {
       await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
@@ -896,6 +924,10 @@ async function closeSymbol(argSym, chatId, qty = null) {
 // Used by /commit3 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
 async function commitSymbol(argSym, chatId, source = "/commit3") {
   try {
+    if (isNonCryptoSymbol(argSym)) {
+      await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
+      return;
+    }
     const pos = await getOpenPosition(argSym);
     if (!pos) {
       await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
@@ -1025,6 +1057,9 @@ async function checkAutoCommit() {
   try {
     const positions = await getAllOpenPositions();
     for (const p of positions) {
+      // Ativos não-cripto não aceitam ordens via API — não vale a pena tentar de
+      // minuto a minuto (encheria o Telegram de erros iguais)
+      if (isNonCryptoSymbol(p.symbol)) continue;
       let threshold, label;
       if (usePct) {
         const margin = p.leverage > 0 ? (p.size * p.avgPrice) / p.leverage : 0;
@@ -1126,6 +1161,7 @@ async function startTelegramPolling() {
       { command: "pnl3", description: "📊 PnL do dia" },
       { command: "stats7", description: "📈 PnL últimos 7 dias (gráfico)" },
       { command: "stats30", description: "📈 PnL últimos 30 dias (gráfico)" },
+      { command: "stats365", description: "📈 PnL últimos 365 dias (por mês)" },
       { command: "pos3", description: "📈 Posições abertas" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
       { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
@@ -1152,6 +1188,25 @@ function toBingxSymbol(sym) {
   return s;
 }
 function fromBingxSymbol(sym) { return String(sym || "").replace("-", ""); }
+
+// BingX lista ativos NÃO-CRIPTO (ações, forex, índices, commodities) com prefixos
+// NCSK/NCFX/NCSI/NCCO. A exchange REJEITA ordens nestes símbolos via OpenAPI quando a
+// conta está em modo one-way:
+//   "non-crypto symbol with one-way mode not support openapi and copy trade"
+// O bot assume one-way em todo o lado (positionSide=BOTH, reversões, reduceOnly), por
+// isso estes pares são bloqueados à entrada — com explicação — em vez de falharem com
+// um erro opaco da API a meio de uma operação.
+function isNonCryptoSymbol(symbol) {
+  return /^NC(SK|FX|SI|CO)/i.test(String(symbol || "").toUpperCase());
+}
+
+// Nome legível: fromBingxSymbol tira o hífen (NCSKIBMR2USD-USDT → NCSKIBMR2USDUSDT),
+// o que é ilegível nestes símbolos longos. Para mensagens, repõe a forma da exchange.
+function prettySymbol(symbol) {
+  return isNonCryptoSymbol(symbol) ? toBingxSymbol(symbol) : symbol;
+}
+
+const NON_CRYPTO_MSG = "a BingX não permite ordens em ativos não-cripto (ações/forex/índices) via API em modo one-way. Tens de operar este par na app da BingX.";
 
 function bxSignature(paramStr) {
   return crypto.createHmac("sha256", CONFIG.bingx.secretKey).update(paramStr).digest("hex");
@@ -2238,6 +2293,14 @@ async function handleWebhook(body) {
   const actionLower   = action.toLowerCase();
   const sym           = symbol || process.env.SYMBOL || "BTCUSDT";
   const effectiveLev  = leverage ? parseInt(leverage) : CONFIG.leverage;
+
+  // Ativos não-cripto (ações/forex/índices) não aceitam ordens via API em modo one-way —
+  // rejeitar já, em vez de falhar a meio com um erro opaco da exchange.
+  if (isNonCryptoSymbol(sym)) {
+    console.log(`  🚫 ${prettySymbol(sym)}: símbolo não-cripto — ordens via API bloqueadas pela BingX`);
+    await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(sym)}</b> — sinal ignorado\n${NON_CRYPTO_MSG}`);
+    return;
+  }
 
   // ── Time filter (buy/sell only — TP always passes through) ────────────────
   if (actionLower !== "tp" && CONFIG.tradeHoursStart !== null && CONFIG.tradeHoursEnd !== null) {
