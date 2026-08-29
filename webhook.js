@@ -936,6 +936,22 @@ async function commitSymbol(argSym, chatId, source = "/commit2") {
     }
     const sideAction = pos.side === "Buy" ? "buy" : "sell";
     const pnl        = pos.unrealizedPnl;
+
+    // /commit2 encaixa GANHOS. Numa posição em perda, fechar não "encaixa" nada:
+    // realiza o prejuízo e ainda arma uma re-entrada. Para sair de uma posição
+    // perdedora existe o /close2, que é explícito quanto ao que faz.
+    if (!(pnl > 0)) {
+      const msg = `PnL ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} — não há ganho para encaixar`;
+      console.log(`  ⏸ ${source} ${argSym}: ${msg}`);
+      await sendTelegram(
+        `⏸ <b>Bot v2 ${argSym}</b> — ${source} ignorado\n` +
+        `${msg}. O /commit2 só encaixa posições em lucro.\n` +
+        `Para fechar mesmo assim: <code>/close2 ${argSym}</code>`,
+        chatId
+      );
+      return;
+    }
+
     const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
     // Mirror protection presence: if the original position ran without SL / trailing
     // (deliberate user choice), the re-entry must not add them either. A configured TP
