@@ -1614,6 +1614,19 @@ async function checkTrailingReentries() {
             const broke = cur > 0 && (r.action === "buy" ? cur >= r.breakoutLevel : cur <= r.breakoutLevel);
             const hoursOk = CONFIG.tradeHoursStart === null || CONFIG.tradeHoursEnd === null ||
               isInTimeWindow(new Date().getUTCHours(), CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd);
+            // Uma re-entrada só faz sentido SEM posição aberta. Sem esta verificação o
+            // fallback entrava a mercado por cima de uma posição existente (foi o que
+            // aconteceu no BEATUSDT: 3455 às 10:18 + 1450 às 10:46 = averaging down
+            // numa posição a perder). O caminho dos watches em software já verificava.
+            const already = broke && hoursOk ? await getOpenPosition(sym) : null;
+            if (already) {
+              console.log(`  ✖ ${sym}: fallback cancelado — já existe posição ${already.side} aberta (qty=${already.size})`);
+              try { await cancelOrder(sym, r.orderId); } catch {}
+              delete state.reentry;
+              saveSymbolState();
+              continue;
+            }
+
             if (broke && hoursOk) {
               console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel)} sem dar pullback — a cancelar limite e entrar a mercado`);
               await cancelOrder(sym, r.orderId);
