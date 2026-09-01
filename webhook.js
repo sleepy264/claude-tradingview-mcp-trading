@@ -1606,6 +1606,21 @@ async function checkTrailingReentries() {
             continue;
           }
 
+          // Uma re-entrada só faz sentido SEM posição aberta. Se entretanto abriu uma
+          // posição por outra via (sinal do TradingView, entrada manual), a limite tem
+          // de sair do livro: a encher, somaria à posição existente — averaging down,
+          // exatamente o que aconteceu no BEATUSDT. Aplica-se enquanto a ordem espera;
+          // depois de encher (status Filled, acima) a posição É esta re-entrada.
+          const already = await getOpenPosition(sym);
+          if (already) {
+            console.log(`  ✖ ${sym}: já existe posição ${already.side} (qty=${already.size}) — a cancelar a ordem limite de re-entrada`);
+            try { await cancelOrder(sym, r.orderId); } catch {}
+            delete state.reentry;
+            saveSymbolState();
+            await sendTelegram(`✖️ <b>Bot v3 ${sym}</b> — ordem limite de re-entrada cancelada\nJá existe posição ${already.side} aberta (qty=${already.size}) — evitado reforço da posição.`);
+            continue;
+          }
+
           // Breakout fallback: price resumed the original direction without ever giving
           // the pullback — cancel the resting limit and enter at market (same qty/leverage)
           // so the continuation isn't lost. Respects the trading-hours window.
@@ -1614,19 +1629,6 @@ async function checkTrailingReentries() {
             const broke = cur > 0 && (r.action === "buy" ? cur >= r.breakoutLevel : cur <= r.breakoutLevel);
             const hoursOk = CONFIG.tradeHoursStart === null || CONFIG.tradeHoursEnd === null ||
               isInTimeWindow(new Date().getUTCHours(), CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd);
-            // Uma re-entrada só faz sentido SEM posição aberta. Sem esta verificação o
-            // fallback entrava a mercado por cima de uma posição existente (foi o que
-            // aconteceu no BEATUSDT: 3455 às 10:18 + 1450 às 10:46 = averaging down
-            // numa posição a perder). O caminho dos watches em software já verificava.
-            const already = broke && hoursOk ? await getOpenPosition(sym) : null;
-            if (already) {
-              console.log(`  ✖ ${sym}: fallback cancelado — já existe posição ${already.side} aberta (qty=${already.size})`);
-              try { await cancelOrder(sym, r.orderId); } catch {}
-              delete state.reentry;
-              saveSymbolState();
-              continue;
-            }
-
             if (broke && hoursOk) {
               console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel)} sem dar pullback — a cancelar limite e entrar a mercado`);
               await cancelOrder(sym, r.orderId);
