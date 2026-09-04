@@ -872,6 +872,11 @@ async function closeSymbol(argSym, chatId, qty = null) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
       return;
     }
+    const tradable = await checkSymbolTradable(argSym, "close");
+    if (!tradable.ok) {
+      await sendTelegram(`🚫 <b>Bot v3 ${argSym}</b> — ${tradable.reason}.\nSe tens posição aberta, terás de a gerir na app da BingX.`, chatId);
+      return;
+    }
     const pos = await getOpenPosition(argSym);
     if (!pos) {
       await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
@@ -933,6 +938,11 @@ async function commitSymbol(argSym, chatId, source = "/commit3") {
   try {
     if (isNonCryptoSymbol(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
+      return;
+    }
+    const tradable = await checkSymbolTradable(argSym, "close");
+    if (!tradable.ok) {
+      await sendTelegram(`🚫 <b>Bot v3 ${argSym}</b> — ${tradable.reason}.\nSe tens posição aberta, terás de a gerir na app da BingX.`, chatId);
       return;
     }
     const pos = await getOpenPosition(argSym);
@@ -1203,14 +1213,32 @@ async function startTelegramPolling() {
 // Symbols use a dash (BTC-USDT); TradingView/state keep the dashless form (BTCUSDT),
 // converted at the API boundary only.
 
+// O MESMO ativo pode ter nomes diferentes nas duas exchanges: o que o TradingView/Bybit
+// chama LITUSDT é LIGHTER-USDT na BingX. Sem tradução, o sinal falhava com
+// "LIT-USDT is offline currently". SYMBOL_ALIASES mapeia os casos conhecidos:
+//   SYMBOL_ALIASES=LITUSDT:LIGHTER-USDT,OUTRO:OUTRO-USDT
+// A tradução é feita só na fronteira da API; o estado e as mensagens continuam a usar o
+// nome que o TradingView envia, para os dois lados falarem a mesma língua.
+const SYMBOL_ALIAS = new Map();   // TradingView → BingX
+const SYMBOL_ALIAS_REV = new Map(); // BingX → TradingView
+for (const pair of (process.env.SYMBOL_ALIASES || "LITUSDT:LIGHTER-USDT").split(",")) {
+  const [tv, bx] = pair.split(":").map(x => (x || "").trim().toUpperCase());
+  if (tv && bx) { SYMBOL_ALIAS.set(tv, bx); SYMBOL_ALIAS_REV.set(bx, tv); }
+}
+
 function toBingxSymbol(sym) {
   const s = String(sym || "").toUpperCase();
+  const alias = SYMBOL_ALIAS.get(s);
+  if (alias) return alias;
   if (s.includes("-")) return s;
   if (s.endsWith("USDT")) return s.slice(0, -4) + "-USDT";
   if (s.endsWith("USDC")) return s.slice(0, -4) + "-USDC";
   return s;
 }
-function fromBingxSymbol(sym) { return String(sym || "").replace("-", ""); }
+function fromBingxSymbol(sym) {
+  const s = String(sym || "").toUpperCase();
+  return SYMBOL_ALIAS_REV.get(s) || s.replace("-", "");
+}
 
 // BingX lista ativos NÃO-CRIPTO (ações, forex, índices, commodities) com prefixos
 // NCSK/NCFX/NCSI/NCCO. A exchange REJEITA ordens nestes símbolos via OpenAPI quando a
@@ -1230,6 +1258,27 @@ function prettySymbol(symbol) {
 }
 
 const NON_CRYPTO_MSG = "a BingX não permite ordens em ativos não-cripto (ações/forex/índices) via API em modo one-way. Tens de operar este par na app da BingX.";
+
+// Nem todos os pares da Bybit/TradingView existem na BingX (ex.: LITUSDT não existe lá),
+// e ~264 dos 1167 contratos estão listados mas FECHADOS à API (apiStateOpen=false).
+// Validar contra a lista de contratos (em cache) evita gastar chamadas e devolve uma
+// razão legível em vez do erro cru da exchange.
+//   action: "open" para entradas, "close" para fechos (a BingX distingue os dois estados)
+async function checkSymbolTradable(symbol, action = "open") {
+  const bx = toBingxSymbol(symbol);
+  let inst;
+  try {
+    inst = (await getContracts()).find(c => c.symbol === bx);
+  } catch {
+    return { ok: true }; // lista indisponível → não bloquear; a exchange que decida
+  }
+  if (!inst) return { ok: false, reason: `o par não existe na BingX (${bx})` };
+  const state = action === "close" ? inst.apiStateClose : inst.apiStateOpen;
+  if (String(state) !== "true") {
+    return { ok: false, reason: `o par está offline para ${action === "close" ? "fechos" : "aberturas"} via API na BingX` };
+  }
+  return { ok: true };
+}
 
 function bxSignature(paramStr) {
   return crypto.createHmac("sha256", CONFIG.bingx.secretKey).update(paramStr).digest("hex");
@@ -2362,6 +2411,14 @@ async function handleWebhook(body) {
   if (isNonCryptoSymbol(sym)) {
     console.log(`  🚫 ${prettySymbol(sym)}: símbolo não-cripto — ordens via API bloqueadas pela BingX`);
     await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(sym)}</b> — sinal ignorado\n${NON_CRYPTO_MSG}`);
+    return;
+  }
+
+  // O par existe e está aberto à API? (um TP fecha, os restantes abrem posição)
+  const tradable = await checkSymbolTradable(sym, actionLower === "tp" ? "close" : "open");
+  if (!tradable.ok) {
+    console.log(`  🚫 ${sym}: ${tradable.reason} — sinal ignorado`);
+    await sendTelegram(`🚫 <b>Bot v3 ${sym}</b> — sinal ignorado\n${tradable.reason}.\nVerifica o par no TradingView: a BingX não lista todos os pares da Bybit.`);
     return;
   }
 
