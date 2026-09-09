@@ -1315,14 +1315,41 @@ async function bxPublic(path, params = {}) {
   return data.data;
 }
 
-// One-way position mode (positionSide=BOTH on every order) — set once at startup.
-async function setOneWayMode() {
+// Modo de posição da conta. O bot NÃO o força: a conta pode precisar de estar em hedge
+// (dualSidePosition=true) — é o que a BingX exige para os ativos não-cripto — e forçar
+// one-way no arranque revertia essa escolha a cada redeploy. Em vez disso, deteta-se o
+// modo e adaptam-se as ordens.
+//   one-way → positionSide=BOTH e reduceOnly nos fechos
+//   hedge   → positionSide=LONG/SHORT; fecha-se enviando o lado oposto NO MESMO
+//             positionSide (reduceOnly não se aplica)
+let POSITION_MODE = "oneway"; // "oneway" | "hedge"
+
+async function detectPositionMode() {
   try {
-    await bxRequest("POST", "/openApi/swap/v1/positionSide/dual", { dualSidePosition: "false" });
-    console.log("✅ BingX em modo one-way (posição única por símbolo)");
+    const d = await bxRequest("GET", "/openApi/swap/v1/positionSide/dual", {});
+    POSITION_MODE = String(d?.dualSidePosition) === "true" ? "hedge" : "oneway";
+    console.log(`⚖️  Modo de posição BingX: ${POSITION_MODE === "hedge" ? "HEDGE (LONG/SHORT)" : "ONE-WAY (BOTH)"}`);
   } catch (e) {
-    console.log(`⚠️  Definir modo one-way falhou (pode já estar ativo): ${e.message}`);
+    console.log(`⚠️  Não foi possível ler o modo de posição (${e.message}) — a assumir ${POSITION_MODE}`);
   }
+  return POSITION_MODE;
+}
+
+// positionSide correto para uma ordem.
+//   abertura: LONG para compras, SHORT para vendas
+//   fecho:    o lado da POSIÇÃO a fechar (não o lado da ordem) — fechar um long é
+//             SELL sobre positionSide=LONG
+function psideOpen(action) {
+  if (POSITION_MODE !== "hedge") return "BOTH";
+  return /^b/i.test(String(action)) ? "LONG" : "SHORT";  // buy/Buy/BUY → LONG
+}
+function psideClose(positionSide) {
+  if (POSITION_MODE !== "hedge") return "BOTH";
+  return positionSide === "Sell" ? "SHORT" : "LONG";
+}
+// reduceOnly só é aceite em one-way; em hedge o fecho é implícito no positionSide.
+function reduceOnlyFlag() {
+  return POSITION_MODE === "hedge" ? {} : { reduceOnly: "true" };
 }
 
 async function setLeverage(symbol, lev) {
@@ -1696,7 +1723,7 @@ async function checkTrailingReentries() {
                 const tpOk = r.tpPrice > 0 && (r.action === "buy" ? r.tpPrice > cur : r.tpPrice < cur);
                 const takeProfit = tpOk ? roundToTick(r.tpPrice, tickSize) : null;
                 const mktParams = {
-                  symbol: toBingxSymbol(sym), side: side.toUpperCase(), positionSide: "BOTH",
+                  symbol: toBingxSymbol(sym), side: side.toUpperCase(), positionSide: psideOpen(r.action),
                   type: "MARKET", quantity: String(r.qty),
                 };
                 if (stopLoss)   mktParams.stopLoss   = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(stopLoss), workingType: "CONTRACT_PRICE" });
@@ -1872,7 +1899,7 @@ async function placeReentryLimit(symbol, action, limitPrice, lev, atr, qtyOverri
   }
   // BingX: SL/TP anexados como objetos JSON no próprio pedido de ordem
   const params = {
-    symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+    symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: psideOpen(action),
     type: "LIMIT", price: priceStr, quantity: qty, timeInForce: "GTC",
   };
   if (slPrice) params.stopLoss   = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(slPrice), workingType: "CONTRACT_PRICE" });
@@ -1988,7 +2015,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
       let limitOrderId = null;
       try {
         const d1 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-          symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+          symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: psideOpen(action),
           type: "LIMIT", price: limitPrice, quantity, timeInForce: "GTC", stopLoss: slParam,
         });
         limitOrderId = d1?.order?.orderId ?? d1?.orderId;
@@ -2026,7 +2053,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   // ── Market order (fallback ou direto se chase limit desativado) ───────────
   if (!orderId) {
     const d2 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-      symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: "BOTH",
+      symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: psideOpen(action),
       type: "MARKET", quantity, stopLoss: slParam,
     });
     orderId  = d2?.order?.orderId ?? d2?.orderId;
@@ -2072,8 +2099,18 @@ async function getProtectionOrders(symbol) {
 
 async function getOpenPosition(symbol) {
   const data = await bxRequest("GET", "/openApi/swap/v2/user/positions", { symbol: toBingxSymbol(symbol) });
-  const position = (Array.isArray(data) ? data : []).find(p => Math.abs(parseFloat(p.positionAmt || "0")) > 0);
-  if (!position) return null;
+  const open = (Array.isArray(data) ? data : []).filter(p => Math.abs(parseFloat(p.positionAmt || "0")) > 0);
+  if (open.length === 0) return null;
+  // Em hedge mode o mesmo par pode ter LONG e SHORT em simultâneo, mas o bot raciocina
+  // sobre UMA posição por símbolo (reversões, commit, trailing). Escolhe-se a de maior
+  // valor nocional — a que domina a exposição — e avisa-se, porque a outra fica fora
+  // da gestão automática.
+  const position = open.length === 1 ? open[0] : open.reduce((a, b) =>
+    Math.abs(parseFloat(b.positionAmt)) * parseFloat(b.avgPrice || 0) >
+    Math.abs(parseFloat(a.positionAmt)) * parseFloat(a.avgPrice || 0) ? b : a);
+  if (open.length > 1) {
+    console.log(`  ⚠️  ${symbol}: ${open.length} posições abertas (hedge) — o bot vai gerir a maior (${position.positionSide}); as outras ficam por tua conta`);
+  }
   const size = Math.abs(parseFloat(position.positionAmt));
   const prot = await getProtectionOrders(symbol);
   return {
@@ -2094,8 +2131,8 @@ async function getOpenPosition(symbol) {
 async function closePosition(symbol, position) {
   const closeSide = position.side === "Buy" ? "SELL" : "BUY";
   const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
-    type: "MARKET", quantity: String(position.size), reduceOnly: "true",
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
+    type: "MARKET", quantity: String(position.size), ...reduceOnlyFlag(),
   });
   return { orderId: data?.order?.orderId ?? data?.orderId };
 }
@@ -2114,8 +2151,8 @@ async function closePartialPosition(symbol, position, qty) {
 
   const closeSide = position.side === "Buy" ? "SELL" : "BUY";
   const data = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
-    type: "MARKET", quantity: closeQty, reduceOnly: "true",
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
+    type: "MARKET", quantity: closeQty, ...reduceOnlyFlag(),
   });
   return { orderId: data?.order?.orderId ?? data?.orderId, closedQty: closeQty, remainingQty: (position.size - parseFloat(closeQty)).toFixed(decimals) };
 }
@@ -2134,7 +2171,7 @@ async function setBreakEvenStop(symbol, entryPrice) {
   if (pos.slOrderId) await cancelOrder(symbol, pos.slOrderId);
   const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
   await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: "BOTH",
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(pos.side),
     type: "STOP_MARKET", stopPrice: slPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
   });
 }
@@ -2305,11 +2342,11 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
     const params = {
       symbol: toBingxSymbol(symbol),
       side: action === "buy" ? "SELL" : "BUY",
-      positionSide: "BOTH",
+      positionSide: psideClose(pos.side),
       type: "TRAILING_STOP_MARKET",
       quantity: String(pos.size),
       priceRate: priceRate.toFixed(4),
-      reduceOnly: "true",
+      ...reduceOnlyFlag(),
     };
     if (!alreadyActivated) params.activationPrice = roundToTick(activePriceNum, tickSize);
     await bxRequest("POST", "/openApi/swap/v2/trade/order", params);
@@ -2962,9 +2999,10 @@ app.listen(PORT, () => {
     console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}`);
   }
 
-  // BingX: garantir modo one-way (uma posição por símbolo, positionSide=BOTH).
-  // O bot assume esta semântica em todo o lado (reversões, reduceOnly, fechos parciais).
-  setOneWayMode();
+  // BingX: DETETAR o modo de posição (não o forçar). A conta pode estar em hedge —
+  // é o que a BingX exige para ativos não-cripto — e forçar one-way revertia essa
+  // escolha a cada redeploy. As ordens adaptam-se ao modo detetado.
+  detectPositionMode();
 
   // Start Telegram command polling
   startTelegramPolling();
