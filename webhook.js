@@ -868,7 +868,7 @@ async function handleTelegramCommand(text, chatId) {
 // SL/trailing and any pending re-entry are deliberately left untouched.
 async function closeSymbol(argSym, chatId, qty = null) {
   try {
-    if (isNonCryptoSymbol(argSym)) {
+    if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
       return;
     }
@@ -936,7 +936,7 @@ async function closeSymbol(argSym, chatId, qty = null) {
 // Used by /commit3 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
 async function commitSymbol(argSym, chatId, source = "/commit3") {
   try {
-    if (isNonCryptoSymbol(argSym)) {
+    if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
       return;
     }
@@ -1092,7 +1092,7 @@ async function checkAutoCommit() {
     for (const p of positions) {
       // Ativos não-cripto não aceitam ordens via API — não vale a pena tentar de
       // minuto a minuto (encheria o Telegram de erros iguais)
-      if (isNonCryptoSymbol(p.symbol)) continue;
+      if (nonCryptoBlocked(p.symbol)) continue;
       let threshold, label;
       if (usePct) {
         const margin = p.leverage > 0 ? (p.size * p.avgPrice) / p.leverage : 0;
@@ -1257,7 +1257,15 @@ function prettySymbol(symbol) {
   return isNonCryptoSymbol(symbol) ? toBingxSymbol(symbol) : symbol;
 }
 
-const NON_CRYPTO_MSG = "a BingX não permite ordens em ativos não-cripto (ações/forex/índices) via API em modo one-way. Tens de operar este par na app da BingX.";
+// A recusa da BingX é específica do modo one-way ("non-crypto symbol with ONE-WAY MODE
+// not support openapi"), por isso o bloqueio só se aplica nesse modo. Em hedge, estes
+// pares são negociáveis via API e seguem o caminho normal — se a exchange ainda assim
+// recusar, o erro dela é reportado como em qualquer outra ordem.
+function nonCryptoBlocked(symbol) {
+  return isNonCryptoSymbol(symbol) && POSITION_MODE !== "hedge";
+}
+
+const NON_CRYPTO_MSG = "a BingX não permite ordens em ativos não-cripto (ações/forex/índices) via API em modo ONE-WAY. Muda a conta para hedge mode na app da BingX, ou opera este par manualmente.";
 
 // Nem todos os pares da Bybit/TradingView existem na BingX (ex.: LITUSDT não existe lá),
 // e ~264 dos 1167 contratos estão listados mas FECHADOS à API (apiStateOpen=false).
@@ -2445,7 +2453,7 @@ async function handleWebhook(body) {
 
   // Ativos não-cripto (ações/forex/índices) não aceitam ordens via API em modo one-way —
   // rejeitar já, em vez de falhar a meio com um erro opaco da exchange.
-  if (isNonCryptoSymbol(sym)) {
+  if (nonCryptoBlocked(sym)) {
     console.log(`  🚫 ${prettySymbol(sym)}: símbolo não-cripto — ordens via API bloqueadas pela BingX`);
     await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(sym)}</b> — sinal ignorado\n${NON_CRYPTO_MSG}`);
     return;
