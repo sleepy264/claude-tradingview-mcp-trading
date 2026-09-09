@@ -634,10 +634,13 @@ async function handleTelegramCommand(text, chatId) {
       await sendTelegram(`📋 <b>Bot v3</b> — /commit3 só funciona em modo LIVE (atual: paper)`, chatId);
       return;
     }
-    const argSym = ((text || "").trim().split(/\s+/)[1] || "").toUpperCase();
+    // Sintaxe: /commit3 [SYMBOL] [long|short] — o lado desambigua em hedge mode
+    const cParts = (text || "").trim().split(/\s+/);
+    const argSym = (cParts[1] || "").toUpperCase();
+    const cSide  = cParts.slice(2).map(p => p.toLowerCase()).find(p => ["long", "short"].includes(p)) || null;
 
     if (argSym) {
-      await commitSymbol(argSym, chatId);
+      await commitSymbol(argSym, chatId, "/commit3", cSide);
       return;
     }
 
@@ -653,8 +656,12 @@ async function handleTelegramCommand(text, chatId) {
         return;
       }
 
-      const listText = winners.map(p => `• <b>${p.symbol}</b> ${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
-      const rows     = winners.map(p => [`/commit3 ${p.symbol}`]);
+      // Em hedge o mesmo par pode aparecer duas vezes (LONG e SHORT). Nesse caso o botão
+      // leva o lado, senão os dois botões seriam idênticos e não se saberia qual foi.
+      const dup = new Set(winners.filter((p, i, a) => a.findIndex(x => x.symbol === p.symbol) !== i).map(p => p.symbol));
+      const sideOf = p => p.side === "Buy" ? "long" : "short";
+      const listText = winners.map(p => `• <b>${p.symbol}</b> ${dup.has(p.symbol) ? `<b>${sideOf(p).toUpperCase()}</b> ` : ""}${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
+      const rows     = winners.map(p => [`/commit3 ${p.symbol}${dup.has(p.symbol) ? ` ${sideOf(p)}` : ""}`]);
       await sendTelegramKeyboard(
         `💰 <b>Encaixar ganho</b> — símbolos com PnL > $${CONFIG.commitMinGainUSD}:\n${listText}\n\nToca para encaixar 👇`,
         rows,
@@ -681,11 +688,14 @@ async function handleTelegramCommand(text, chatId) {
     //   /close3 BTCUSDT 10         → pede confirmação (fecho PARCIAL de 10 unidades)
     //   /close3 BTCUSDT confirmar  → executa o fecho total
     //   /close3 BTCUSDT 10 confirmar → executa o fecho parcial
+    //   /close3 BTCUSDT long       → escolhe o lado (hedge mode; sem isto, se houver
+    //                                LONG e SHORT no mesmo par o bot pergunta qual)
     const parts  = (text || "").trim().split(/\s+/);
     const argSym = (parts[1] || "").toUpperCase();
     const rest   = parts.slice(2).map(p => p.toLowerCase());
     const confirmed = rest.includes("confirmar");
-    const qtyArg    = rest.find(p => p !== "confirmar");
+    const sideArg   = rest.find(p => ["long", "short"].includes(p)) || null;
+    const qtyArg    = rest.find(p => !["confirmar", "long", "short"].includes(p));
     const qtyNum    = qtyArg !== undefined ? parseFloat(qtyArg.replace(",", ".")) : null;
 
     if (argSym) {
@@ -695,25 +705,24 @@ async function handleTelegramCommand(text, chatId) {
       }
       // Second step: only close when explicitly confirmed
       if (confirmed) {
-        await closeSymbol(argSym, chatId, qtyNum);
+        await closeSymbol(argSym, chatId, qtyNum, sideArg);
         return;
       }
       // First step: show the position and ask for confirmation. The "Cancelar" button
       // sends plain text (no leading /), which the command poller simply ignores.
       try {
-        const pos = await getOpenPosition(argSym);
-        if (!pos) {
-          await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
-          return;
-        }
+        // Em hedge, resolve (ou pergunta) qual das posições antes de confirmar
+        const pos = await resolvePositionOrAsk(argSym, sideArg, chatId, "/close3", "fechar", qtyNum > 0 ? ` ${qtyNum}` : "");
+        if (!pos) return;
+        const sideTag = sideArg ? ` ${sideArg}` : "";
         const partial = qtyNum > 0 && qtyNum < pos.size;
         if (qtyNum > pos.size) {
-          await sendTelegram(`⚠️ <b>${argSym}</b> — pediste ${qtyNum} mas a posição só tem ${pos.size}. Usa <code>/close3 ${argSym}</code> para fechar tudo.`, chatId);
+          await sendTelegram(`⚠️ <b>${argSym}</b> — pediste ${qtyNum} mas a posição só tem ${pos.size}. Usa <code>/close3 ${argSym}${sideTag}</code> para fechar tudo.`, chatId);
           return;
         }
-        const cmdConfirm = partial ? `/close3 ${argSym} ${qtyNum} confirmar` : `/close3 ${argSym} confirmar`;
+        const cmdConfirm = `/close3 ${argSym}${partial ? ` ${qtyNum}` : ""}${sideTag} confirmar`;
         await sendTelegramKeyboard(
-          `⚠️ <b>Confirmas ${partial ? `fechar ${qtyNum} de ${argSym}` : `fechar ${argSym}`}?</b>\n` +
+          `⚠️ <b>Confirmas ${partial ? `fechar ${qtyNum} de ${argSym}` : `fechar ${argSym}`}${sideArg ? ` (${sideArg.toUpperCase()})` : ""}?</b>\n` +
           `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
           `PnL atual: ${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}\n` +
           (partial
@@ -735,8 +744,12 @@ async function handleTelegramCommand(text, chatId) {
         await sendTelegram(`📭 <b>Bot v3</b> — Sem posições abertas para fechar`, chatId);
         return;
       }
-      const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
-      const rows     = positions.map(p => [`/close3 ${p.symbol}`]);
+      // Em hedge o mesmo par pode ter LONG e SHORT — o botão leva o lado nesse caso,
+      // senão os dois seriam idênticos.
+      const dupC   = new Set(positions.filter((p, i, a) => a.findIndex(x => x.symbol === p.symbol) !== i).map(p => p.symbol));
+      const sideOfC = p => p.side === "Buy" ? "long" : "short";
+      const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${dupC.has(p.symbol) ? `<b>${sideOfC(p).toUpperCase()}</b> ` : ""}${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
+      const rows     = positions.map(p => [`/close3 ${p.symbol}${dupC.has(p.symbol) ? ` ${sideOfC(p)}` : ""}`]);
       await sendTelegramKeyboard(
         `✂️ <b>Fechar posição</b> (sem re-entrada):\n${listText}\n\nToca para fechar 👇`,
         rows,
@@ -866,7 +879,7 @@ async function handleTelegramCommand(text, chatId) {
 // breakout auto-detector doesn't re-arm a watch for this closure.
 // qty > 0 closes only that many contracts: the position stays open, so the state,
 // SL/trailing and any pending re-entry are deliberately left untouched.
-async function closeSymbol(argSym, chatId, qty = null) {
+async function closeSymbol(argSym, chatId, qty = null, side = null) {
   try {
     if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
@@ -877,11 +890,8 @@ async function closeSymbol(argSym, chatId, qty = null) {
       await sendTelegram(`🚫 <b>Bot v3 ${argSym}</b> — ${tradable.reason}.\nSe tens posição aberta, terás de a gerir na app da BingX.`, chatId);
       return;
     }
-    const pos = await getOpenPosition(argSym);
-    if (!pos) {
-      await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para fechar`, chatId);
-      return;
-    }
+    const pos = await resolvePositionOrAsk(argSym, side, chatId, "/close3", "fechar", qty > 0 ? ` ${qty}` : "");
+    if (!pos) return;   // sem posição, lado inválido, ou pergunta enviada
     const pnl       = pos.unrealizedPnl;
     const exitPrice = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
     const partial   = qty > 0 && qty < pos.size;
@@ -931,10 +941,44 @@ async function closeSymbol(argSym, chatId, qty = null) {
   }
 }
 
+// Resolve QUAL posição um comando deve tratar. Em hedge o mesmo par pode ter LONG e
+// SHORT; em vez de adivinhar (o utilizador pode querer a outra), o bot pergunta e
+// oferece um botão por lado. Devolve a posição, ou null se já respondeu ao utilizador.
+//   cmd  — "/commit3" | "/close3" (para construir os botões)
+//   verb — texto para a mensagem ("encaixar", "fechar")
+async function resolvePositionOrAsk(symbol, side, chatId, cmd, verb, extraArgs = "") {
+  const open = await getOpenPositionsFor(symbol);
+  if (open.length === 0) {
+    await sendTelegram(`⚠️ <b>Bot v3 ${symbol}</b> — sem posição aberta para ${verb}`, chatId);
+    return null;
+  }
+  const want = normalizeSide(side);
+  if (want) {
+    const p = open.find(x => x.side === want);
+    if (!p) {
+      await sendTelegram(`⚠️ <b>Bot v3 ${symbol}</b> — não há posição ${want === "Buy" ? "LONG" : "SHORT"} aberta.\nAbertas: ${open.map(x => x.side === "Buy" ? "LONG" : "SHORT").join(", ")}`, chatId);
+      return null;
+    }
+    return p;
+  }
+  if (open.length === 1) return open[0];
+
+  // Ambíguo: duas posições no mesmo par e nenhum lado indicado
+  const lines = open.map(p =>
+    `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.side === "Buy" ? "LONG" : "SHORT"}</b> qty=${p.size} | entrada $${formatPrice(p.avgPrice)} | PnL ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}`).join("\n");
+  await sendTelegramKeyboard(
+    `⚠️ <b>${symbol}</b> tem ${open.length} posições abertas (hedge mode).\n${lines}\n\nQual queres ${verb}?`,
+    open.map(p => [`${cmd} ${symbol}${extraArgs} ${p.side === "Buy" ? "long" : "short"}`]).concat([["❌ Cancelar"]]),
+    chatId
+  );
+  return null;
+}
+
 // Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
 // re-entering once price retraces the pullback distance from the exit.
-// Used by /commit3 SYMBOL (manual) and checkAutoCommit (source label distinguishes them).
-async function commitSymbol(argSym, chatId, source = "/commit3") {
+// Used by /commit3 SYMBOL [long|short] (manual) and checkAutoCommit (which always passes
+// a side, since it iterates positions). `side` desambigua em hedge mode.
+async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
   try {
     if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
@@ -945,11 +989,8 @@ async function commitSymbol(argSym, chatId, source = "/commit3") {
       await sendTelegram(`🚫 <b>Bot v3 ${argSym}</b> — ${tradable.reason}.\nSe tens posição aberta, terás de a gerir na app da BingX.`, chatId);
       return;
     }
-    const pos = await getOpenPosition(argSym);
-    if (!pos) {
-      await sendTelegram(`⚠️ <b>Bot v3 ${argSym}</b> — sem posição aberta para encaixar`, chatId);
-      return;
-    }
+    const pos = await resolvePositionOrAsk(argSym, side, chatId, "/commit3", "encaixar");
+    if (!pos) return;   // sem posição, lado inválido, ou pergunta enviada
     const sideAction = pos.side === "Buy" ? "buy" : "sell";
     const pnl        = pos.unrealizedPnl;
 
@@ -1104,8 +1145,9 @@ async function checkAutoCommit() {
         label     = `$${threshold}`;
       }
       if (p.unrealizedPnl >= threshold) {
-        console.log(`\n💰 [Auto-commit] ${p.symbol}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ ${label} — a encaixar`);
-        await commitSymbol(p.symbol, null, "auto-commit");
+        console.log(`\n💰 [Auto-commit] ${p.symbol} ${p.side}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ ${label} — a encaixar`);
+        // passa o lado: em hedge, sem ele o commit podia acabar na posição errada
+        await commitSymbol(p.symbol, null, "auto-commit", p.side === "Buy" ? "long" : "short");
       }
     }
   } catch (e) {
@@ -1695,7 +1737,9 @@ async function checkTrailingReentries() {
           // de sair do livro: a encher, somaria à posição existente — averaging down,
           // exatamente o que aconteceu no BEATUSDT. Aplica-se enquanto a ordem espera;
           // depois de encher (status Filled, acima) a posição É esta re-entrada.
-          const already = await getOpenPosition(sym);
+          // Side-aware: em hedge, uma posição do lado OPOSTO não invalida esta
+          // re-entrada — só a do mesmo lado é que somaria à exposição.
+          const already = await getOpenPosition(sym, r.action === "buy" ? "long" : "short");
           if (already) {
             console.log(`  ✖ ${sym}: já existe posição ${already.side} (qty=${already.size}) — a cancelar a ordem limite de re-entrada`);
             try { await cancelOrder(sym, r.orderId); } catch {}
@@ -2085,10 +2129,16 @@ async function fetchCurrentPrice(symbol) {
 // Open conditional (SL/TP/trailing) orders attached to a symbol's position.
 // BingX keeps protections as separate reduce orders, not position attributes — this
 // reconstructs the BingX-style view (stopLoss/takeProfit/trailing on the position).
-async function getProtectionOrders(symbol) {
+// `side` ("Buy"/"Sell"): em hedge, cada lado tem as SUAS protecções — sem filtrar, o SL
+// do LONG apareceria também no SHORT.
+async function getProtectionOrders(symbol, side = null) {
   try {
     const data = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol: toBingxSymbol(symbol) });
-    const orders = data?.orders || [];
+    let orders = data?.orders || [];
+    if (side && POSITION_MODE === "hedge") {
+      const want = side === "Sell" ? "SHORT" : "LONG";
+      orders = orders.filter(o => String(o.positionSide).toUpperCase() === want);
+    }
     const sl    = orders.find(o => o.type === "STOP_MARKET" || o.type === "STOP");
     const tp    = orders.find(o => o.type === "TAKE_PROFIT_MARKET" || o.type === "TAKE_PROFIT");
     const trail = orders.find(o => o.type === "TRAILING_STOP_MARKET");
@@ -2105,35 +2155,51 @@ async function getProtectionOrders(symbol) {
   }
 }
 
-async function getOpenPosition(symbol) {
+// "long"/"short"/"buy"/"sell" (ou "Buy"/"Sell") → o lado normalizado que o bot usa.
+function normalizeSide(s) {
+  const v = String(s || "").toLowerCase();
+  if (v === "long"  || v === "buy")  return "Buy";
+  if (v === "short" || v === "sell") return "Sell";
+  return null;
+}
+
+// TODAS as posições abertas de um símbolo. Em hedge podem ser duas (LONG e SHORT).
+async function getOpenPositionsFor(symbol) {
   const data = await bxRequest("GET", "/openApi/swap/v2/user/positions", { symbol: toBingxSymbol(symbol) });
   const open = (Array.isArray(data) ? data : []).filter(p => Math.abs(parseFloat(p.positionAmt || "0")) > 0);
-  if (open.length === 0) return null;
-  // Em hedge mode o mesmo par pode ter LONG e SHORT em simultâneo, mas o bot raciocina
-  // sobre UMA posição por símbolo (reversões, commit, trailing). Escolhe-se a de maior
-  // valor nocional — a que domina a exposição — e avisa-se, porque a outra fica fora
-  // da gestão automática.
-  const position = open.length === 1 ? open[0] : open.reduce((a, b) =>
-    Math.abs(parseFloat(b.positionAmt)) * parseFloat(b.avgPrice || 0) >
-    Math.abs(parseFloat(a.positionAmt)) * parseFloat(a.avgPrice || 0) ? b : a);
-  if (open.length > 1) {
-    console.log(`  ⚠️  ${symbol}: ${open.length} posições abertas (hedge) — o bot vai gerir a maior (${position.positionSide}); as outras ficam por tua conta`);
+  const out = [];
+  for (const position of open) {
+    const side = position.positionSide === "SHORT" || parseFloat(position.positionAmt) < 0 ? "Sell" : "Buy";
+    const prot = await getProtectionOrders(symbol, side);
+    out.push({
+      side,
+      size:           Math.abs(parseFloat(position.positionAmt)),
+      stopLoss:       prot.slPrice,                                     // from the open STOP_MARKET order
+      avgPrice:       parseFloat(position.avgPrice        || "0"),
+      unrealizedPnl:  parseFloat(position.unrealizedProfit || position.unrealisedProfit || "0"),
+      leverage:       parseFloat(position.leverage        || "0"),      // so a re-entry can mirror the original leverage
+      trailingStop:   prot.trailActive,                                 // so a re-entry can mirror SL/trailing presence
+      takeProfit:     prot.tpPrice,                                     // so a re-entry can inherit the TP level
+      slOrderId:      prot.slOrderId,
+      tpOrderId:      prot.tpOrderId,
+      trailOrderId:   prot.trailOrderId,
+    });
   }
-  const size = Math.abs(parseFloat(position.positionAmt));
-  const prot = await getProtectionOrders(symbol);
-  return {
-    side:           position.positionSide === "SHORT" || parseFloat(position.positionAmt) < 0 ? "Sell" : "Buy",
-    size,
-    stopLoss:       prot.slPrice,                                     // from the open STOP_MARKET order
-    avgPrice:       parseFloat(position.avgPrice        || "0"),
-    unrealizedPnl:  parseFloat(position.unrealizedProfit || position.unrealisedProfit || "0"),
-    leverage:       parseFloat(position.leverage        || "0"),      // so a re-entry can mirror the original leverage
-    trailingStop:   prot.trailActive,                                 // so a re-entry can mirror SL/trailing presence
-    takeProfit:     prot.tpPrice,                                     // so a re-entry can inherit the TP level
-    slOrderId:      prot.slOrderId,
-    tpOrderId:      prot.tpOrderId,
-    trailOrderId:   prot.trailOrderId,
-  };
+  return out;
+}
+
+// Uma posição. Com `side` devolve exatamente a desse lado (o que os comandos usam em
+// hedge para não haver ambiguidade); sem `side` e havendo duas, devolve a de maior
+// valor nocional — os caminhos automáticos precisam de escolher alguma.
+async function getOpenPosition(symbol, side = null) {
+  const open = await getOpenPositionsFor(symbol);
+  if (open.length === 0) return null;
+  const want = normalizeSide(side);
+  if (want) return open.find(p => p.side === want) || null;
+  if (open.length === 1) return open[0];
+  const largest = open.reduce((a, b) => (b.size * b.avgPrice > a.size * a.avgPrice ? b : a));
+  console.log(`  ⚠️  ${symbol}: ${open.length} posições abertas (hedge) — sem lado indicado, a usar a maior (${largest.side})`);
+  return largest;
 }
 
 async function closePosition(symbol, position) {
