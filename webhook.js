@@ -1411,7 +1411,10 @@ async function setLeverage(symbol, lev) {
       lev = maxLeverage;
     }
   } catch {}
-  await bxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol: toBingxSymbol(symbol), side: "BOTH", leverage: lev });
+  // O campo `side` deste endpoint segue o modo da conta: "BOTH" em one-way,
+  // e apenas LONG/SHORT/ALL em hedge — "ALL" define os dois lados de uma vez.
+  const side = POSITION_MODE === "hedge" ? "ALL" : "BOTH";
+  await bxRequest("POST", "/openApi/swap/v2/trade/leverage", { symbol: toBingxSymbol(symbol), side, leverage: lev });
 }
 
 // Contract specs. BingX exposes precisions, not tick/step sizes — converted here.
