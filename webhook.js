@@ -159,7 +159,7 @@ const CONFIG = {
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
   // Auto-commit: automatically bank a position (same flow as /commit3 — close + pullback
-  // limit re-entry) once its unrealized gain reaches the threshold. Checked every 1 min.
+  // limit re-entry) once its unrealized gain reaches the threshold. Checked every POSITION_POLL_MS.
   // AUTO_COMMIT_GAIN_PCT: threshold as % of the position's own margin (ROI — e.g. 100 =
   //   gain equals the margin). Scales with position size and leverage, so manual positions
   //   and different leverages are treated proportionally. Takes precedence when > 0.
@@ -167,6 +167,10 @@ const CONFIG = {
   // Both 0 = disabled (manual /commit3 only).
   autoCommitGainPct:      parseFloat(process.env.AUTO_COMMIT_GAIN_PCT || "0"),
   autoCommitGainUSD:      parseFloat(process.env.AUTO_COMMIT_GAIN_USD || "0"),
+  // How often the open positions are polled for auto-commit and /target3 (ms). One
+  // getAllOpenPositions call per tick — cheap. Lower = tighter reaction to PnL spikes,
+  // but still polling: a spike that comes and goes between two ticks is not seen.
+  positionPollMs:         parseInt(process.env.POSITION_POLL_MS || "30000"),
   // BingX API keys without an IP whitelist expire every 3 months. Checked daily; a
   // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
   apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
@@ -210,6 +214,27 @@ function _getSymState(symbol) {
   if (!symbolState[symbol]) symbolState[symbol] = {};
   return symbolState[symbol];
 }
+
+// ─── /target3 — encaixe condicional por posição ──────────────────────────────
+// Um target é um /commit3 adiado: "quando o PnL desta posição chegar a X USDT, encaixa
+// e arma a re-entrada". Uso único — dispara uma vez e desaparece; a posição reaberta
+// não herda o target. Guardado à parte do symbolState e indexado por SYMBOL:SIDE, para
+// que em hedge o LONG e o SHORT do mesmo par tenham targets independentes.
+// Persistido em DATA_DIR para sobreviver a redeploys.
+const TARGETS_FILE = path.join(DATA_DIR, "targets.json");
+let targets = {}; // "BEATUSDT:LONG" → { usd, createdAt, chatId }
+
+function loadTargets() {
+  try { if (existsSync(TARGETS_FILE)) targets = JSON.parse(readFileSync(TARGETS_FILE, "utf8")); } catch { targets = {}; }
+}
+function saveTargets() {
+  try { writeFileSync(TARGETS_FILE, JSON.stringify(targets, null, 2)); } catch {}
+}
+function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/"short"
+  const s = normalizeSide(side);
+  return `${String(symbol).toUpperCase()}:${s === "Sell" ? "SHORT" : "LONG"}`;
+}
+function fmtUsd(v) { return `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`; }
 
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
@@ -613,7 +638,8 @@ async function handleTelegramCommand(text, chatId) {
 
       const lines = positions.map(p => {
         const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
-        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}`;
+        const t = targets[targetKey(p.symbol, p.side)];
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}${t ? ` | 🎯 ${fmtUsd(t.usd)}` : ""}`;
       });
 
       const totalPnl   = positions.reduce((s, p) => s + p.unrealizedPnl, 0);
@@ -760,6 +786,95 @@ async function handleTelegramCommand(text, chatId) {
     }
     return;
   }
+
+  // /target3 — encaixe condicional: faz o mesmo que /commit3, mas só quando o PnL da
+  // posição chegar a X USDT (verificado a cada POSITION_POLL_MS). Uso único.
+  //   /target3                      → targets ativos + botões por posição aberta
+  //   /target3 SYMBOL               → pede o valor (próxima mensagem)
+  //   /target3 SYMBOL 20            → define target de +20 USDT
+  //   /target3 SYMBOL short 20      → com lado (hedge, quando há LONG e SHORT)
+  //   /target3 SYMBOL off           → remove o target
+  if (cmd === "/target3") {
+    if (CONFIG.paperTrading) {
+      await sendTelegram(`📋 <b>Bot v3</b> — /target3 só funciona em modo LIVE (atual: paper)`, chatId);
+      return;
+    }
+    const parts  = (text || "").trim().split(/\s+/);
+    const argSym = (parts[1] || "").toUpperCase();
+    const rest   = parts.slice(2).map(p => p.toLowerCase());
+    const sideArg = rest.find(p => ["long", "short"].includes(p)) || null;
+    const off     = rest.includes("off");
+    const valArg  = rest.find(p => !["long", "short", "off"].includes(p));
+    const valNum  = valArg !== undefined ? parseFloat(valArg.replace(",", ".").replace(/[€$]/g, "")) : null;
+
+    if (argSym) {
+      if (valArg !== undefined && !(valNum > 0)) {
+        await sendTelegram(`⚠️ Valor inválido: <code>${valArg}</code>\nUso: <code>/target3 ${argSym} 20</code> (encaixa quando o PnL chegar a +$20)`, chatId);
+        return;
+      }
+      try {
+        // Em hedge, resolve (ou pergunta) qual das posições; o valor/off vai nos botões
+        const extra = off ? " off" : valNum > 0 ? ` ${valNum}` : "";
+        const pos = await resolvePositionOrAsk(argSym, sideArg, chatId, "/target3", "definir o target", extra);
+        if (!pos) return;
+        const key = targetKey(argSym, pos.side);
+
+        if (off) {
+          if (!targets[key]) { await sendTelegram(`ℹ️ <b>${argSym} ${pos.side === "Buy" ? "LONG" : "SHORT"}</b> — não tinha target`, chatId); return; }
+          delete targets[key]; saveTargets();
+          await sendTelegram(`🎯 <b>${argSym} ${pos.side === "Buy" ? "LONG" : "SHORT"}</b> — target removido`, chatId);
+          return;
+        }
+
+        if (!(valNum > 0)) {
+          // Sem valor: fica à espera da próxima mensagem deste chat
+          pendingInput.set(chatId, { kind: "target", symbol: argSym, side: pos.side, expires: Date.now() + PENDING_INPUT_TTL_MS });
+          await sendTelegramKeyboard(
+            `🎯 <b>${argSym} ${pos.side === "Buy" ? "LONG" : "SHORT"}</b> — PnL atual ${fmtUsd(pos.unrealizedPnl)}\n` +
+            `Envia o valor em USDT a partir do qual encaixo (ex: <code>20</code>)`,
+            [["❌ Cancelar"]], chatId
+          );
+          return;
+        }
+
+        await setTarget(argSym, pos, valNum, chatId);
+      } catch (e) {
+        await sendTelegram(`❌ <b>Bot v3 ${argSym}</b> — /target3 falhou\n${e.message}`, chatId);
+      }
+      return;
+    }
+
+    // Sem argumentos → targets ativos + um botão por posição aberta
+    try {
+      const positions = (await getAllOpenPositions()).sort((a, b) => b.unrealizedPnl - a.unrealizedPnl);
+      const byKey = new Map(positions.map(p => [targetKey(p.symbol, p.side), p]));
+      const active = Object.entries(targets).map(([k, t]) => {
+        const p = byKey.get(k);
+        return `• <b>${k.replace(":", " ")}</b> → ${fmtUsd(t.usd)}${p ? ` (PnL atual ${fmtUsd(p.unrealizedPnl)})` : " (posição fechada — será removido)"}`;
+      });
+      if (positions.length === 0) {
+        await sendTelegram(`📭 <b>Bot v3</b> — Sem posições abertas${active.length ? `\n\n🎯 Targets:\n${active.join("\n")}` : ""}`, chatId);
+        return;
+      }
+      const dupT   = new Set(positions.filter((p, i, a) => a.findIndex(x => x.symbol === p.symbol) !== i).map(p => p.symbol));
+      const sideOfT = p => p.side === "Buy" ? "long" : "short";
+      const listText = positions.map(p => {
+        const t = targets[targetKey(p.symbol, p.side)];
+        return `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${dupT.has(p.symbol) ? `<b>${sideOfT(p).toUpperCase()}</b> ` : ""}${p.side}: ${fmtUsd(p.unrealizedPnl)}${t ? ` | 🎯 ${fmtUsd(t.usd)}` : ""}`;
+      }).join("\n");
+      const rows = positions.map(p => [`/target3 ${p.symbol}${dupT.has(p.symbol) ? ` ${sideOfT(p)}` : ""}`]);
+      await sendTelegramKeyboard(
+        `🎯 <b>Target de encaixe</b> — fecha + re-entrada (como /commit3) quando o PnL chegar ao valor.\n` +
+        (active.length ? `Ativos:\n${active.join("\n")}\n\n` : "") +
+        `Posições:\n${listText}\n\nToca para definir 👇 (ou <code>/target3 SYMBOL 20</code> / <code>/target3 SYMBOL off</code>)`,
+        rows, chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao listar posições: ${e.message}`, chatId);
+    }
+    return;
+  }
+
   // /wait3 [SYMBOL] — ordens pendentes (por encher/disparar), opcionalmente de um par
   if (cmd === "/wait3") {
     try {
@@ -974,6 +1089,52 @@ async function resolvePositionOrAsk(symbol, side, chatId, cmd, verb, extraArgs =
   return null;
 }
 
+// Segundo passo do /target3 quando o valor não veio no comando: o bot fica à espera da
+// próxima mensagem do chat (texto sem "/"), que o poller encaminha para aqui.
+const PENDING_INPUT_TTL_MS = 2 * 60 * 1000;
+const pendingInput = new Map(); // chatId → { kind, symbol, side, expires }
+
+async function handlePendingInput(text, chatId) {
+  const pend = pendingInput.get(chatId);
+  if (!pend) return false;
+  pendingInput.delete(chatId);
+  if (Date.now() > pend.expires) { await sendTelegram(`⌛ Pedido de target expirou — repete <code>/target3 ${pend.symbol}</code>`, chatId); return true; }
+  if (/cancel/i.test(text) || text.startsWith("❌")) { await sendTelegram(`❌ Target cancelado`, chatId); return true; }
+  const v = parseFloat(text.replace(",", ".").replace(/[€$\s]/g, ""));
+  if (!(v > 0)) { await sendTelegram(`⚠️ Valor inválido: <code>${text}</code> — repete <code>/target3 ${pend.symbol} 20</code>`, chatId); return true; }
+  try {
+    const pos = await getOpenPosition(pend.symbol, pend.side === "Buy" ? "long" : "short");
+    if (!pos) { await sendTelegram(`⚠️ <b>${pend.symbol}</b> — a posição já não está aberta`, chatId); return true; }
+    await setTarget(pend.symbol, pos, v, chatId);
+  } catch (e) {
+    await sendTelegram(`❌ <b>Bot v3 ${pend.symbol}</b> — /target3 falhou\n${e.message}`, chatId);
+  }
+  return true;
+}
+
+// Regista o target. Não recusa quando o PnL já está acima do valor — o pedido é para
+// ser executado pelo poller, não neste instante; nesse caso dispara na próxima verificação.
+// Avisa quando o auto-commit apanharia a posição primeiro (target nunca chegaria a correr).
+async function setTarget(symbol, pos, usd, chatId) {
+  const key  = targetKey(symbol, pos.side);
+  const prev = targets[key];
+  targets[key] = { usd, createdAt: Date.now(), chatId };
+  saveTargets();
+  const ac = autoCommitThreshold(pos);
+  const sideTxt = pos.side === "Buy" ? "LONG" : "SHORT";
+  const pollS   = Math.round(CONFIG.positionPollMs / 1000);
+  console.log(`  🎯 Target ${key} = $${usd} (PnL atual $${pos.unrealizedPnl.toFixed(2)})`);
+  await sendTelegram(
+    `🎯 <b>Bot v3 ${symbol} ${sideTxt}</b> — target ${prev ? "atualizado" : "definido"}: <b>${fmtUsd(usd)}</b>\n` +
+    `PnL atual ${fmtUsd(pos.unrealizedPnl)} | qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
+    `Ao chegar: fecha + arma re-entrada (como /commit3). Uso único. Verifica a cada ${pollS}s.\n` +
+    (pos.unrealizedPnl >= usd ? `⚡ O PnL já está acima do target — dispara na próxima verificação (≤${pollS}s).\n` : "") +
+    (ac && usd >= ac.threshold ? `⚠️ O auto-commit dispara a $${ac.threshold.toFixed(2)} (${ac.label}) — apanha esta posição ANTES do target.\n` : "") +
+    `Remover: <code>/target3 ${symbol}${POSITION_MODE === "hedge" ? ` ${sideTxt.toLowerCase()}` : ""} off</code>`,
+    chatId
+  );
+}
+
 // Close a symbol's position (bank the gain) and arm a pullback re-entry — same direction,
 // re-entering once price retraces the pullback distance from the exit.
 // Used by /commit3 SYMBOL [long|short] (manual) and checkAutoCommit (which always passes
@@ -1125,33 +1286,64 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
 // flow as the manual /commit3 (close + pullback limit re-entry, volatility-filtered).
 // Threshold: % of the position's own margin (AUTO_COMMIT_GAIN_PCT, ROI-based — scales
 // with size/leverage) or fixed USD (AUTO_COMMIT_GAIN_USD) when PCT is 0.
+// Auto-commit threshold for a position (USD), or null when not configured / not computable.
+function autoCommitThreshold(p) {
+  if (CONFIG.autoCommitGainPct > 0) {
+    const margin = p.leverage > 0 ? (p.size * p.avgPrice) / p.leverage : 0;
+    if (!(margin > 0)) return null; // leverage unknown — can't compute ROI
+    return { threshold: margin * (CONFIG.autoCommitGainPct / 100),
+             label: `${CONFIG.autoCommitGainPct}% da margem $${margin.toFixed(2)} → $${(margin * CONFIG.autoCommitGainPct / 100).toFixed(2)}` };
+  }
+  if (CONFIG.autoCommitGainUSD > 0) return { threshold: CONFIG.autoCommitGainUSD, label: `$${CONFIG.autoCommitGainUSD}` };
+  return null;
+}
+const autoCommitEnabled = () => CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0;
+
+// One positions fetch per tick serves three things: /target3 triggers, auto-commit
+// thresholds and orphaned-target cleanup (a target whose position was closed by any
+// other path — SL, opposite signal, /close3 — is dropped and reported, never left to
+// fire on a future position that happens to reuse the same symbol/side).
 async function checkAutoCommit() {
-  const usePct = CONFIG.autoCommitGainPct > 0;
-  if (!(usePct || CONFIG.autoCommitGainUSD > 0) || CONFIG.paperTrading) return;
+  const anyTargets = Object.keys(targets).length > 0;
+  if ((!autoCommitEnabled() && !anyTargets) || CONFIG.paperTrading) return;
   try {
     const positions = await getAllOpenPositions();
+    const openKeys  = new Set(positions.map(p => targetKey(p.symbol, p.side)));
+
+    // Orphans first, so a target never outlives its position
+    for (const [key, t] of Object.entries(targets)) {
+      if (openKeys.has(key)) continue;
+      delete targets[key]; saveTargets();
+      console.log(`  🎯 Target ${key} removido — posição já não está aberta`);
+      await sendTelegram(`🎯 <b>Bot v3 ${key.replace(":", " ")}</b> — target de ${fmtUsd(t.usd)} removido: a posição já não está aberta (fechou por outra via).`, t.chatId || null);
+    }
+
     for (const p of positions) {
       // Ativos não-cripto não aceitam ordens via API — não vale a pena tentar de
       // minuto a minuto (encheria o Telegram de erros iguais)
       if (nonCryptoBlocked(p.symbol)) continue;
-      let threshold, label;
-      if (usePct) {
-        const margin = p.leverage > 0 ? (p.size * p.avgPrice) / p.leverage : 0;
-        if (!(margin > 0)) continue; // leverage unknown — can't compute ROI, skip
-        threshold = margin * (CONFIG.autoCommitGainPct / 100);
-        label     = `${CONFIG.autoCommitGainPct}% da margem $${margin.toFixed(2)} → $${threshold.toFixed(2)}`;
-      } else {
-        threshold = CONFIG.autoCommitGainUSD;
-        label     = `$${threshold}`;
+      const sideArg = p.side === "Buy" ? "long" : "short";
+
+      // /target3 — uso único: apaga ANTES de executar, para nunca disparar duas vezes
+      // (e para a posição reaberta pelo commit não o herdar)
+      const key = targetKey(p.symbol, p.side);
+      const t   = targets[key];
+      if (t && p.unrealizedPnl >= t.usd) {
+        delete targets[key]; saveTargets();
+        console.log(`\n🎯 [Target] ${p.symbol} ${p.side}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ $${t.usd} — a encaixar`);
+        await commitSymbol(p.symbol, t.chatId || null, "/target3", sideArg);
+        continue; // posição fechada — o auto-commit já não se aplica
       }
-      if (p.unrealizedPnl >= threshold) {
-        console.log(`\n💰 [Auto-commit] ${p.symbol} ${p.side}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ ${label} — a encaixar`);
+
+      const ac = autoCommitThreshold(p);
+      if (ac && p.unrealizedPnl >= ac.threshold) {
+        console.log(`\n💰 [Auto-commit] ${p.symbol} ${p.side}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ ${ac.label} — a encaixar`);
         // passa o lado: em hedge, sem ele o commit podia acabar na posição errada
-        await commitSymbol(p.symbol, null, "auto-commit", p.side === "Buy" ? "long" : "short");
+        await commitSymbol(p.symbol, null, "auto-commit", sideArg);
       }
     }
   } catch (e) {
-    console.log(`  ⚠️  Auto-commit check: ${e.message}`);
+    console.log(`  ⚠️  Auto-commit/target check: ${e.message}`);
   }
 }
 
@@ -1208,7 +1400,16 @@ async function startTelegramPolling() {
 
           // Only respond to messages from the configured chat
           if (fromId !== chatId) continue;
-          if (!text.startsWith("/")) continue;
+          if (!text.startsWith("/")) {
+            // Texto livre só interessa quando o bot está à espera de um valor (/target3)
+            if (pendingInput.has(fromId)) {
+              console.log(`[Telegram input] ${text}`);
+              handlePendingInput(text, fromId).catch((e) => console.log(`[Telegram input] erro: ${e.message}`));
+            }
+            continue;
+          }
+          // Um comando novo cancela qualquer pedido de valor pendente
+          pendingInput.delete(fromId);
 
           console.log(`[Telegram cmd] ${text}`);
           handleTelegramCommand(text, fromId).catch((e) =>
@@ -1240,6 +1441,7 @@ async function startTelegramPolling() {
       { command: "pos3", description: "📈 Posições abertas" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
       { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
+      { command: "target3", description: "🎯 Encaixar quando o PnL chegar a X (ou /target3 SYMBOL 20)" },
       { command: "wait3", description: "⏳ Ordens pendentes (por executar)" },
       { command: "closewait3", description: "✖️ Cancelar ordens pendentes (ou /closewait3 SYMBOL)" },
     ]}),
@@ -3027,6 +3229,7 @@ async function handleWebhook(body) {
 
 initCsv();
 loadSymbolState();
+loadTargets();
 app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  TradingView Webhook Bot v3 — BingX");
@@ -3054,7 +3257,8 @@ app.listen(PORT, () => {
   console.log(`  Stable    : ${CONFIG.stableSymbols.length > 0 ? `${CONFIG.stableSymbols.join(", ")} | trailing ${CONFIG.stableTrailingStopPct * 100}%` : "desativado (STABLE_SYMBOLS vazio)"}`);
   console.log(`  Re-entrada: ${CONFIG.trailingReentryEnabled ? `breakout 1×/${CONFIG.reentryCooldownMs / 3600000}h após trailing-stop, expira em ${CONFIG.reentryExpiryHours}h` : "breakout desativado (TRAILING_REENTRY_ENABLED=true)"}`);
   console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
-  console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem (verifica 1min)` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD} (verifica 1min)` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"}`);
+  console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
+  console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -3070,11 +3274,10 @@ app.listen(PORT, () => {
   setInterval(checkTrailingReentries, 60 * 1000);
   console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit3: on`);
 
-  // Start background auto-commit checker (every 1 min)
-  if (CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0) {
-    setInterval(checkAutoCommit, 60 * 1000);
-    console.log(`💰 Auto-commit ativo — encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}`);
-  }
+  // Position poller: auto-commit + /target3. Always on (targets can be set at any time;
+  // the tick is a no-op when neither applies).
+  setInterval(checkAutoCommit, CONFIG.positionPollMs);
+  console.log(`🎯 Position poller ativo (${CONFIG.positionPollMs / 1000}s) — /target3: on | auto-commit: ${autoCommitEnabled() ? `PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}` : "off"}${Object.keys(targets).length ? ` | targets carregados: ${Object.keys(targets).join(", ")}` : ""}`);
 
   // BingX: DETETAR o modo de posição (não o forçar). A conta pode estar em hedge —
   // é o que a BingX exige para ativos não-cripto — e forçar one-way revertia essa
