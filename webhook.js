@@ -3702,12 +3702,17 @@ function checkPersistence() {
     reentries: Object.values(symbolState).reduce((n, s) => n + Object.keys(getReentries(s)).length, 0),
     ratchets:  Object.keys(ratchets).length,
   };
+  // O caminho REAL onde está a escrever é metade do diagnóstico: um Volume montado em
+  // /data não serve de nada se a variável DATA_DIR não estiver definida no serviço —
+  // o default é "." e o estado vai parar ao contentor, ao lado do volume.
+  const where = `📁 DATA_DIR=<code>${DATA_DIR}</code>${DATA_DIR === "." ? " ⚠️ (default — variável NÃO definida neste serviço; o Volume não está a ser usado)" : ""}`;
   if (prev?.bootAt) {
     persistReport = `✅ Estado PERSISTE (arranque anterior: ${new Date(prev.bootAt).toISOString().slice(0, 19).replace("T", " ")}). ` +
-      `Restaurado: ${counts.targets} target(s), ${counts.reentries} re-entrada(s), ${counts.ratchets} ratchet(s).`;
+      `Restaurado: ${counts.targets} target(s), ${counts.reentries} re-entrada(s), ${counts.ratchets} ratchet(s).\n${where}`;
   } else {
-    persistReport = `⚠️ Marcador de persistência AUSENTE em ${DATA_DIR} — ou é o primeiro arranque de sempre, ou o disco é EFÉMERO ` +
-      `e o estado é apagado a cada redeploy (targets e re-entradas perdidos). Confirma que há um Volume Railway montado em ${DATA_DIR}.`;
+    persistReport = `⚠️ Marcador de persistência AUSENTE — ou é o primeiro arranque de sempre, ou o disco é EFÉMERO ` +
+      `e o estado é apagado a cada redeploy (targets e re-entradas perdidos).\n${where}\n` +
+      `Verifica no Railway: o Volume tem de estar ligado a ESTE serviço e montado no caminho acima.`;
   }
   try { writeFileSync(PERSIST_FILE, JSON.stringify({ bootAt: Date.now(), counts }, null, 2)); }
   catch (e) { persistReport += ` | ❌ Não consigo sequer ESCREVER em ${DATA_DIR}: ${e.message}`; }
