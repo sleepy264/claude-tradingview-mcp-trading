@@ -183,6 +183,14 @@ const CONFIG = {
   // getAllOpenPositions call per tick — cheap. Lower = tighter reaction to PnL spikes,
   // but still polling: a spike that comes and goes between two ticks is not seen.
   positionPollMs:         parseInt(process.env.POSITION_POLL_MS || "30000"),
+  // Ratchet do SL: acompanha o lucro movendo o PRÓPRIO stop (como fazia a Bybit), nunca
+  // para trás. Funciona sobre posições abertas à mão na BingX — lê o SL da API, não do
+  // estado interno. NUNCA cria um SL: se a posição não tem stop, é porque foi decisão do
+  // utilizador (a mesma regra que o /commit3 já segue ao espelhar protecções).
+  trailRatchetEnabled:    process.env.TRAIL_RATCHET_ENABLED !== "false",
+  // Só mexe quando a melhoria vale pelo menos esta fração da distância ancorada —
+  // sem isto seria um cancelar+repor a cada 30s por frações de tick.
+  trailRatchetMinStepPct: parseFloat(process.env.TRAIL_RATCHET_MIN_STEP_PCT || "0.1"),
   // BingX API keys without an IP whitelist expire every 3 months. Checked daily; a
   // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
   apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
@@ -260,6 +268,19 @@ function saveTargets() {
 // ficava com chave diferente da posição e a limpeza de órfãos apagava-o no tick seguinte:
 // desaparecia do Telegram e nunca chegava a disparar.
 function canonicalSymbol(sym) { return fromBingxSymbol(toBingxSymbol(sym)); }
+// ─── Ratchet do SL ───────────────────────────────────────────────────────────
+// Por posição (SYMBOL:SIDE): a distância ancorada e o último SL que o BOT colocou.
+// O último SL serve para distinguir "o stop está onde eu o pus" de "o utilizador mexeu
+// nele na app" — nesse caso o bot re-ancora em vez de lutar contra a decisão dele.
+const RATCHETS_FILE = path.join(DATA_DIR, "ratchets.json");
+let ratchets = {}; // "BEATUSDT:LONG" → { dist, sl }
+function loadRatchets() {
+  try { if (existsSync(RATCHETS_FILE)) ratchets = JSON.parse(readFileSync(RATCHETS_FILE, "utf8")); } catch { ratchets = {}; }
+}
+function saveRatchets() {
+  try { writeFileSync(RATCHETS_FILE, JSON.stringify(ratchets, null, 2)); } catch {}
+}
+
 function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/"short"
   const s = normalizeSide(side);
   return `${canonicalSymbol(symbol)}:${s === "Sell" ? "SHORT" : "LONG"}`;
@@ -507,6 +528,7 @@ async function attachProtections(positions) {
     p.stopLoss     = sl ? parseFloat(sl.stopPrice || sl.price || "0") : 0;
     p.takeProfit   = tp ? parseFloat(tp.stopPrice || tp.price || "0") : 0;
     p.trailingStop = trail ? 1 : 0;
+    p.slOrderId    = sl?.orderId ?? null;   // o ratchet precisa dele para substituir o stop
   }
   return positions;
 }
@@ -1477,16 +1499,101 @@ function autoCommitThreshold(p) {
 }
 const autoCommitEnabled = () => CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0;
 
+// Substitui o STOP_MARKET de uma posição por um noutro preço.
+// Coloca o NOVO antes de cancelar o antigo: se a colocação falhar, a posição nunca fica
+// sem stop. (É o inverso do chase, onde o risco a evitar era a entrada a dobrar; aqui o
+// risco a evitar é ficar a descoberto, e um instante com dois stops é inofensivo — o
+// primeiro a disparar fecha tudo e o outro fica sem posição para reduzir.)
+async function replaceStopLoss(symbol, pos, newSlPrice, oldOrderId) {
+  const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
+  await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(pos.side),
+    type: "STOP_MARKET", stopPrice: newSlPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
+  });
+  if (oldOrderId) {
+    try { await cancelOrder(symbol, oldOrderId); }
+    catch (e) { console.log(`  ⚠️  ${symbol}: stop novo colocado mas o antigo (${oldOrderId}) não foi cancelado: ${e.message}`); }
+  }
+}
+
+// Acompanha o lucro movendo o SL da posição, nunca para trás — o que a Bybit fazia
+// nativamente e a BingX não faz (lá o trailing é uma ordem à parte que deixa o stop
+// visível parado). Corre sobre TODAS as posições abertas, incluindo as abertas à mão
+// na app, porque lê o SL da API em vez de depender de estado interno.
+async function ratchetStops(positions) {
+  if (!CONFIG.trailRatchetEnabled || CONFIG.paperTrading) return;
+  const liveKeys = new Set(positions.map(p => targetKey(p.symbol, p.side)));
+  for (const k of Object.keys(ratchets)) if (!liveKeys.has(k)) delete ratchets[k];
+
+  for (const p of positions) {
+    const key = targetKey(p.symbol, p.side);
+    try {
+      // Sem SL não há nada para mover — e o bot não cria stops por iniciativa própria.
+      if (!(p.stopLoss > 0) || !(p.markPrice > 0)) { delete ratchets[key]; continue; }
+      if (nonCryptoBlocked(p.symbol)) continue;
+
+      const { tickSize } = await getInstrumentInfo(p.symbol);
+      const isLong = p.side === "Buy";
+      let rec = ratchets[key];
+
+      // Âncora: primeira vez que vemos este SL, ou o utilizador mexeu nele na app.
+      // Nos dois casos a distância passa a ser a que ELE definiu, medida agora.
+      const tol = Math.max(tickSize || 0, 1e-12) / 2;
+      if (!rec || Math.abs(p.stopLoss - rec.sl) > tol) {
+        rec = { dist: Math.abs(p.markPrice - p.stopLoss), sl: p.stopLoss };
+        ratchets[key] = rec;
+        saveRatchets();
+        console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${rec.dist.toFixed(8).replace(/\.?0+$/, "")})`);
+        continue;   // só ancora neste tick; move a partir do próximo
+      }
+
+      const desiredNum = isLong ? p.markPrice - rec.dist : p.markPrice + rec.dist;
+      const improves   = isLong ? desiredNum > p.stopLoss : desiredNum < p.stopLoss;
+      if (!improves) continue;   // preço andou contra nós — o stop NÃO recua
+
+      // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick
+      const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct);
+      if (Math.abs(desiredNum - p.stopLoss) < minStep) continue;
+
+      const newSl = roundToTick(desiredNum, tickSize);
+      if (parseFloat(newSl) === p.stopLoss) continue;
+
+      await replaceStopLoss(p.symbol, p, newSl, p.slOrderId);
+      const from = p.stopLoss;
+      rec.sl = parseFloat(newSl);
+      saveRatchets();
+
+      // Travou lucro? (stop já do lado bom da entrada)
+      const locked = isLong ? rec.sl > p.avgPrice : rec.sl < p.avgPrice;
+      console.log(`  🪜 ${key}: SL $${from} → $${newSl} (preço $${p.markPrice}${locked ? ", lucro travado" : ""})`);
+      await sendTelegram(
+        `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL acompanhou o lucro\n` +
+        `$${formatPrice(from)} → <b>$${newSl}</b> | preço $${formatPrice(p.markPrice)} | entrada $${formatPrice(p.avgPrice)}\n` +
+        (locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`)
+      );
+    } catch (e) {
+      console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
+    }
+  }
+}
+
 // One positions fetch per tick serves three things: /target3 triggers, auto-commit
 // thresholds and orphaned-target cleanup (a target whose position was closed by any
 // other path — SL, opposite signal, /close3 — is dropped and reported, never left to
 // fire on a future position that happens to reuse the same symbol/side).
 async function checkAutoCommit() {
   const anyTargets = Object.keys(targets).length > 0;
-  if ((!autoCommitEnabled() && !anyTargets) || CONFIG.paperTrading) return;
+  if ((!autoCommitEnabled() && !anyTargets && !CONFIG.trailRatchetEnabled) || CONFIG.paperTrading) return;
   try {
     const positions = await getAllOpenPositions();
     const openKeys  = new Set(positions.map(p => targetKey(p.symbol, p.side)));
+
+    // SL a acompanhar o lucro. Antes dos encaixes: se o stop subiu, é esse o número que
+    // protege a posição durante o resto do tick. Uma chamada extra a openOrders por tick.
+    if (CONFIG.trailRatchetEnabled) {
+      await attachProtections(positions);
+      await ratchetStops(positions);
+    }
 
     // Órfãos: um target não deve sobreviver à posição. Mas também não deve morrer por
     // uma leitura falhada — uma lista vazia ou incompleta (blip da API, fecho parcial a
@@ -3533,6 +3640,7 @@ async function handleWebhook(body) {
 initCsv();
 loadSymbolState();
 loadTargets();
+loadRatchets();
 app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  TradingView Webhook Bot v3 — BingX");
@@ -3562,6 +3670,7 @@ app.listen(PORT, () => {
   console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
+  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | passo mín ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 60000}min (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
