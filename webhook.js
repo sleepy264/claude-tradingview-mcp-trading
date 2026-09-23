@@ -155,6 +155,18 @@ const CONFIG = {
   // cancel the limit and re-enter at market (mirroring qty/leverage) so the move isn't lost.
   // 0 = disabled (limit-only, may expire unfilled).
   commitBreakoutAtrMult:  parseFloat(process.env.COMMIT_BREAKOUT_ATR_MULT || "0.5"),
+  // Chase da ordem limite de re-entrada (à imagem da "chase limit order" da BingX): se a
+  // limite não encher e o preço se tiver afastado, aproxima-a do mercado de tempos a
+  // tempos, em vez de a deixar parada até expirar — o caso mais comum de re-entrada
+  // falhada é o preço nunca voltar ao pullback nem romper o nível de breakout.
+  // O limite duro é COMMIT_CHASE_MAX_PCT: a ordem NUNCA cede mais do que esta fração da
+  // distância de pullback original. Perseguir até ao preço de saída seria re-entrar onde
+  // se vendeu — encaixava o ganho e pagava duas comissões para ficar na mesma.
+  commitChaseEnabled:     process.env.COMMIT_CHASE_ENABLED !== "false",
+  commitChaseIntervalMs:  parseInt(process.env.COMMIT_CHASE_INTERVAL_MS || "300000"),  // 5 min
+  commitChaseStepPct:     parseFloat(process.env.COMMIT_CHASE_STEP_PCT || "0.33"),     // 1/3 do que falta, por passo
+  commitChaseMaxPct:      parseFloat(process.env.COMMIT_CHASE_MAX_PCT || "0.7"),       // cede no máximo 70% do pullback
+  commitChaseMaxSteps:    parseInt(process.env.COMMIT_CHASE_MAX_STEPS || "6"),
   // /commit3 with no argument lists one button per open symbol whose unrealized gain
   // exceeds this many USD, so you can bank it with one tap.
   commitMinGainUSD:       parseFloat(process.env.COMMIT_MIN_GAIN_USD || "5"),
@@ -239,6 +251,30 @@ function fmtUsd(v) { return `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}`;
 
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
+// ─── Re-entradas por lado ────────────────────────────────────────────────────
+// Antes havia UMA re-entrada por símbolo (state.reentry). Em hedge isso colide: um
+// commit no LONG e outro no SHORT do mesmo par — a segunda sobrescrevia a primeira e a
+// ordem limite dessa ficava no livro da BingX sem ninguém a seguir (não era cancelada
+// por sinal contrário, não expirava, e se enchesse abria uma posição desconhecida do bot).
+// Agora vivem em state.reentries, indexadas por LONG/SHORT (BOTH em one-way).
+function reentrySlot(action) {
+  if (POSITION_MODE !== "hedge") return "BOTH";
+  return /^b/i.test(String(action)) ? "LONG" : "SHORT";
+}
+// Lê as re-entradas de um símbolo, migrando o formato antigo à cabeça.
+function getReentries(state) {
+  if (state.reentry) {
+    (state.reentries ||= {})[reentrySlot(state.reentry.action)] = state.reentry;
+    delete state.reentry;
+  }
+  return state.reentries || {};
+}
+function setReentry(state, action, r) { (state.reentries ||= {})[reentrySlot(action)] = r; }
+function delReentry(state, action)     { const m = getReentries(state); delete m[reentrySlot(action)]; }
+// Todas as re-entradas de um símbolo, como [slot, r]. Usado pelos caminhos que têm de
+// varrer tudo (cancelar por orderId, fechar o símbolo inteiro).
+function reentryList(state) { return Object.entries(getReentries(state)); }
+
 // Called after a BUY/SELL order is successfully placed.
 function recordSignalPlaced(symbol, action, price = null, leverage = null, interval = null) {
   const s = _getSymState(symbol);
@@ -249,7 +285,7 @@ function recordSignalPlaced(symbol, action, price = null, leverage = null, inter
   s.lastEntryPrice   = price;
   if (leverage != null && leverage > 0) s.lastLeverage = leverage; // so a re-entry mirrors this leverage
   if (interval) s.lastInterval = interval; // so re-entry ATR uses the same candle interval as the entry
-  delete s.reentry;                 // a fresh entry supersedes any pending re-entry watch
+  delReentry(s, action);            // a fresh entry supersedes the re-entry watch OF THAT SIDE
   saveSymbolState();
 }
 
@@ -508,7 +544,7 @@ async function fetchPricesFor(orders) {
 // `prices` (optional) adds the current price and how far it still is from triggering —
 // the number that actually says whether an order is about to fill or is parked far away.
 function describePendingOrder(o, prices = {}) {
-  const isReentry = Object.values(symbolState).some(s => s.reentry?.orderId === o.orderId);
+  const isReentry = Object.values(symbolState).some(s => reentryList(s).some(([, r]) => r.orderId === o.orderId));
   const prot      = isProtectiveOrder(o);
   const ageMin    = o.createdTime ? Math.round((Date.now() - o.createdTime) / 60000) : null;
   const level     = o.triggerPrice > 0 ? o.triggerPrice : o.price;
@@ -1066,7 +1102,9 @@ async function handleTelegramCommand(text, chatId) {
         // Se era uma re-entrada vigiada pelo bot, limpar o estado para o poller não
         // ficar a consultar uma ordem que já não existe
         for (const [sym, st] of Object.entries(symbolState)) {
-          if (st.reentry?.orderId === o.orderId) { delete st.reentry; console.log(`  ✖ ${sym}: watch de re-entrada removida (/closewait3)`); }
+          for (const [slot, r] of reentryList(st)) {
+            if (r.orderId === o.orderId) { delete st.reentries[slot]; console.log(`  ✖ ${sym} ${slot}: watch de re-entrada removida (/closewait3)`); }
+          }
         }
       }
       saveSymbolState();
@@ -1131,14 +1169,16 @@ async function closeSymbol(argSym, chatId, qty = null, side = null) {
 
     const s = _getSymState(argSym);
     s.positionOpenTime = null; // prevents the breakout auto-detector from arming a watch
+    // Só a re-entrada DESTE lado — em hedge, fechar o LONG não deve matar a do SHORT
     let cancelledReentry = false;
-    if (s.reentry) {
-      if (s.reentry.type === "limit" && s.reentry.orderId) {
-        try { await cancelOrder(argSym, s.reentry.orderId); cancelledReentry = true; } catch {}
+    const rClose = getReentries(s)[reentrySlot(pos.side === "Buy" ? "buy" : "sell")];
+    if (rClose) {
+      if (rClose.type === "limit" && rClose.orderId) {
+        try { await cancelOrder(argSym, rClose.orderId); cancelledReentry = true; } catch {}
       } else {
         cancelledReentry = true;
       }
-      delete s.reentry;
+      delReentry(s, pos.side === "Buy" ? "buy" : "sell");
     }
     saveSymbolState();
 
@@ -1306,7 +1346,7 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       if (impliedSlPct > CONFIG.maxSlPct) {
         const s0 = _getSymState(argSym);
         s0.positionOpenTime = null;
-        delete s0.reentry;
+        delReentry(s0, sideAction);
         saveSymbolState();
         const msg = `SL implícito ${(impliedSlPct * 100).toFixed(2)}% > limite ${(CONFIG.maxSlPct * 100).toFixed(1)}% — volatilidade alta, sem re-entrada`;
         console.log(`  ⏸ ${argSym}: ${msg}`);
@@ -1346,7 +1386,7 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       : null;
 
     s.lastLeverage = reLev;
-    s.reentry = {
+    setReentry(s, sideAction, {
       type:      "limit",
       action:    sideAction,
       orderId:   lim.orderId,
@@ -1358,7 +1398,14 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       hadTrail,            // fill handler mirrors trailing presence
       tpPrice,             // inherited TP level (fallback market entry re-attaches it)
       createdAt: Date.now(),
-    };
+      // Referências do chase (ver chaseReentryLimit): sem elas não há como saber
+      // quanto da vantagem já foi cedida, por isso watches antigas não são perseguidas.
+      exitPrice,
+      pullbackDist,
+      origPrice:   parseFloat(lim.priceStr),
+      chaseCount:  0,
+      lastChaseAt: Date.now(),
+    });
     saveSymbolState();
 
     logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, ordem limite re-entrada @ $${lim.priceStr}`);
@@ -1966,6 +2013,86 @@ async function checkPositionTimeouts() {
   }
 }
 
+// Aproxima do mercado uma ordem limite de re-entrada que não encheu — o equivalente à
+// "chase limit order" da BingX, mas com um travão: a ordem nunca cede mais do que
+// COMMIT_CHASE_MAX_PCT da distância de pullback original. Perseguir até ao preço de
+// saída seria re-entrar exatamente onde se vendeu: encaixava o ganho e pagava duas
+// comissões para ficar na mesma posição — o problema que o /commit3 existe para evitar.
+//
+// Por passo, fecha COMMIT_CHASE_STEP_PCT do que falta até ao preço atual, no máximo
+// COMMIT_CHASE_MAX_STEPS vezes, a cada COMMIT_CHASE_INTERVAL_MS.
+// Ordem das operações: cancela PRIMEIRO e só coloca a nova se o cancelamento resultar —
+// se a antiga encheu entretanto, o cancelamento falha e nada é reposto (o tick seguinte
+// deteta o fill). O inverso arriscava duas ordens vivas ao mesmo tempo.
+async function chaseReentryLimit(sym, state, slot, r, now) {
+  // Watches antigas (sem as referências) não são perseguidas: sem exitPrice/pullbackDist
+  // não há como saber quanta vantagem já foi cedida, e o travão deixaria de existir.
+  if (!(r.exitPrice > 0) || !(r.pullbackDist > 0) || r.chaseDone) return;
+  if ((r.chaseCount || 0) >= CONFIG.commitChaseMaxSteps) return;
+  if (now - (r.lastChaseAt || r.createdAt) < CONFIG.commitChaseIntervalMs) return;
+
+  const cur = await fetchCurrentPrice(sym);
+  if (!cur) return;
+  const isBuy = r.action === "buy";
+
+  // Só faz sentido se o mercado estiver do lado ERRADO da limite (a afastar-se).
+  // Se já estiver do lado certo, a ordem está prestes a encher — não lhe tocar.
+  if (isBuy ? cur <= r.price : cur >= r.price) return;
+
+  // Travão: o pior preço admissível, mantendo (1 − maxPct) da vantagem original
+  const keep  = r.pullbackDist * (1 - CONFIG.commitChaseMaxPct);
+  const bound = isBuy ? r.exitPrice - keep : r.exitPrice + keep;
+
+  const { tickSize } = await getInstrumentInfo(sym);
+  let next = r.price + (cur - r.price) * CONFIG.commitChaseStepPct;
+  next = isBuy ? Math.min(next, bound) : Math.max(next, bound);
+  const nextStr = roundToTick(next, tickSize);
+
+  // Já no travão (ou o passo não chega a mover um tick): pára de perseguir, mas mantém
+  // a ordem no livro — ainda pode encher, e o fallback de breakout continua ativo.
+  if (parseFloat(nextStr) === r.price || (isBuy ? parseFloat(nextStr) <= r.price : parseFloat(nextStr) >= r.price)) {
+    r.chaseDone = true;
+    saveSymbolState();
+    console.log(`  🎣 ${sym} ${slot}: chase no limite (${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback cedido) — ordem mantida @ $${r.price}`);
+    return;
+  }
+
+  try {
+    await cancelOrder(sym, r.orderId);
+  } catch (e) {
+    console.log(`  ⚠️  ${sym} ${slot}: chase abortado, cancelar falhou (${e.message}) — pode ter enchido`);
+    return;   // não repõe nada: o tick seguinte lê o estado real da ordem
+  }
+
+  let atr = null;
+  try { atr = await fetchATR(sym, state.lastInterval || CONFIG.candleInterval); } catch {}
+  try {
+    const lim = await placeReentryLimit(sym, r.action, parseFloat(nextStr), r.leverage, atr, r.qty, r.hadSL !== false, r.tpPrice || null);
+    const from = r.price;
+    r.orderId     = lim.orderId;
+    r.price       = parseFloat(lim.priceStr);
+    r.qty         = lim.qty;
+    r.chaseCount  = (r.chaseCount || 0) + 1;
+    r.lastChaseAt = now;
+    saveSymbolState();
+    const cedido = Math.abs(r.price - r.origPrice) / r.pullbackDist * 100;
+    console.log(`  🎣 ${sym} ${slot}: chase ${r.chaseCount}/${CONFIG.commitChaseMaxSteps} — limite $${from} → $${lim.priceStr} (preço $${cur}, ${cedido.toFixed(0)}% do pullback cedido)`);
+    await sendTelegram(
+      `🎣 <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} reajustada (${r.chaseCount}/${CONFIG.commitChaseMaxSteps})\n` +
+      `Limite $${formatPrice(from)} → <b>$${lim.priceStr}</b> | preço atual $${formatPrice(cur)}\n` +
+      `Cedido ${cedido.toFixed(0)}% do pullback (máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}%)` +
+      (lim.slPrice ? ` | 🛡 SL $${lim.slPrice}` : "")
+    );
+  } catch (e) {
+    // Cancelou mas não conseguiu repor — não há ordem nenhuma no livro. Desarma a watch
+    // e avisa, em vez de deixar o estado a apontar para uma ordem que já não existe.
+    delete state.reentries[slot];
+    saveSymbolState();
+    console.log(`  ❌ ${sym} ${slot}: chase cancelou a ordem mas falhou a repor: ${e.message}`);
+    await sendTelegram(`❌ <b>Bot v3 ${sym}</b> — chase da re-entrada falhou\nA ordem antiga foi cancelada e a nova não passou: ${e.message}\n⚠️ Não há re-entrada pendente para este lado.`);
+  }
+}
+
 // Background re-entry check — runs every 1 min. Handles two kinds of armed watch:
 //   • "breakout" (auto, only when TRAILING_REENTRY_ENABLED=true): a position closed at
 //     breakeven/profit by the trailing-stop arms a watch; re-enters when price breaks
@@ -1986,13 +2113,13 @@ async function checkTrailingReentries() {
           state.positionOpenTime = null;
           const last = await getLastClosedPnl(sym);
           if (last && parseFloat(last.closedPnl) >= 0 && state.lastAction) {
-            state.reentry = {
+            setReentry(state, state.lastAction, {
               type:            "breakout",
               action:          state.lastAction,
               level:           parseFloat(last.avgExitPrice),
               createdAt:       now,
               lastAttemptTime: 0,
-            };
+            });
             console.log(`  🔁 ${sym}: posição fechada por trailing-stop @ $${last.avgExitPrice} (PnL $${parseFloat(last.closedPnl).toFixed(2)}) — a vigiar re-entrada ${state.lastAction.toUpperCase()} (breakout)`);
           }
           saveSymbolState();
@@ -2000,8 +2127,8 @@ async function checkTrailingReentries() {
       }
 
       // ── 2) Check armed re-entry watches ──────────────────────────────────
-      if (state.reentry) {
-        const r = state.reentry;
+      // Em hedge pode haver uma por lado (LONG e SHORT) — são independentes.
+      for (const [slot, r] of reentryList(state)) {
         const kind = r.type || "breakout";
 
         // ── 2a) BingX limit re-entry (/commit3) — poll status ───────────────
@@ -2015,7 +2142,7 @@ async function checkTrailingReentries() {
             state.positionOpenTime = now;   // hand the position to timeout/trailing tracking
             state.lastAction       = r.action;
             if (r.leverage > 0) state.lastLeverage = r.leverage; // keep leverage for future re-entries
-            delete state.reentry;
+            delete state.reentries[slot];
             saveSymbolState();
             try {
               // Mirror the original position: no trailing if it didn't have one (r.hadTrail
@@ -2032,7 +2159,7 @@ async function checkTrailingReentries() {
           }
           if (status === "Cancelled" || status === "Rejected" || status === "Deactivated") {
             console.log(`  ✖ ${sym}: ordem limite de re-entrada ${status} — watch removida`);
-            delete state.reentry;
+            delete state.reentries[slot];
             saveSymbolState();
             continue;
           }
@@ -2048,7 +2175,7 @@ async function checkTrailingReentries() {
           if (already) {
             console.log(`  ✖ ${sym}: já existe posição ${already.side} (qty=${already.size}) — a cancelar a ordem limite de re-entrada`);
             try { await cancelOrder(sym, r.orderId); } catch {}
-            delete state.reentry;
+            delete state.reentries[slot];
             saveSymbolState();
             await sendTelegram(`✖️ <b>Bot v3 ${sym}</b> — ordem limite de re-entrada cancelada\nJá existe posição ${already.side} aberta (qty=${already.size}) — evitado reforço da posição.`);
             continue;
@@ -2088,7 +2215,7 @@ async function checkTrailingReentries() {
                 const dM = await bxRequest("POST", "/openApi/swap/v2/trade/order", mktParams);
                 state.positionOpenTime = now;
                 state.lastAction       = r.action;
-                delete state.reentry;
+                delete state.reentries[slot];
                 saveSymbolState();
                 if (r.hadTrail !== false && CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, cur, atr);
                 logTrade(sym, r.action, cur, "", dM?.order?.orderId ?? dM?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel)} (limite não encheu)`);
@@ -2099,7 +2226,7 @@ async function checkTrailingReentries() {
                 );
               } catch (e) {
                 console.log(`  ❌ Fallback breakout ${sym} falhou: ${e.message}`);
-                delete state.reentry;
+                delete state.reentries[slot];
                 saveSymbolState();
                 await sendTelegram(`❌ <b>Bot v3 ${sym}</b> — Fallback breakout falhou\n${e.message}`);
               }
@@ -2107,10 +2234,18 @@ async function checkTrailingReentries() {
             }
           }
 
+          // Chase: a limite não encheu e o preço afastou-se — aproxima-a do mercado.
+          // Depois do fallback de breakout de propósito: se o preço fugiu de vez, a
+          // entrada a mercado é a resposta certa, não perseguir com uma limite.
+          if (status === "New" && CONFIG.commitChaseEnabled && now - r.createdAt <= expiryMs) {
+            await chaseReentryLimit(sym, state, slot, r, now);
+            if (!state.reentries[slot]) continue;   // o chase desarmou a watch
+          }
+
           if (now - r.createdAt > expiryMs) {
             console.log(`  ⌛ ${sym}: re-entrada limite expirou (${CONFIG.reentryExpiryHours}h) — a cancelar ordem`);
             try { await cancelOrder(sym, r.orderId); } catch {}
-            delete state.reentry;
+            delete state.reentries[slot];
             saveSymbolState();
           }
           continue; // limit watches are fully handled here
@@ -2120,7 +2255,7 @@ async function checkTrailingReentries() {
         const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
         if (now - r.createdAt > expiryMs) {
           console.log(`  ⌛ ${sym}: watch de re-entrada (${kind}) expirou (${CONFIG.reentryExpiryHours}h sem gatilho)`);
-          delete state.reentry;
+          delete state.reentries[slot];
           saveSymbolState();
           continue;
         }
@@ -2137,7 +2272,7 @@ async function checkTrailingReentries() {
         if (!triggered) continue;
 
         const openPos = await getOpenPosition(sym);
-        if (openPos) { delete state.reentry; saveSymbolState(); continue; } // already has a position — drop watch
+        if (openPos) { delete state.reentries[slot]; saveSymbolState(); continue; } // already has a position — drop watch
 
         r.lastAttemptTime = now;
         saveSymbolState();
@@ -2878,15 +3013,18 @@ async function handleWebhook(body) {
   // recordSignalPlaced) so it happens even if the new order is later blocked by a filter.
   if (actionLower !== "tp") {
     const stCancel = symbolState[sym];
-    const rc = stCancel?.reentry;
-    if (rc && (rc.action !== actionLower || rc.type === "limit")) {
+    // Em hedge há uma re-entrada por lado — percorre as duas. A regra mantém-se por
+    // watch: contrária cancela sempre; uma limite cancela mesmo com sinal do mesmo lado,
+    // para o novo pedido não deixar uma ordem órfã no livro.
+    for (const [slot, rc] of (stCancel ? reentryList(stCancel) : [])) {
+      if (!(rc.action !== actionLower || rc.type === "limit")) continue;
       if (rc.type === "limit" && rc.orderId) {
-        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym}: ordem limite de re-entrada ${rc.orderId} cancelada na BingX`); }
-        catch (e) { console.log(`  ⚠️  ${sym}: cancelar ordem de re-entrada falhou: ${e.message}`); }
+        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym} ${slot}: ordem limite de re-entrada ${rc.orderId} cancelada na BingX`); }
+        catch (e) { console.log(`  ⚠️  ${sym} ${slot}: cancelar ordem de re-entrada falhou: ${e.message}`); }
       } else {
-        console.log(`  ✖ ${sym}: watch de re-entrada (${rc.type || "breakout"}) cancelada — sinal ${actionLower.toUpperCase()}`);
+        console.log(`  ✖ ${sym} ${slot}: watch de re-entrada (${rc.type || "breakout"}) cancelada — sinal ${actionLower.toUpperCase()}`);
       }
-      delete stCancel.reentry;
+      delete stCancel.reentries[slot];
       saveSymbolState();
     }
   }
@@ -3359,6 +3497,7 @@ app.listen(PORT, () => {
   console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
+  console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 60000}min (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
