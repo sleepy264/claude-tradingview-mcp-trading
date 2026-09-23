@@ -234,7 +234,8 @@ function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/
   const s = normalizeSide(side);
   return `${String(symbol).toUpperCase()}:${s === "Sell" ? "SHORT" : "LONG"}`;
 }
-function fmtUsd(v) { return `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`; }
+// Sinal ANTES do cifrão: "-$0.10", não "$-0.10"
+function fmtUsd(v) { return `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}`; }
 
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
@@ -373,6 +374,9 @@ async function getAllOpenPositions() {
         avgPrice:      parseFloat(p.avgPrice || "0"),
         markPrice:     parseFloat(p.markPrice || "0"),  // current price
         unrealizedPnl: parseFloat(p.unrealizedProfit || p.unrealisedProfit || "0"),
+        // Já realizado nesta posição (funding pago/recebido, fechos parciais). Não entra
+        // no unrealizedPnl e por isso não conta para o /target3 — só para a estimativa líquida.
+        realisedPnl:   parseFloat(p.realisedProfit || p.realizedProfit || "0"),
         leverage:      parseFloat(p.leverage || "0"),   // for margin/ROI calc
         // SL/TP/trailing vivem em ordens separadas na BingX — ficam a 0 aqui e são
         // preenchidos por attachProtections() quem precisar deles (ver /pos3).
@@ -383,6 +387,40 @@ async function getAllOpenPositions() {
     }
   }
   return out;
+}
+
+// Comissões da conta (taker/maker). Só muda com o nível VIP — cache longa.
+const _feeCache = { taker: null, maker: null, at: 0 };
+const FEE_TTL = 6 * 60 * 60 * 1000;
+async function getCommissionRates() {
+  if (_feeCache.taker !== null && Date.now() - _feeCache.at < FEE_TTL) return _feeCache;
+  try {
+    const d = await bxRequest("GET", "/openApi/swap/v2/user/commissionRate", {});
+    const c = d?.commission || d;
+    const taker = parseFloat(c?.takerCommissionRate);
+    const maker = parseFloat(c?.makerCommissionRate);
+    if (taker >= 0) { _feeCache.taker = taker; _feeCache.maker = maker >= 0 ? maker : taker; _feeCache.at = Date.now(); }
+  } catch (e) {
+    console.log(`  ⚠️  getCommissionRates: ${e.message}`);
+  }
+  return _feeCache;
+}
+
+// Estimativa do resultado LÍQUIDO de uma posição aberta: PnL não realizado menos as
+// comissões de entrada (já paga) e de saída (ainda por pagar), mais o que já foi
+// realizado na posição (funding, fechos parciais).
+// É MERAMENTE INDICATIVA e não é usada por mais nada — o /target3, o auto-commit e o
+// hard cap continuam a decidir pelo unrealizedPnl, que é o valor oficial da BingX.
+// Assume taker nos dois lados (pior caso); uma entrada por limite paga menos (maker).
+function estimateNetPnl(p, taker) {
+  if (!(taker >= 0)) return null;
+  const entryFee = p.size * p.avgPrice  * taker;
+  const exitFee  = p.size * p.markPrice * taker;
+  return {
+    net:   p.unrealizedPnl + (p.realisedPnl || 0) - entryFee - exitFee,
+    fees:  entryFee + exitFee,
+    realised: p.realisedPnl || 0,
+  };
 }
 
 // Na BingX o SL/TP/trailing NÃO são atributos da posição — são ordens condicionais
@@ -676,6 +714,7 @@ async function handleTelegramCommand(text, chatId) {
 
       // SL/TP/trailing são ordens condicionais separadas na BingX — sem isto viriam vazios
       await attachProtections(positions);
+      const { taker } = await getCommissionRates();
 
       const lines = positions.map(p => {
         const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
@@ -687,14 +726,23 @@ async function handleTelegramCommand(text, chatId) {
           `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit)}${dist(p.takeProfit)}` : "—"}`,
           ...(p.trailingStop ? ["📉 trailing ativo"] : []),
         ].join(" | ");
+        const est = estimateNetPnl(p, taker);
         return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n` +
                `   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}${t ? ` | 🚩 target ${fmtUsd(t.usd)}` : ""}\n` +
+               (est ? `   ≈ líquido: ${fmtUsd(est.net)} <i>(−$${est.fees.toFixed(2)} fees${est.realised ? `, ${fmtUsd(est.realised)} já realizado` : ""})</i>\n` : "") +
                `   ${prot}`;
       });
 
       const totalPnl   = positions.reduce((s, p) => s + p.unrealizedPnl, 0);
       const totalEmoji = totalPnl >= 0 ? "🟢" : "🔴";
-      const totalLine  = `${totalEmoji} <b>Total (${positions.length} posições): ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>`;
+      const ests       = positions.map(p => estimateNetPnl(p, taker)).filter(Boolean);
+      const totalNet   = ests.length === positions.length
+        ? ests.reduce((s, e) => s + e.net, 0) : null;
+      const totalLine  = `${totalEmoji} <b>Total (${positions.length} posições): ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}</b>` +
+        (totalNet !== null
+          ? `\n≈ <b>líquido: ${fmtUsd(totalNet)}</b> <i>(−$${ests.reduce((s, e) => s + e.fees, 0).toFixed(2)} em fees, taker ${(taker * 100).toFixed(3)}% entrada+saída)</i>\n` +
+            `<i>Estimativa indicativa. O valor oficial — e o que o /target3, auto-commit e hard cap usam — é o PnL acima.</i>`
+          : "");
 
       await sendTelegram(`📊 <b>Posições abertas — Bot v3</b>\n\n${lines.join("\n\n")}\n\n${totalLine}`, chatId);
     } catch (e) {
