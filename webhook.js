@@ -235,17 +235,34 @@ function _getSymState(symbol) {
 // que em hedge o LONG e o SHORT do mesmo par tenham targets independentes.
 // Persistido em DATA_DIR para sobreviver a redeploys.
 const TARGETS_FILE = path.join(DATA_DIR, "targets.json");
+// Leituras seguidas sem ver a posição antes de dar o target por órfão (3 × 30s = 90s)
+const TARGET_MISSES_TO_DROP = 3;
 let targets = {}; // "BEATUSDT:LONG" → { usd, createdAt, chatId }
 
 function loadTargets() {
   try { if (existsSync(TARGETS_FILE)) targets = JSON.parse(readFileSync(TARGETS_FILE, "utf8")); } catch { targets = {}; }
+  // Re-chaveia targets gravados antes da normalização (ex: "TRUMPSOL-USDT:SHORT")
+  let fixed = 0;
+  for (const [k, v] of Object.entries(targets)) {
+    const [sym, side] = k.split(":");
+    const canon = targetKey(sym, side === "SHORT" ? "short" : "long");
+    if (canon !== k) { delete targets[k]; targets[canon] = v; fixed++; console.log(`  🚩 Target re-chaveado: ${k} → ${canon}`); }
+  }
+  if (fixed) saveTargets();
 }
 function saveTargets() {
   try { writeFileSync(TARGETS_FILE, JSON.stringify(targets, null, 2)); } catch {}
 }
+// A chave TEM de ser canónica. O mesmo ativo chega aqui com três grafias — o que o
+// utilizador escreve no comando ("TRUMPSOL-USDT"), o que a BingX devolve ("TRUMPSOL-USDT")
+// e o que o bot usa internamente ("TRUMPSOLUSDT") — e um alias ainda acrescenta uma quarta
+// ("LIGHTER-USDT" = "LITUSDT"). Sem normalizar, um target criado por comando com hífen
+// ficava com chave diferente da posição e a limpeza de órfãos apagava-o no tick seguinte:
+// desaparecia do Telegram e nunca chegava a disparar.
+function canonicalSymbol(sym) { return fromBingxSymbol(toBingxSymbol(sym)); }
 function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/"short"
   const s = normalizeSide(side);
-  return `${String(symbol).toUpperCase()}:${s === "Sell" ? "SHORT" : "LONG"}`;
+  return `${canonicalSymbol(symbol)}:${s === "Sell" ? "SHORT" : "LONG"}`;
 }
 // Sinal ANTES do cifrão: "-$0.10", não "$-0.10"
 function fmtUsd(v) { return `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}`; }
@@ -1471,12 +1488,24 @@ async function checkAutoCommit() {
     const positions = await getAllOpenPositions();
     const openKeys  = new Set(positions.map(p => targetKey(p.symbol, p.side)));
 
-    // Orphans first, so a target never outlives its position
+    // Órfãos: um target não deve sobreviver à posição. Mas também não deve morrer por
+    // uma leitura falhada — uma lista vazia ou incompleta (blip da API, fecho parcial a
+    // meio) apagaria targets de posições que estão bem vivas. Exige TARGET_MISSES_TO_DROP
+    // leituras seguidas sem a posição antes de apagar.
     for (const [key, t] of Object.entries(targets)) {
-      if (openKeys.has(key)) continue;
+      if (openKeys.has(key)) {
+        if (t.misses) { t.misses = 0; saveTargets(); }
+        continue;
+      }
+      t.misses = (t.misses || 0) + 1;
+      if (t.misses < TARGET_MISSES_TO_DROP) {
+        console.log(`  🚩 Target ${key}: posição não vista (${t.misses}/${TARGET_MISSES_TO_DROP}) — mantido. Abertas: ${[...openKeys].join(", ") || "nenhuma"}`);
+        saveTargets();
+        continue;
+      }
       delete targets[key]; saveTargets();
-      console.log(`  🎯 Target ${key} removido — posição já não está aberta`);
-      await sendTelegram(`🎯 <b>Bot v3 ${key.replace(":", " ")}</b> — target de ${fmtUsd(t.usd)} removido: a posição já não está aberta (fechou por outra via).`, t.chatId || null);
+      console.log(`  🚩 Target ${key} removido — posição ausente em ${TARGET_MISSES_TO_DROP} leituras. Abertas: ${[...openKeys].join(", ") || "nenhuma"}`);
+      await sendTelegram(`🚩 <b>Bot v3 ${key.replace(":", " ")}</b> — target de ${fmtUsd(t.usd)} removido: a posição já não está aberta (fechou por outra via).`, t.chatId || null);
     }
 
     for (const p of positions) {
