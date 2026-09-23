@@ -1838,13 +1838,23 @@ function bxSignature(paramStr) {
 }
 
 // Signed request. `params` values are signed raw and URL-encoded on the wire.
+// Os orderId da BingX têm 19 dígitos e passam de Number.MAX_SAFE_INTEGER (2^53). Com
+// JSON.parse normal perdem precisão em silêncio — 2102857792339795968 vira
+// ...796000 — e a partir daí TODA a consulta por id devolve "order not exist":
+// o estado da ordem nunca é lido (sem deteção de fill, sem chase, sem fallback de
+// breakout) e os cancelamentos por id falham. Ficam como STRING antes do parse.
+// Só afeta inteiros com 16+ dígitos em posição de valor: timestamps têm 13.
+function bxParse(text) {
+  return JSON.parse(text.replace(/([:[,]\s*)(\d{16,})(?=\s*[,}\]])/g, '$1"$2"'));
+}
+
 async function bxRequest(method, path, params = {}) {
   const p = { ...params, timestamp: Date.now() };
   const rawQs = Object.entries(p).map(([k, v]) => `${k}=${v}`).join("&");
   const encQs = Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
   const url = `${CONFIG.bingx.baseUrl}${path}?${encQs}&signature=${bxSignature(rawQs)}`;
   const res  = await fetch(url, { method, headers: { "X-BX-APIKEY": CONFIG.bingx.apiKey } });
-  const data = await res.json();
+  const data = bxParse(await res.text());
   if (data.code !== undefined && data.code !== 0) {
     // 100410 = limite de frequência do endpoint. A mensagem traz o instante de
     // desbloqueio em epoch-ms; traduzi-lo evita a mensagem críptica no Telegram.
@@ -1863,7 +1873,7 @@ async function bxRequest(method, path, params = {}) {
 async function bxPublic(path, params = {}) {
   const qs  = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
   const res = await fetch(`${CONFIG.bingx.baseUrl}${path}${qs ? `?${qs}` : ""}`);
-  const data = await res.json();
+  const data = bxParse(await res.text());
   if (data.code !== undefined && data.code !== 0) throw new Error(`BingX ${path}: ${data.msg || `code ${data.code}`}`);
   return data.data;
 }
@@ -2183,6 +2193,27 @@ async function rearmCarriedTarget(sym, r, entryPrice) {
   );
 }
 
+// Procura no livro a ordem limite que corresponde a uma re-entrada cujo id deixou de
+// ser reconhecido. Identifica-a pelo que a define: símbolo, lado, tipo LIMIT de abertura
+// e preço (com tolerância de um tick). Devolve null se não estiver lá — nesse caso a
+// ordem encheu ou foi cancelada, e o fluxo normal trata disso.
+async function findRestingLimit(sym, r) {
+  try {
+    const data   = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol: toBingxSymbol(sym) });
+    const orders = data?.orders || [];
+    const wantSide  = r.action === "buy" ? "BUY" : "SELL";
+    const wantPside = POSITION_MODE === "hedge" ? (r.action === "buy" ? "LONG" : "SHORT") : null;
+    const { tickSize } = await getInstrumentInfo(sym);
+    const tol = Math.max(tickSize || 0, 1e-12) * 1.5;
+    return orders.find(o =>
+      o.type === "LIMIT" &&
+      String(o.side).toUpperCase() === wantSide &&
+      (!wantPside || String(o.positionSide).toUpperCase() === wantPside) &&
+      Math.abs(parseFloat(o.price || "0") - r.price) <= tol
+    ) || null;
+  } catch { return null; }
+}
+
 // Aproxima do mercado uma ordem limite de re-entrada que não encheu — o equivalente à
 // "chase limit order" da BingX, mas com um travão: a ordem nunca cede mais do que
 // COMMIT_CHASE_MAX_PCT da distância de pullback original. Perseguir até ao preço de
@@ -2306,6 +2337,20 @@ async function checkTrailingReentries() {
           const expiryMs = CONFIG.reentryExpiryHours * 3_600_000;
           let status = null;
           try { status = await getOrderStatus(sym, r.orderId); } catch {}
+
+          // Id não reconhecido pela BingX. Acontecia com todos os ids gravados antes da
+          // correção do JSON.parse (perdiam precisão), e deixava a ordem à deriva: sem
+          // estado, o chase, o fallback e a deteção de fill nunca corriam. Recupera-se
+          // procurando a ordem real no livro pelo símbolo/lado/preço.
+          if (status === null) {
+            const found = await findRestingLimit(sym, r);
+            if (found) {
+              console.log(`  🔧 ${sym} ${slot}: orderId corrigido ${r.orderId} → ${found.orderId}`);
+              r.orderId = found.orderId;
+              saveSymbolState();
+              status = "New";
+            }
+          }
 
           if (status === "Filled") {
             console.log(`  ✅ ${sym}: ordem limite de re-entrada encheu @ $${r.price}`);
