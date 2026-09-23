@@ -7,7 +7,17 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 // Persisted state/log live under DATA_DIR. Set DATA_DIR to a mounted Railway Volume path
 // (e.g. /data) so symbol-state.json and the trade log survive redeploys/restarts.
 // Default "." keeps the old behaviour (current working dir) for local runs.
-const DATA_DIR = process.env.DATA_DIR || ".";
+// O Railway injeta RAILWAY_VOLUME_MOUNT_PATH no serviço a que o Volume está ligado —
+// é a única fonte fiável do caminho real. Serve de default quando DATA_DIR não está
+// definido, para o estado não ir parar ao contentor por causa de uma variável em falta.
+const VOLUME_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH || "";
+const DATA_DIR = process.env.DATA_DIR || VOLUME_PATH || ".";
+// DATA_DIR a apontar para um sítio diferente do Volume é silencioso e fatal: escreve ao
+// LADO do disco persistente e perde tudo a cada redeploy. Não se corrige sozinho (a
+// configuração explícita do utilizador manda), mas grita.
+const DATA_DIR_MISMATCH = VOLUME_PATH && DATA_DIR !== VOLUME_PATH
+  ? `DATA_DIR=${DATA_DIR} mas o Volume está montado em ${VOLUME_PATH} — o estado NÃO está a ser gravado no disco persistente.`
+  : "";
 try { if (DATA_DIR !== "." && !existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); } catch {}
 
 // Default timeout for every outgoing HTTP call. Node's fetch has NO timeout: a hung
@@ -3705,7 +3715,10 @@ function checkPersistence() {
   // O caminho REAL onde está a escrever é metade do diagnóstico: um Volume montado em
   // /data não serve de nada se a variável DATA_DIR não estiver definida no serviço —
   // o default é "." e o estado vai parar ao contentor, ao lado do volume.
-  const where = `📁 DATA_DIR=<code>${DATA_DIR}</code>${DATA_DIR === "." ? " ⚠️ (default — variável NÃO definida neste serviço; o Volume não está a ser usado)" : ""}`;
+  const where = `📁 DATA_DIR=<code>${DATA_DIR}</code>` +
+    (DATA_DIR === "." ? " ⚠️ (default — sem DATA_DIR e sem Volume ligado a este serviço)" : "") +
+    (VOLUME_PATH ? `\n💾 Volume Railway montado em <code>${VOLUME_PATH}</code>` : `\n💾 ⚠️ Sem Volume ligado a ESTE serviço (RAILWAY_VOLUME_MOUNT_PATH ausente) — verifica se está no serviço errado.`) +
+    (DATA_DIR_MISMATCH ? `\n❌ <b>${DATA_DIR_MISMATCH}</b>` : "");
   if (prev?.bootAt) {
     persistReport = `✅ Estado PERSISTE (arranque anterior: ${new Date(prev.bootAt).toISOString().slice(0, 19).replace("T", " ")}). ` +
       `Restaurado: ${counts.targets} target(s), ${counts.reentries} re-entrada(s), ${counts.ratchets} ratchet(s).\n${where}`;
