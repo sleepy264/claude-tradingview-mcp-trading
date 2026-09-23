@@ -374,11 +374,49 @@ async function getAllOpenPositions() {
         markPrice:     parseFloat(p.markPrice || "0"),  // current price
         unrealizedPnl: parseFloat(p.unrealizedProfit || p.unrealisedProfit || "0"),
         leverage:      parseFloat(p.leverage || "0"),   // for margin/ROI calc
-        stopLoss:      "",                              // SL vive em ordens separadas na BingX (ver getOpenPosition)
+        // SL/TP/trailing vivem em ordens separadas na BingX — ficam a 0 aqui e são
+        // preenchidos por attachProtections() quem precisar deles (ver /pos3).
+        stopLoss:      0,
+        takeProfit:    0,
+        trailingStop:  0,
       });
     }
   }
   return out;
+}
+
+// Na BingX o SL/TP/trailing NÃO são atributos da posição — são ordens condicionais
+// separadas, e por isso /user/positions não os traz (getAllOpenPositions devolve-os
+// vazios). Isto enche-os para uma LISTA de posições com UMA só chamada a openOrders
+// (sem símbolo), em vez de uma por símbolo como faz getProtectionOrders.
+// Em hedge a associação é por símbolo + positionSide; em one-way só por símbolo.
+async function attachProtections(positions) {
+  if (positions.length === 0) return positions;
+  let orders = [];
+  try {
+    const data = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", {});
+    orders = data?.orders || (Array.isArray(data) ? data : []);
+  } catch (e) {
+    console.log(`  ⚠️  attachProtections: ${e.message}`);
+    return positions;   // sem protecções conhecidas — melhor "—" do que um número errado
+  }
+  const key = (sym, pside) => `${sym}|${POSITION_MODE === "hedge" ? String(pside || "").toUpperCase() : ""}`;
+  const byKey = new Map();
+  for (const o of orders) {
+    const k = key(fromBingxSymbol(o.symbol), o.positionSide);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(o);
+  }
+  for (const p of positions) {
+    const mine  = byKey.get(key(p.symbol, p.side === "Sell" ? "SHORT" : "LONG")) || [];
+    const sl    = mine.find(o => o.type === "STOP_MARKET"        || o.type === "STOP");
+    const tp    = mine.find(o => o.type === "TAKE_PROFIT_MARKET" || o.type === "TAKE_PROFIT");
+    const trail = mine.find(o => o.type === "TRAILING_STOP_MARKET");
+    p.stopLoss     = sl ? parseFloat(sl.stopPrice || sl.price || "0") : 0;
+    p.takeProfit   = tp ? parseFloat(tp.stopPrice || tp.price || "0") : 0;
+    p.trailingStop = trail ? 1 : 0;
+  }
+  return positions;
 }
 
 // Pending (still unfilled) orders across all symbols: resting limit entries — e.g. the
@@ -636,10 +674,22 @@ async function handleTelegramCommand(text, chatId) {
         return;
       }
 
+      // SL/TP/trailing são ordens condicionais separadas na BingX — sem isto viriam vazios
+      await attachProtections(positions);
+
       const lines = positions.map(p => {
         const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
         const t = targets[targetKey(p.symbol, p.side)];
-        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | SL=$${p.stopLoss || "—"}${t ? ` | 🎯 ${fmtUsd(t.usd)}` : ""}`;
+        // Distância até ao SL/TP: o número que diz se a protecção está perto de disparar
+        const dist = lvl => p.markPrice > 0 && lvl > 0 ? ` (${(Math.abs(lvl - p.markPrice) / p.markPrice * 100).toFixed(2)}%)` : "";
+        const prot = [
+          `🛡 SL: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss)}${dist(p.stopLoss)}` : "—"}`,
+          `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit)}${dist(p.takeProfit)}` : "—"}`,
+          ...(p.trailingStop ? ["📉 trailing ativo"] : []),
+        ].join(" | ");
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n` +
+               `   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}${t ? ` | 🚩 target ${fmtUsd(t.usd)}` : ""}\n` +
+               `   ${prot}`;
       });
 
       const totalPnl   = positions.reduce((s, p) => s + p.unrealizedPnl, 0);
