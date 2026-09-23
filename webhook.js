@@ -3686,11 +3686,41 @@ initCsv();
 loadSymbolState();
 loadTargets();
 loadRatchets();
+
+// ─── Prova de persistência ───────────────────────────────────────────────────
+// Saber se DATA_DIR sobrevive a um redeploy não se adivinha pelo caminho: /data sem
+// Volume montado é um diretório normal do contentor e desaparece com ele — e o estado
+// (targets, re-entradas, ratchets) some sem um único erro. Este marcador é escrito a
+// cada arranque; se no arranque seguinte não estiver lá, o disco é efémero.
+const PERSIST_FILE = path.join(DATA_DIR, "persist-check.json");
+let persistReport = "";
+function checkPersistence() {
+  let prev = null;
+  try { if (existsSync(PERSIST_FILE)) prev = JSON.parse(readFileSync(PERSIST_FILE, "utf8")); } catch {}
+  const counts = {
+    targets:   Object.keys(targets).length,
+    reentries: Object.values(symbolState).reduce((n, s) => n + Object.keys(getReentries(s)).length, 0),
+    ratchets:  Object.keys(ratchets).length,
+  };
+  if (prev?.bootAt) {
+    persistReport = `✅ Estado PERSISTE (arranque anterior: ${new Date(prev.bootAt).toISOString().slice(0, 19).replace("T", " ")}). ` +
+      `Restaurado: ${counts.targets} target(s), ${counts.reentries} re-entrada(s), ${counts.ratchets} ratchet(s).`;
+  } else {
+    persistReport = `⚠️ Marcador de persistência AUSENTE em ${DATA_DIR} — ou é o primeiro arranque de sempre, ou o disco é EFÉMERO ` +
+      `e o estado é apagado a cada redeploy (targets e re-entradas perdidos). Confirma que há um Volume Railway montado em ${DATA_DIR}.`;
+  }
+  try { writeFileSync(PERSIST_FILE, JSON.stringify({ bootAt: Date.now(), counts }, null, 2)); }
+  catch (e) { persistReport += ` | ❌ Não consigo sequer ESCREVER em ${DATA_DIR}: ${e.message}`; }
+  console.log(`  ${persistReport}`);
+}
 app.listen(PORT, () => {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  TradingView Webhook Bot v3 — BingX");
   console.log(`  Port     : ${PORT}`);
-  console.log(`  Data dir : ${DATA_DIR}${DATA_DIR === "." ? " (efémero — define DATA_DIR p/ Volume Railway)" : " (persistente)"} | estado: ${SYMBOL_STATE_FILE}`);
+  // Nota: um DATA_DIR definido NÃO garante persistência — só um Volume montado garante.
+  // checkPersistence() abaixo é que responde a isso, comparando com o arranque anterior.
+  console.log(`  Data dir : ${DATA_DIR}${DATA_DIR === "." ? " (efémero — define DATA_DIR p/ Volume Railway)" : ""} | estado: ${SYMBOL_STATE_FILE}`);
+  checkPersistence();
   console.log(`  Mode     : ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log(`  Leverage : ${CONFIG.leverage}x`);
   console.log(`  Trade    : $${CONFIG.tradeSize} per signal${CONFIG.riskPerTradeUSD > 0 ? ` (risk-based $${CONFIG.riskPerTradeUSD})` : ""}`);
@@ -3744,4 +3774,13 @@ app.listen(PORT, () => {
 
   // Start Telegram command polling
   startTelegramPolling();
+
+  // Diz no canal o que sobreviveu ao redeploy. Sem isto, perder targets num deploy é
+  // invisível: o bot arranca "bem" e só se dá pela falta quando o encaixe não acontece.
+  sendTelegram(
+    `🔄 <b>Bot v3</b> — arranque\n${persistReport}` +
+    (Object.keys(targets).length
+      ? `\n🚩 Targets ativos: ${Object.entries(targets).map(([k, t]) => `${k.replace(":", " ")} → ${fmtUsd(t.usd)}`).join(" | ")}`
+      : `\n🚩 Sem targets ativos.`)
+  ).catch(() => {});
 });
