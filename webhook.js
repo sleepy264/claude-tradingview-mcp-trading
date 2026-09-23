@@ -229,8 +229,9 @@ function _getSymState(symbol) {
 
 // ─── /target3 — encaixe condicional por posição ──────────────────────────────
 // Um target é um /commit3 adiado: "quando o PnL desta posição chegar a X USDT, encaixa
-// e arma a re-entrada". Uso único — dispara uma vez e desaparece; a posição reaberta
-// não herda o target. Guardado à parte do symbolState e indexado por SYMBOL:SIDE, para
+// e arma a re-entrada". Dispara uma vez por posição, mas é HERDADO pela posição que a
+// re-entrada abrir (ver rearmCarriedTarget), medido de novo a partir de zero — daí sair
+// uma escada de encaixes. Guardado à parte do symbolState e indexado por SYMBOL:SIDE, para
 // que em hedge o LONG e o SHORT do mesmo par tenham targets independentes.
 // Persistido em DATA_DIR para sobreviver a redeploys.
 const TARGETS_FILE = path.join(DATA_DIR, "targets.json");
@@ -922,7 +923,7 @@ async function handleTelegramCommand(text, chatId) {
   }
 
   // /target3 — encaixe condicional: faz o mesmo que /commit3, mas só quando o PnL da
-  // posição chegar a X USDT (verificado a cada POSITION_POLL_MS). Uso único.
+  // posição chegar a X USDT (verificado a cada POSITION_POLL_MS). Herdado pela re-entrada.
   //   /target3                      → targets ativos + botões por posição aberta
   //   /target3 SYMBOL               → pede o valor (próxima mensagem)
   //   /target3 SYMBOL 20            → define target de +20 USDT
@@ -1265,7 +1266,8 @@ async function setTarget(symbol, pos, usd, chatId) {
   await sendTelegram(
     `🎯 <b>Bot v3 ${symbol} ${sideTxt}</b> — target ${prev ? "atualizado" : "definido"}: <b>${fmtUsd(usd)}</b>\n` +
     `PnL atual ${fmtUsd(pos.unrealizedPnl)} | qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
-    `Ao chegar: fecha + arma re-entrada (como /commit3). Uso único. Verifica a cada ${pollS}s.\n` +
+    `Ao chegar: fecha + arma re-entrada (como /commit3). Verifica a cada ${pollS}s.\n` +
+    `🔁 A posição que a re-entrada abrir herda este target (contado de novo a partir de zero).\n` +
     (pos.unrealizedPnl >= usd ? `⚡ O PnL já está acima do target — dispara na próxima verificação (≤${pollS}s).\n` : "") +
     (ac && usd >= ac.threshold ? `⚠️ O auto-commit dispara a $${ac.threshold.toFixed(2)} (${ac.label}) — apanha esta posição ANTES do target.\n` : "") +
     `Remover: <code>/target3 ${symbol}${POSITION_MODE === "hedge" ? ` ${sideTxt.toLowerCase()}` : ""} off</code>`,
@@ -1277,7 +1279,9 @@ async function setTarget(symbol, pos, usd, chatId) {
 // re-entering once price retraces the pullback distance from the exit.
 // Used by /commit3 SYMBOL [long|short] (manual) and checkAutoCommit (which always passes
 // a side, since it iterates positions). `side` desambigua em hedge mode.
-async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
+// `carryTargetUsd` — valor de target a transportar para a posição re-aberta. Quando não
+// é passado, é lido (e consumido) do target guardado para esta posição.
+async function commitSymbol(argSym, chatId, source = "/commit3", side = null, carryTargetUsd = null) {
   try {
     if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
@@ -1307,6 +1311,14 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       );
       return;
     }
+
+    // Target a transportar: o encaixe fecha a posição, mas a intenção ("encaixa sempre
+    // que ganhar X") pertence à ideia, não a esta instância dela. A re-entrada volta a
+    // armá-lo quando encher, formando uma escada de encaixes.
+    const tKey    = targetKey(argSym, pos.side);
+    const carried = carryTargetUsd != null ? carryTargetUsd : (targets[tKey]?.usd ?? null);
+    const carriedChat = targets[tKey]?.chatId ?? chatId ?? null;
+    if (targets[tKey]) { delete targets[tKey]; saveTargets(); }
 
     const exitPrice  = (await fetchCurrentPrice(argSym)) || pos.avgPrice;
     // Mirror protection presence: if the original position ran without SL / trailing
@@ -1354,7 +1366,8 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
         await sendTelegram(
           `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Ganho encaixado (${source})\n` +
           `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
-          `⏸ Sem re-entrada: ${msg}`,
+          `⏸ Sem re-entrada: ${msg}` +
+          (carried != null ? `\n🚩 Target de ${fmtUsd(carried)} perdido — não há posição nova para o herdar` : ""),
           chatId
         );
         return;
@@ -1398,6 +1411,8 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       hadTrail,            // fill handler mirrors trailing presence
       tpPrice,             // inherited TP level (fallback market entry re-attaches it)
       createdAt: Date.now(),
+      targetUsd:    carried,       // re-armado quando a re-entrada encher
+      targetChatId: carriedChat,
       // Referências do chase (ver chaseReentryLimit): sem elas não há como saber
       // quanto da vantagem já foi cedida, por isso watches antigas não são perseguidas.
       exitPrice,
@@ -1418,6 +1433,7 @@ async function commitSymbol(argSym, chatId, source = "/commit3", side = null) {
       (lim.tpPrice ? `🎯 TP herdado: $${lim.tpPrice}\n` : "") +
       (!hadSL || !hadTrail ? `⚠️ Sem ${!hadSL && !hadTrail ? "SL nem trailing" : !hadSL ? "SL" : "trailing"} (a posição original não tinha)\n` : "") +
       (breakoutLevel ? `🚀 Fallback: entra a mercado se romper $${formatPrice(breakoutLevel)} sem dar o pullback\n` : "") +
+      (carried != null ? `🚩 Target de ${fmtUsd(carried)} herdado — volta a armar quando a re-entrada encher\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
     );
@@ -1469,14 +1485,16 @@ async function checkAutoCommit() {
       if (nonCryptoBlocked(p.symbol)) continue;
       const sideArg = p.side === "Buy" ? "long" : "short";
 
-      // /target3 — uso único: apaga ANTES de executar, para nunca disparar duas vezes
-      // (e para a posição reaberta pelo commit não o herdar)
+      // /target3 — apaga ANTES de executar, para nunca disparar duas vezes sobre a mesma
+      // posição; o valor segue para o commit, que o transporta para a re-entrada.
       const key = targetKey(p.symbol, p.side);
       const t   = targets[key];
       if (t && p.unrealizedPnl >= t.usd) {
         delete targets[key]; saveTargets();
         console.log(`\n🎯 [Target] ${p.symbol} ${p.side}: PnL $${p.unrealizedPnl.toFixed(2)} ≥ $${t.usd} — a encaixar`);
-        await commitSymbol(p.symbol, t.chatId || null, "/target3", sideArg);
+        // O valor vai explícito: foi apagado acima (para não disparar duas vezes) e o
+        // commitSymbol já não o encontraria para o transportar para a re-entrada.
+        await commitSymbol(p.symbol, t.chatId || null, "/target3", sideArg, t.usd);
         continue; // posição fechada — o auto-commit já não se aplica
       }
 
@@ -2013,6 +2031,22 @@ async function checkPositionTimeouts() {
   }
 }
 
+// Volta a armar o target herdado na posição que a re-entrada acabou de abrir, fechando
+// o ciclo "encaixa sempre que ganhar X". O valor é o mesmo, mas medido no PnL da posição
+// NOVA (que começa em zero) — cada degrau da escada é um ganho fresco de X, não acumulado.
+async function rearmCarriedTarget(sym, r, entryPrice) {
+  if (!(r?.targetUsd > 0)) return;
+  const key = targetKey(sym, r.action === "buy" ? "Buy" : "Sell");
+  targets[key] = { usd: r.targetUsd, createdAt: Date.now(), chatId: r.targetChatId || null };
+  saveTargets();
+  console.log(`  🚩 ${key}: target de $${r.targetUsd} re-armado na posição re-aberta`);
+  await sendTelegram(
+    `🚩 <b>Bot v3 ${sym}</b> — target de ${fmtUsd(r.targetUsd)} re-armado\n` +
+    `Herdado da posição encaixada. Mede o PnL da posição nova (entrada $${formatPrice(entryPrice)}), a partir de zero.`,
+    r.targetChatId || null
+  );
+}
+
 // Aproxima do mercado uma ordem limite de re-entrada que não encheu — o equivalente à
 // "chase limit order" da BingX, mas com um travão: a ordem nunca cede mais do que
 // COMMIT_CHASE_MAX_PCT da distância de pullback original. Perseguir até ao preço de
@@ -2155,6 +2189,7 @@ async function checkTrailingReentries() {
               }
             } catch (e) { console.log(`  ⚠️  Trailing pós-fill ${sym}: ${e.message}`); }
             await sendTelegram(`🔁 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
+            await rearmCarriedTarget(sym, r, r.price);
             continue;
           }
           if (status === "Cancelled" || status === "Rejected" || status === "Deactivated") {
@@ -2224,6 +2259,7 @@ async function checkTrailingReentries() {
                   `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel)}\n` +
                   `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}${takeProfit ? ` | TP herdado: $${takeProfit}` : ""}`
                 );
+                await rearmCarriedTarget(sym, r, cur);
               } catch (e) {
                 console.log(`  ❌ Fallback breakout ${sym} falhou: ${e.message}`);
                 delete state.reentries[slot];
