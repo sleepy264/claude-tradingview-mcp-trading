@@ -1532,11 +1532,13 @@ async function startTelegramPolling() {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({ commands: [
+      // A ordem desta lista é a ordem que o Telegram mostra no menu "/" — os dois
+      // comandos mais usados ficam à cabeça.
+      { command: "pos3", description: "📈 Posições abertas" },
       { command: "pnl3", description: "📊 PnL do dia" },
       { command: "stats7", description: "📈 PnL últimos 7 dias (gráfico)" },
       { command: "stats30", description: "📈 PnL últimos 30 dias (gráfico)" },
       { command: "stats365", description: "📈 PnL últimos 365 dias (por mês)" },
-      { command: "pos3", description: "📈 Posições abertas" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
       { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
       { command: "target3", description: "🎯 Encaixar quando o PnL chegar a X (ou /target3 SYMBOL 20)" },
