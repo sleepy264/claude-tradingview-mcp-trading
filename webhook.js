@@ -173,7 +173,11 @@ const CONFIG = {
   // distância de pullback original. Perseguir até ao preço de saída seria re-entrar onde
   // se vendeu — encaixava o ganho e pagava duas comissões para ficar na mesma.
   commitChaseEnabled:     process.env.COMMIT_CHASE_ENABLED !== "false",
-  commitChaseIntervalMs:  parseInt(process.env.COMMIT_CHASE_INTERVAL_MS || "300000"),  // 5 min
+  // 90s, não 5 min: num par rápido (BEAT) cinco minutos é mais tempo do que o
+  // movimento dura — numa re-entrada real o utilizador reajustou à mão aos 3m44,
+  // antes do primeiro passo do bot sequer ser elegível. O piso útil é 60s, que é a
+  // cadência do checkTrailingReentries.
+  commitChaseIntervalMs:  parseInt(process.env.COMMIT_CHASE_INTERVAL_MS || "90000"),
   commitChaseStepPct:     parseFloat(process.env.COMMIT_CHASE_STEP_PCT || "0.33"),     // 1/3 do que falta, por passo
   commitChaseMaxPct:      parseFloat(process.env.COMMIT_CHASE_MAX_PCT || "0.7"),       // cede no máximo 70% do pullback
   commitChaseMaxSteps:    parseInt(process.env.COMMIT_CHASE_MAX_STEPS || "6"),
@@ -2254,9 +2258,15 @@ async function chaseReentryLimit(sym, state, slot, r, now) {
   const keep  = r.pullbackDist * (1 - CONFIG.commitChaseMaxPct);
   const bound = isBuy ? r.exitPrice - keep : r.exitPrice + keep;
 
+  // O passo aponta ao TRAVÃO, não ao preço atual. Apontar ao preço é assintótico: uma
+  // ordem de venda enche quando o preço a alcança, logo a limite tem de descer ABAIXO
+  // do preço — e fechar 33% do que falta até ao preço nunca o cruza. Com o mercado
+  // colado à ordem os passos ficam menores que um tick e o chase estagna (foi o que
+  // aconteceu no BEAT: limite $0.1030, preço $0.1025, passo $0.00017).
+  // O travão é a concessão máxima já aceite, por isso é o alvo certo — e continua a ser
+  // aproximado por passos, não de uma vez.
   const { tickSize } = await getInstrumentInfo(sym);
-  let next = r.price + (cur - r.price) * CONFIG.commitChaseStepPct;
-  next = isBuy ? Math.min(next, bound) : Math.max(next, bound);
+  const next = r.price + (bound - r.price) * CONFIG.commitChaseStepPct;
   const nextStr = roundToTick(next, tickSize);
 
   // Já no travão (ou o passo não chega a mover um tick): pára de perseguir, mas mantém
@@ -3764,7 +3774,7 @@ app.listen(PORT, () => {
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
   console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | passo mín ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
-  console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 60000}min (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
+  console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
   console.log("═══════════════════════════════════════════════════════════");
