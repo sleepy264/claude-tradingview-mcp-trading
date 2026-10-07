@@ -1785,14 +1785,44 @@ for (const pair of (process.env.SYMBOL_ALIASES || "LITUSDT:LIGHTER-USDT").split(
   if (tv && bx) { SYMBOL_ALIAS.set(tv, bx); SYMBOL_ALIAS_REV.set(bx, tv); }
 }
 
+// Os ativos não-cripto têm um símbolo de API que ninguém escreve (NCFXGBP2USD-USDT) e um
+// nome de exibição (displayName "GBPUSD-USDT") parecido com o ticker do TradingView
+// ("GBPUSD"). Sem esta tradução o sinal falhava com "o par não existe na BingX (GBPUSD)".
+// O mapa é construído a partir da lista de contratos (getContracts) e só é consultado
+// quando o nome direto NÃO é um contrato — os pares cripto nunca passam por aqui.
+const DISPLAY_ALIAS   = new Map(); // "GBPUSD" / "GBPUSDUSDT" / "GBPUSD-USDT" → "NCFXGBP2USD-USDT"
+const CONTRACT_SYMBOLS = new Set();
+function indexContracts(list) {
+  CONTRACT_SYMBOLS.clear();
+  DISPLAY_ALIAS.clear();
+  for (const c of list) {
+    const sym = String(c.symbol || "").toUpperCase();
+    if (!sym) continue;
+    CONTRACT_SYMBOLS.add(sym);
+    if (!/^NC(SK|FX|SI|CO)/.test(sym)) continue;
+    const disp = String(c.displayName || "").toUpperCase().replace(/\s+/g, "");
+    if (!disp) continue;
+    const base = disp.replace(/-USD[TC]$/, "");
+    for (const k of [disp, disp.replace("-", ""), base]) {
+      if (k && !DISPLAY_ALIAS.has(k)) DISPLAY_ALIAS.set(k, sym);
+    }
+  }
+}
+
 function toBingxSymbol(sym) {
   const s = String(sym || "").toUpperCase();
   const alias = SYMBOL_ALIAS.get(s);
   if (alias) return alias;
-  if (s.includes("-")) return s;
-  if (s.endsWith("USDT")) return s.slice(0, -4) + "-USDT";
-  if (s.endsWith("USDC")) return s.slice(0, -4) + "-USDC";
-  return s;
+  let bx = s;
+  if (!s.includes("-")) {
+    if (s.endsWith("USDT")) bx = s.slice(0, -4) + "-USDT";
+    else if (s.endsWith("USDC")) bx = s.slice(0, -4) + "-USDC";
+  }
+  if (CONTRACT_SYMBOLS.size && !CONTRACT_SYMBOLS.has(bx)) {
+    const disp = DISPLAY_ALIAS.get(s) || DISPLAY_ALIAS.get(bx);
+    if (disp) return disp;
+  }
+  return bx;
 }
 function fromBingxSymbol(sym) {
   const s = String(sym || "").toUpperCase();
@@ -1807,7 +1837,7 @@ function fromBingxSymbol(sym) {
 // isso estes pares são bloqueados à entrada — com explicação — em vez de falharem com
 // um erro opaco da API a meio de uma operação.
 function isNonCryptoSymbol(symbol) {
-  return /^NC(SK|FX|SI|CO)/i.test(String(symbol || "").toUpperCase());
+  return /^NC(SK|FX|SI|CO)/i.test(toBingxSymbol(symbol));
 }
 
 // Nome legível: fromBingxSymbol tira o hífen (NCSKIBMR2USD-USDT → NCSKIBMR2USDUSDT),
@@ -1958,6 +1988,7 @@ async function getContracts() {
   const data = await bxPublic("/openApi/swap/v2/quote/contracts");
   _contractsCache.list = Array.isArray(data) ? data : [];
   _contractsCache.at   = Date.now();
+  if (_contractsCache.list.length) indexContracts(_contractsCache.list);
   return _contractsCache.list;
 }
 
@@ -3191,7 +3222,14 @@ async function handleWebhook(body) {
   }
 
   const actionLower   = action.toLowerCase();
-  const sym           = symbol || process.env.SYMBOL || "BTCUSDT";
+  // Contratos carregados ANTES de traduzir: o nome de exibição (GBPUSD) só resolve para o
+  // símbolo da API (NCFXGBP2USD-USDT) com a lista em cache. A forma canónica é a mesma que
+  // as posições lidas da API usam, para estado/targets/ratchets baterem certo.
+  try { await getContracts(); } catch {}
+  const sym           = canonicalSymbol(symbol || process.env.SYMBOL || "BTCUSDT");
+  if (sym !== String(symbol || "").toUpperCase() && isNonCryptoSymbol(sym)) {
+    console.log(`  🔁 ${symbol} → ${prettySymbol(sym)} (nome de exibição BingX)`);
+  }
   const effectiveLev  = leverage ? parseInt(leverage) : CONFIG.leverage;
 
   // Ativos não-cripto (ações/forex/índices) não aceitam ordens via API em modo one-way —
@@ -3799,6 +3837,10 @@ app.listen(PORT, () => {
   // é o que a BingX exige para ativos não-cripto — e forçar one-way revertia essa
   // escolha a cada redeploy. As ordens adaptam-se ao modo detetado.
   detectPositionMode();
+
+  // Pré-carrega os contratos: toBingxSymbol é síncrono e só traduz nomes de exibição
+  // (GBPUSD → NCFXGBP2USD-USDT) depois de a lista estar em cache.
+  getContracts().catch(err => console.log(`  ⚠️ Contratos BingX não carregados: ${err.message}`));
 
   // Start Telegram command polling
   startTelegramPolling();
