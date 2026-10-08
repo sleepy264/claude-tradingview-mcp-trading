@@ -282,6 +282,44 @@ function saveTargets() {
 // ficava com chave diferente da posição e a limpeza de órfãos apagava-o no tick seguinte:
 // desaparecia do Telegram e nunca chegava a disparar.
 function canonicalSymbol(sym) { return fromBingxSymbol(toBingxSymbol(sym)); }
+
+// ─── Exclusão por símbolo ────────────────────────────────────────────────────
+// Alertas do TradingView, comandos do Telegram e os pollers de fundo (auto-commit,
+// /target3, ratchet, re-entradas) mexem nas MESMAS posições e ordens. Sem exclusão,
+// dois deles podiam ler o mesmo estado e agir os dois — ex.: um alerta a reverter
+// enquanto o auto-commit encaixa a mesma posição. Cada operação sobre um símbolo
+// espera que a anterior termine (fila, não descarte). Não é reentrante: uma função
+// com o lock não pode chamar outra que o peça para o mesmo símbolo.
+const _symLocks = new Map();
+async function withSymbolLock(symbol, fn) {
+  const key  = canonicalSymbol(symbol);
+  const prev = _symLocks.get(key) || Promise.resolve();
+  let release;
+  const mine    = new Promise(r => { release = r; });
+  const chained = prev.then(() => mine);
+  _symLocks.set(key, chained);
+  await prev;
+  try { return await fn(); }
+  finally {
+    release();
+    if (_symLocks.get(key) === chained) _symLocks.delete(key);
+  }
+}
+
+// Há uma operação em curso (ou em fila) neste símbolo? Os pollers que decidem com base
+// numa leitura feita ANTES de obter o lock usam isto para saltar em vez de esperar.
+function symbolBusy(symbol) { return _symLocks.has(canonicalSymbol(symbol)); }
+
+// Um poller de fundo não arranca uma volta nova enquanto a anterior ainda corre — com
+// HTTP a até 20s por pedido, uma volta pode durar mais que o intervalo do setInterval.
+function nonOverlapping(name, fn) {
+  let running = false;
+  return async () => {
+    if (running) { console.log(`  ⏭ ${name}: volta anterior ainda a correr — esta saltada`); return; }
+    running = true;
+    try { await fn(); } finally { running = false; }
+  };
+}
 // ─── Ratchet do SL ───────────────────────────────────────────────────────────
 // Por posição (SYMBOL:SIDE): a distância ancorada e o último SL que o BOT colocou.
 // O último SL serve para distinguir "o stop está onde eu o pus" de "o utilizador mexeu
@@ -1147,14 +1185,12 @@ async function handleTelegramCommand(text, chatId) {
       let ok = 0;
       const failed = [];
       for (const o of orders) {
-        try {
-          const r = await cancelOrder(o.symbol, o.orderId);
-          if (r?.retCode === 0) ok++; else failed.push(`${o.symbol}: ${r?.retMsg || "erro"}`);
-        } catch (e) {
-          failed.push(`${o.symbol}: ${e.message}`);
-        }
+        // cancelOrder devolve null quando falha (não lança) — retCode era da Bybit
+        const r = await cancelOrder(o.symbol, o.orderId);
+        if (!r) { failed.push(`${o.symbol}: cancelamento recusado (ver logs)`); continue; }
+        ok++;
         // Se era uma re-entrada vigiada pelo bot, limpar o estado para o poller não
-        // ficar a consultar uma ordem que já não existe
+        // ficar a consultar uma ordem que já não existe (só quando o cancel resultou)
         for (const [sym, st] of Object.entries(symbolState)) {
           for (const [slot, r] of reentryList(st)) {
             if (r.orderId === o.orderId) { delete st.reentries[slot]; console.log(`  ✖ ${sym} ${slot}: watch de re-entrada removida (/closewait3)`); }
@@ -1184,7 +1220,10 @@ async function handleTelegramCommand(text, chatId) {
 // breakout auto-detector doesn't re-arm a watch for this closure.
 // qty > 0 closes only that many contracts: the position stays open, so the state,
 // SL/trailing and any pending re-entry are deliberately left untouched.
-async function closeSymbol(argSym, chatId, qty = null, side = null) {
+function closeSymbol(argSym, ...rest) {
+  return withSymbolLock(argSym, () => _closeSymbol(argSym, ...rest));
+}
+async function _closeSymbol(argSym, chatId, qty = null, side = null) {
   try {
     if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
@@ -1228,7 +1267,7 @@ async function closeSymbol(argSym, chatId, qty = null, side = null) {
     const rClose = getReentries(s)[reentrySlot(pos.side === "Buy" ? "buy" : "sell")];
     if (rClose) {
       if (rClose.type === "limit" && rClose.orderId) {
-        try { await cancelOrder(argSym, rClose.orderId); cancelledReentry = true; } catch {}
+        cancelledReentry = !!(await cancelOrder(argSym, rClose.orderId));
       } else {
         cancelledReentry = true;
       }
@@ -1334,7 +1373,10 @@ async function setTarget(symbol, pos, usd, chatId) {
 // a side, since it iterates positions). `side` desambigua em hedge mode.
 // `carryTargetUsd` — valor de target a transportar para a posição re-aberta. Quando não
 // é passado, é lido (e consumido) do target guardado para esta posição.
-async function commitSymbol(argSym, chatId, source = "/commit3", side = null, carryTargetUsd = null) {
+function commitSymbol(argSym, ...rest) {
+  return withSymbolLock(argSym, () => _commitSymbol(argSym, ...rest));
+}
+async function _commitSymbol(argSym, chatId, source = "/commit3", side = null, carryTargetUsd = null) {
   try {
     if (nonCryptoBlocked(argSym)) {
       await sendTelegram(`🚫 <b>Bot v3 ${prettySymbol(argSym)}</b> — ${NON_CRYPTO_MSG}`, chatId);
@@ -1525,8 +1567,9 @@ async function replaceStopLoss(symbol, pos, newSlPrice, oldOrderId) {
     type: "STOP_MARKET", stopPrice: newSlPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
   });
   if (oldOrderId) {
-    try { await cancelOrder(symbol, oldOrderId); }
-    catch (e) { console.log(`  ⚠️  ${symbol}: stop novo colocado mas o antigo (${oldOrderId}) não foi cancelado: ${e.message}`); }
+    if (!(await cancelOrder(symbol, oldOrderId))) {
+      console.log(`  ⚠️  ${symbol}: stop novo colocado mas o antigo (${oldOrderId}) não foi cancelado`);
+    }
   }
 }
 
@@ -1541,10 +1584,14 @@ async function ratchetStops(positions) {
 
   for (const p of positions) {
     const key = targetKey(p.symbol, p.side);
+    // Ocupado (alerta/comando a meio neste par)? Salta esta volta: a leitura do SL feita
+    // no início do tick pode já estar desatualizada. Tenta de novo no tick seguinte.
+    if (symbolBusy(p.symbol)) { console.log(`  ⏭ Ratchet ${key}: símbolo ocupado — fica para o próximo tick`); continue; }
+    await withSymbolLock(p.symbol, async () => {
     try {
       // Sem SL não há nada para mover — e o bot não cria stops por iniciativa própria.
-      if (!(p.stopLoss > 0) || !(p.markPrice > 0)) { delete ratchets[key]; continue; }
-      if (nonCryptoBlocked(p.symbol)) continue;
+      if (!(p.stopLoss > 0) || !(p.markPrice > 0)) { delete ratchets[key]; return; }
+      if (nonCryptoBlocked(p.symbol)) return;
 
       const { tickSize } = await getInstrumentInfo(p.symbol);
       const isLong = p.side === "Buy";
@@ -1558,19 +1605,19 @@ async function ratchetStops(positions) {
         ratchets[key] = rec;
         saveRatchets();
         console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${rec.dist.toFixed(8).replace(/\.?0+$/, "")})`);
-        continue;   // só ancora neste tick; move a partir do próximo
+        return;   // só ancora neste tick; move a partir do próximo
       }
 
       const desiredNum = isLong ? p.markPrice - rec.dist : p.markPrice + rec.dist;
       const improves   = isLong ? desiredNum > p.stopLoss : desiredNum < p.stopLoss;
-      if (!improves) continue;   // preço andou contra nós — o stop NÃO recua
+      if (!improves) return;   // preço andou contra nós — o stop NÃO recua
 
       // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick
       const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct);
-      if (Math.abs(desiredNum - p.stopLoss) < minStep) continue;
+      if (Math.abs(desiredNum - p.stopLoss) < minStep) return;
 
       const newSl = roundToTick(desiredNum, tickSize);
-      if (parseFloat(newSl) === p.stopLoss) continue;
+      if (parseFloat(newSl) === p.stopLoss) return;
 
       await replaceStopLoss(p.symbol, p, newSl, p.slOrderId);
       const from = p.stopLoss;
@@ -1588,6 +1635,7 @@ async function ratchetStops(positions) {
     } catch (e) {
       console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
     }
+    });
   }
 }
 
@@ -1633,6 +1681,9 @@ async function checkAutoCommit() {
       // Ativos não-cripto não aceitam ordens via API — não vale a pena tentar de
       // minuto a minuto (encheria o Telegram de erros iguais)
       if (nonCryptoBlocked(p.symbol)) continue;
+      // PnL lido no início do tick — se o par está ocupado (alerta a reverter, /close3…),
+      // a decisão pode já não valer. Fica para o tick seguinte.
+      if (symbolBusy(p.symbol)) continue;
       const sideArg = p.side === "Buy" ? "long" : "short";
 
       // /target3 — apaga ANTES de executar, para nunca disparar duas vezes sobre a mesma
@@ -2089,30 +2140,61 @@ async function fetchBidAsk(symbol) {
 // Returns a BingX-style status string ("New", "Filled", "PartiallyFilled", "Cancelled")
 // so existing call sites keep working, or null on error.
 async function getOrderStatus(symbol, orderId) {
+  return (await getOrderInfo(symbol, orderId)).status;
+}
+
+// Estado + quantidade executada. { status: null } em caso de erro.
+async function getOrderInfo(symbol, orderId) {
   try {
     const data = await bxRequest("GET", "/openApi/swap/v2/trade/order", { symbol: toBingxSymbol(symbol), orderId });
-    const st = data?.order?.status || data?.status;
+    const o  = data?.order || data || {};
+    const st = o.status;
+    let status;
     switch (st) {
-      case "NEW": case "PENDING": return "New";
-      case "FILLED": return "Filled";
-      case "PARTIALLY_FILLED": return "PartiallyFilled";
-      case "CANCELLED": case "CANCELED": return "Cancelled";
-      case "EXPIRED": return "Deactivated";
-      default: return st ?? null;
+      case "NEW": case "PENDING": status = "New"; break;
+      case "FILLED": status = "Filled"; break;
+      case "PARTIALLY_FILLED": status = "PartiallyFilled"; break;
+      case "CANCELLED": case "CANCELED": status = "Cancelled"; break;
+      case "EXPIRED": status = "Deactivated"; break;
+      default: status = st ?? null;
     }
+    return { status, executedQty: parseFloat(o.executedQty || "0") || 0 };
   } catch {
-    return null;
+    return { status: null, executedQty: 0 };
   }
 }
 
-// Cancel an open order by orderId.
+// Cancel an open order by orderId. Never throws: returns the BingX response on success,
+// null on failure — callers that act on the outcome must check it (or use cancelConfirmed).
 async function cancelOrder(symbol, orderId) {
   try {
-    return await bxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol: toBingxSymbol(symbol), orderId });
+    return (await bxRequest("DELETE", "/openApi/swap/v2/trade/order", { symbol: toBingxSymbol(symbol), orderId })) ?? {};
   } catch (e) {
     console.log(`  ⚠️  Cancelamento de ordem falhou: ${e.message}`);
     return null;
   }
+}
+
+// Cancela e devolve o estado FINAL real da ordem: { status, executedQty }.
+// Um cancelamento falhado quase sempre quer dizer que a ordem ENCHEU entretanto — e
+// agir como se tivesse sido cancelada (repor a limite, entrar a mercado) duplicava a
+// posição. Por isso o resultado vem sempre da leitura da ordem, não do pedido de cancel.
+//   status: "Cancelled" | "Filled" | "PartiallyFilled" | "New" | null (desconhecido)
+//   executedQty > 0 com status "Cancelled" = encheu parcialmente antes do cancelamento
+async function cancelConfirmed(symbol, orderId) {
+  await cancelOrder(symbol, orderId);
+  for (let i = 0; i < 2; i++) {
+    const info = await getOrderInfo(symbol, orderId);
+    if (info.status && info.status !== "New" && info.status !== "PartiallyFilled") return info;
+    await new Promise(r => setTimeout(r, 700));   // o cancel pode ainda não ter assentado
+  }
+  return await getOrderInfo(symbol, orderId);
+}
+
+// Só é seguro agir como "não encheu nada" quando a ordem está confirmadamente
+// cancelada e sem nenhuma quantidade executada.
+function cleanlyCancelled(info) {
+  return (info?.status === "Cancelled" || info?.status === "Deactivated") && !(info.executedQty > 0);
 }
 
 // Fetch candles from BingX and compute simple ATR(period).
@@ -2215,6 +2297,7 @@ async function checkPositionTimeouts() {
     if (!state.positionOpenTime) continue;
     const elapsed = now - state.positionOpenTime;
     if (elapsed < timeoutMs) continue;
+    if (symbolBusy(sym)) continue;   // operação em curso neste par — tenta na próxima volta
     try {
       const pos = await getOpenPosition(sym);
       if (!pos) { state.positionOpenTime = null; saveSymbolState(); continue; }
@@ -2325,11 +2408,21 @@ async function chaseReentryLimit(sym, state, slot, r, now) {
     return;
   }
 
-  try {
-    await cancelOrder(sym, r.orderId);
-  } catch (e) {
-    console.log(`  ⚠️  ${sym} ${slot}: chase abortado, cancelar falhou (${e.message}) — pode ter enchido`);
-    return;   // não repõe nada: o tick seguinte lê o estado real da ordem
+  const fin = await cancelConfirmed(sym, r.orderId);
+  if (!cleanlyCancelled(fin)) {
+    if (fin.status === "Cancelled" && fin.executedQty > 0) {
+      // Encheu em parte e o resto foi cancelado: há posição (com o SL anexado à ordem),
+      // mas mais pequena. Não se repõe nada — desarma a watch e avisa.
+      delete state.reentries[slot];
+      saveSymbolState();
+      console.log(`  ⚠️  ${sym} ${slot}: chase — a limite encheu ${fin.executedQty} antes do cancelamento; watch removida`);
+      await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} encheu parcialmente (${fin.executedQty} de ${r.qty}) @ $${formatPrice(r.price)}\nO resto foi cancelado pelo chase; a posição parcial fica aberta.`);
+    } else {
+      // Encheu (o tick seguinte trata o fill) ou estado desconhecido — em ambos os casos
+      // NÃO repor: uma limite nova por cima de uma que encheu duplicaria a posição.
+      console.log(`  ⚠️  ${sym} ${slot}: chase abortado — a ordem está ${fin.status ?? "em estado desconhecido"}, não reposta`);
+    }
+    return;
   }
 
   let atr = null;
@@ -2373,6 +2466,14 @@ async function checkTrailingReentries() {
   const now = Date.now();
 
   for (const [sym, state] of Object.entries(symbolState)) {
+    // Sem nada para vigiar, não vale a pena esperar pelo lock do símbolo
+    if (!(CONFIG.trailingReentryEnabled && state.positionOpenTime) && reentryList(state).length === 0) continue;
+    await withSymbolLock(sym, () => checkReentriesFor(sym, state, now));
+  }
+}
+
+async function checkReentriesFor(sym, state, now) {
+  {
     try {
       // ── 1) Auto-detect trailing-stop closure → arm breakout watch ─────────
       if (CONFIG.trailingReentryEnabled && state.positionOpenTime) {
@@ -2447,6 +2548,19 @@ async function checkTrailingReentries() {
             continue;
           }
 
+          // Um sinal contrário pediu o cancelamento mas ele não foi confirmado — tentar
+          // de novo, e não fazer mais nada com esta ordem (nem chase, nem fallback).
+          if (r.cancelRequested) {
+            const fin = await cancelConfirmed(sym, r.orderId);
+            if (cleanlyCancelled(fin)) {
+              console.log(`  ✖ ${sym} ${slot}: re-entrada ${r.orderId} cancelada (pedido pendente de sinal contrário)`);
+              delete state.reentries[slot];
+              saveSymbolState();
+              await sendTelegram(`✖️ <b>Bot v3 ${sym}</b> — ordem limite de re-entrada ${r.action.toUpperCase()} cancelada (pedido pendente)`);
+            }
+            continue;   // Filled é tratado no tick seguinte, pelo ramo acima
+          }
+
           // Uma re-entrada só faz sentido SEM posição aberta. Se entretanto abriu uma
           // posição por outra via (sinal do TradingView, entrada manual), a limite tem
           // de sair do livro: a encher, somaria à posição existente — averaging down,
@@ -2474,7 +2588,18 @@ async function checkTrailingReentries() {
               isInTimeWindow(new Date().getUTCHours(), CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd);
             if (broke && hoursOk) {
               console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel)} sem dar pullback — a cancelar limite e entrar a mercado`);
-              await cancelOrder(sym, r.orderId);
+              // Só entra a mercado se a limite foi MESMO cancelada sem nada executado.
+              // Se encheu entretanto, entrar a mercado duplicaria a posição.
+              const fin = await cancelConfirmed(sym, r.orderId);
+              if (!cleanlyCancelled(fin)) {
+                console.log(`  ⚠️  ${sym}: fallback abortado — a limite está ${fin.status ?? "em estado desconhecido"} (executado ${fin.executedQty}); sem entrada a mercado`);
+                if (fin.status === "Cancelled" && fin.executedQty > 0) {
+                  delete state.reentries[slot];
+                  saveSymbolState();
+                  await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} encheu parcialmente (${fin.executedQty} de ${r.qty}) antes do fallback\nSem entrada a mercado — a posição parcial fica aberta.`);
+                }
+                continue;   // Filled → o tick seguinte trata o fill; desconhecido → tenta de novo
+              }
               try {
                 const side = r.action === "buy" ? "Buy" : "Sell";
                 const { tickSize } = await getInstrumentInfo(sym);
@@ -2812,17 +2937,29 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
           console.log(`  ✅ LIMIT FILLED — taxa maker`);
         } else if (status === "PartiallyFilled") {
           // Accept partial fill, cancel remaining to avoid open limit sitting in book
-          await cancelOrder(symbol, limitOrderId);
+          await cancelConfirmed(symbol, limitOrderId);
           orderId  = limitOrderId;
           filledAs = "maker";
           console.log(`  ✅ LIMIT PARCIALMENTE FILLED — restante cancelado | taxa maker`);
         } else {
-          // Not filled → cancel and fall through to market
+          // Not filled → cancel, and go to market ONLY if the cancel is confirmed with
+          // nothing executed. A limit that filled between the status read and the cancel
+          // (or whose status couldn't be read) would otherwise be doubled by the market order.
           console.log(`  ⚠️  Limit não encheu (${status ?? "unknown"}) — a cancelar → Market`);
-          await cancelOrder(symbol, limitOrderId);
+          const fin = await cancelConfirmed(symbol, limitOrderId);
+          if (fin.status === "Filled" || fin.executedQty > 0) {
+            orderId  = limitOrderId;
+            filledAs = "maker";
+            console.log(`  ✅ LIMIT encheu durante o cancelamento (${fin.status}, qty ${fin.executedQty}) — sem Market`);
+          } else if (!cleanlyCancelled(fin)) {
+            const err = new Error(`estado da ordem limite ${limitOrderId} desconhecido após cancelar (${fin.status ?? "sem resposta"}) — Market NÃO enviada para não duplicar. Verifica a posição na BingX.`);
+            err.noMarketFallback = true;
+            throw err;
+          }
         }
       }
     } catch (e) {
+      if (e.noMarketFallback) throw e;
       console.log(`  ⚠️  Chase Limit erro (${e.message}) — a usar Market`);
     }
   }
@@ -2960,19 +3097,17 @@ async function closeHalfPosition(symbol, position) {
   return closePartialPosition(symbol, position, position.size / 2);
 }
 
-// Move the position SL to a new price. On BingX the SL is a separate STOP_MARKET order:
-// cancel the existing one (if any) and place a new closePosition stop at the new level.
-async function setBreakEvenStop(symbol, entryPrice) {
+// Move the position SL to a new price. On BingX the SL is a separate STOP_MARKET order.
+// `side` ("Buy"/"Sell") picks the position in hedge mode — without it the largest one
+// was used, which could move the stop of the OTHER side. The new stop is placed BEFORE
+// the old one is cancelled (replaceStopLoss), so a failed placement never leaves the
+// position without a stop.
+async function setBreakEvenStop(symbol, entryPrice, side = null) {
   const { tickSize } = await getInstrumentInfo(symbol);
   const slPrice = roundToTick(parseFloat(entryPrice), tickSize);
-  const pos = await getOpenPosition(symbol);
+  const pos = await getOpenPosition(symbol, side);
   if (!pos) throw new Error("Sem posição aberta para mover o SL");
-  if (pos.slOrderId) await cancelOrder(symbol, pos.slOrderId);
-  const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
-  await bxRequest("POST", "/openApi/swap/v2/trade/order", {
-    symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(pos.side),
-    type: "STOP_MARKET", stopPrice: slPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
-  });
+  await replaceStopLoss(symbol, pos, slPrice, pos.slOrderId);
 }
 
 // Income records in [startTime, endTime] — the building block for the daily/period PnL
@@ -3135,7 +3270,8 @@ async function setTrailingStop(symbol, action, entryPrice, atr = null) {
   // RÁCIO (priceRate = distância/entrada) e activationPrice opcional. Com a ativação
   // em entrada ± distância, o stop inicial ao ativar ≈ breakeven — mesma garantia.
   try {
-    const pos = await getOpenPosition(symbol);
+    // O lado da posição é o da ação — em hedge, sem isto podia ir para a posição oposta
+    const pos = await getOpenPosition(symbol, action === "buy" ? "long" : "short");
     if (!pos) { console.log("  ⚠️  Trailing ignorado — posição não encontrada"); return; }
     // Cancel a previous trailing order, if any (replace semantics like BingX's)
     if (pos.trailOrderId) await cancelOrder(symbol, pos.trailOrderId);
@@ -3220,9 +3356,14 @@ app.post("/webhook", (req, res) => {
   // Trade processing continues asynchronously in the background.
   res.json({ status: "received" });
 
-  handleWebhook(req.body).catch(err => {
-    console.log("  ❌ Unhandled error:", err.message);
-  });
+  // Contratos carregados antes de calcular a chave do lock: GBPUSD só resolve para o
+  // mesmo nome canónico que as posições usam com a lista em cache.
+  const lockSym = req.body.symbol || process.env.SYMBOL || "BTCUSDT";
+  getContracts().catch(() => {})
+    .then(() => withSymbolLock(lockSym, () => handleWebhook(req.body)))
+    .catch(err => {
+      console.log("  ❌ Unhandled error:", err.message);
+    });
 });
 
 async function handleWebhook(body) {
@@ -3313,8 +3454,22 @@ async function handleWebhook(body) {
     for (const [slot, rc] of (stCancel ? reentryList(stCancel) : [])) {
       if (!(rc.action !== actionLower || rc.type === "limit")) continue;
       if (rc.type === "limit" && rc.orderId) {
-        try { await cancelOrder(sym, rc.orderId); console.log(`  ✖ ${sym} ${slot}: ordem limite de re-entrada ${rc.orderId} cancelada na BingX`); }
-        catch (e) { console.log(`  ⚠️  ${sym} ${slot}: cancelar ordem de re-entrada falhou: ${e.message}`); }
+        // Confirmado, não presumido: se o cancelamento falhar e o estado for apagado, a
+        // limite fica no livro sem ninguém a vigiar e pode abrir uma posição contra o
+        // sinal novo mais tarde. Se encheu, passou a ser a posição — a lógica de
+        // reversão abaixo lê-a da API e trata-a como qualquer posição aberta.
+        const fin = await cancelConfirmed(sym, rc.orderId);
+        if (cleanlyCancelled(fin)) {
+          console.log(`  ✖ ${sym} ${slot}: ordem limite de re-entrada ${rc.orderId} cancelada na BingX`);
+        } else if (fin.status === "Filled" || fin.executedQty > 0) {
+          console.log(`  ℹ️  ${sym} ${slot}: a re-entrada ${rc.orderId} já tinha enchido (${fin.executedQty}) — é agora a posição aberta`);
+        } else {
+          console.log(`  ⚠️  ${sym} ${slot}: não foi possível confirmar o cancelamento da re-entrada ${rc.orderId} (${fin.status ?? "sem resposta"}) — watch mantida`);
+          await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — não consegui cancelar a ordem limite de re-entrada ${rc.action.toUpperCase()} (${rc.orderId}) ao receber sinal ${actionLower.toUpperCase()}.\nVerifica em /wait3 — o bot volta a tentar no próximo tick.`);
+          rc.cancelRequested = true;   // o checker de re-entradas volta a tentar a cada minuto
+          saveSymbolState();
+          continue;
+        }
       } else {
         console.log(`  ✖ ${sym} ${slot}: watch de re-entrada (${rc.type || "breakout"}) cancelada — sinal ${actionLower.toUpperCase()}`);
       }
@@ -3332,7 +3487,13 @@ async function handleWebhook(body) {
       return;
     }
     try {
-      const openPos = await getOpenPosition(sym);
+      // Em hedge pode haver LONG e SHORT no mesmo par. O TP do TradingView pertence à
+      // posição que o último sinal abriu (lastAction) — não à maior, que podia ser a
+      // outra (aberta à mão). Sem lastAction, ou sem posição desse lado, usa a única/maior.
+      const tpAll   = await getOpenPositionsFor(sym);
+      const tpWant  = normalizeSide(symbolState[sym]?.lastAction);
+      const openPos = (tpWant && tpAll.find(p => p.side === tpWant))
+        || (tpAll.length ? tpAll.reduce((a, b) => (b.size * b.avgPrice > a.size * a.avgPrice ? b : a)) : null);
       if (!openPos) {
         console.log(`  ⚠️  Nenhuma posição aberta em ${sym} — TP ignorado`);
         await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — TP ignorado\nNenhuma posição aberta`);
@@ -3379,55 +3540,59 @@ async function handleWebhook(body) {
       try { dailyPnl = await getDailyClosedPnl(sym); } catch (_) {}
 
       // Progressive SL tightening — works for both long and short:
-      //   TP1: current SL ≠ entry_price  → move SL to entry_price (break-even)
-      //   TP2+: current SL ≈ entry_price → move SL to midpoint(currentSL, TP_price)
-      //         midpoint moves SL up for longs, down for shorts — always tighter
+      //   TP1:  SL ainda pior que o break-even (entrada ∓ buffer) → move para o break-even
+      //   TP2+: SL já no break-even ou melhor → move para o meio entre o SL e o preço do TP
+      // O SL NUNCA recua: o ratchet pode já o ter levado para lucro antes do TP chegar, e
+      // "pôr no break-even" seria devolver esse ganho travado. Antes o TP2 era detetado
+      // por "SL a 0.1% da entrada", o que falhava com o buffer de 0.3×ATR (nos cripto
+      // passa de 0.1%) — o TP2 era tratado como TP1 e o stop podia recuar.
       let newSl = null;
       if (entryNum) {
         try {
           // Re-fetch position to get current SL after the half-close settled
-          const posAfter = await getOpenPosition(sym);
-          const currentSl = posAfter?.stopLoss ?? 0;
-          const tolerance = entryNum * 0.001; // 0.1% tolerance for float comparison
-          const breakEvenSet = currentSl > 0 && Math.abs(currentSl - entryNum) <= tolerance;
+          const isLong   = openPos.side === "Buy";
+          const posAfter = await getOpenPosition(sym, isLong ? "long" : "short");
+          if (!posAfter) throw new Error("posição já não está aberta após o fecho parcial");
+          const currentSl = posAfter.stopLoss ?? 0;
+          // a ≥ b no sentido "mais protetor": acima para longs, abaixo para shorts
+          const tighter = (a, b) => isLong ? a > b : a < b;
 
-          if (breakEvenSet) {
+          let beBuffer = 0;
+          if (CONFIG.breakEvenBufferAtr > 0) {
+            try {
+              const beAtr = await fetchATR(sym, symbolState[sym]?.lastInterval || CONFIG.candleInterval);
+              beBuffer    = beAtr * CONFIG.breakEvenBufferAtr;
+            } catch {}
+          }
+          const beSl = isLong ? entryNum - beBuffer : entryNum + beBuffer;
+          const tol  = entryNum * 1e-6;
+          const atOrPastBe = currentSl > 0 && !tighter(beSl, currentSl + (isLong ? tol : -tol));
+
+          if (atOrPastBe) {
             // TP2+ — move SL halfway between current SL and this TP price
-            newSl = (currentSl + priceNum) / 2;  // tick-rounded inside setBreakEvenStop
+            newSl = (currentSl + priceNum) / 2;
             console.log(`  ✅ SL progressivo (TP2+): $${currentSl} → $${formatPrice(newSl)} (meio entre $${currentSl} e $${priceNum})`);
           } else {
             // TP1 — move SL to entry ± ATR buffer (avoids micro-retracções a bater no SL)
-            let beBuffer = 0;
-            if (CONFIG.breakEvenBufferAtr > 0) {
-              try {
-                const beAtr = await fetchATR(sym, CONFIG.candleInterval);
-                beBuffer    = beAtr * CONFIG.breakEvenBufferAtr;
-              } catch {}
-            }
-            const beSl = openPos.side === "Buy"
-              ? entryNum - beBuffer   // long: SL ligeiramente abaixo da entrada
-              : entryNum + beBuffer;  // short: SL ligeiramente acima da entrada
-            newSl = beSl;  // tick-rounded inside setBreakEvenStop
+            newSl = beSl;
             const bufLabel = beBuffer > 0
-              ? ` (entry $${entryNum} ${openPos.side === "Buy" ? "-" : "+"} ${CONFIG.breakEvenBufferAtr}×ATR=$${beBuffer.toFixed(2)})`
+              ? ` (entry $${entryNum} ${isLong ? "-" : "+"} ${CONFIG.breakEvenBufferAtr}×ATR=$${formatPrice(beBuffer)})`
               : "";
             console.log(`  ✅ SL break-even (TP1): → $${formatPrice(newSl)}${bufLabel}`);
           }
 
           // Validate SL is on the correct side of current price before submitting.
-          // For a Buy  position: SL must be < current price (stop loss is below).
-          // For a Sell position: SL must be > current price (stop loss is above).
           // If the position is in loss at TP time the computed break-even can end up
           // on the wrong side, causing BingX to reject the order.
-          const slInvalid = newSl !== null && (
-            openPos.side === "Buy"  ? newSl >= priceNum :
-            openPos.side === "Sell" ? newSl <= priceNum : false
-          );
+          const slInvalid = isLong ? newSl >= priceNum : newSl <= priceNum;
           if (slInvalid) {
-            console.log(`  ⚠️  SL break-even $${newSl} inválido para ${openPos.side} @ $${priceNum} — ajuste ignorado`);
+            console.log(`  ⚠️  SL break-even $${formatPrice(newSl)} inválido para ${openPos.side} @ $${priceNum} — ajuste ignorado`);
+            newSl = null;
+          } else if (currentSl > 0 && !tighter(newSl, currentSl)) {
+            console.log(`  ℹ️  SL atual $${currentSl} já é mais protetor que $${formatPrice(newSl)} — mantido (o SL nunca recua)`);
             newSl = null;
           } else {
-            await setBreakEvenStop(sym, newSl);
+            await setBreakEvenStop(sym, newSl, openPos.side);
           }
         } catch (e) {
           console.log(`  ⚠️  Ajuste de SL falhou: ${e.message}`);
@@ -3496,7 +3661,12 @@ async function handleWebhook(body) {
       await setLeverage(sym, effectiveLev);
       console.log(`  Leverage set to ${effectiveLev}x`);
 
-      const openPos = await getOpenPosition(sym);
+      // Em hedge pode haver LONG e SHORT: a do MESMO lado é um duplicado (guarda abaixo),
+      // a do lado OPOSTO é a que se reverte. Antes usava-se a maior, que podia ser a errada.
+      // Em one-way há no máximo uma, e o comportamento é o mesmo de sempre.
+      const sigSide = actionLower === "buy" ? "Buy" : "Sell";
+      const symPos  = await getOpenPositionsFor(sym);
+      const openPos = symPos.find(p => p.side === sigSide) || symPos.find(p => p.side !== sigSide) || null;
 
       // ── Cooldown + daily SL limit ───────────────────────────────────────────
       const cooldownCheck = await checkCooldownAndSlLimit(sym, actionLower, !!openPos);
@@ -3847,18 +4017,18 @@ app.listen(PORT, () => {
 
   // Start background position timeout checker (every 5 min)
   if (CONFIG.positionTimeoutHours > 0) {
-    setInterval(checkPositionTimeouts, 5 * 60 * 1000);
+    setInterval(nonOverlapping("Timeout checker", checkPositionTimeouts), 5 * 60 * 1000);
     console.log(`⏱  Position timeout checker ativo — verifica a cada 5min`);
   }
 
   // Start background re-entry checker (every 1 min). Always on so manual /commit3 pullback
   // watches are serviced; breakout auto-detection is still gated by TRAILING_REENTRY_ENABLED.
-  setInterval(checkTrailingReentries, 60 * 1000);
+  setInterval(nonOverlapping("Re-entry checker", checkTrailingReentries), 60 * 1000);
   console.log(`🔁 Re-entry checker ativo (1min) — breakout: ${CONFIG.trailingReentryEnabled ? "on" : "off"} | pullback /commit3: on`);
 
   // Position poller: auto-commit + /target3. Always on (targets can be set at any time;
   // the tick is a no-op when neither applies).
-  setInterval(checkAutoCommit, CONFIG.positionPollMs);
+  setInterval(nonOverlapping("Position poller", checkAutoCommit), CONFIG.positionPollMs);
   console.log(`🎯 Position poller ativo (${CONFIG.positionPollMs / 1000}s) — /target3: on | auto-commit: ${autoCommitEnabled() ? `PnL ≥ ${CONFIG.autoCommitGainPct > 0 ? `${CONFIG.autoCommitGainPct}% da margem da posição` : `$${CONFIG.autoCommitGainUSD}`}` : "off"}${Object.keys(targets).length ? ` | targets carregados: ${Object.keys(targets).join(", ")}` : ""}`);
 
   // BingX: DETETAR o modo de posição (não o forçar). A conta pode estar em hedge —
