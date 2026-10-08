@@ -1993,27 +1993,11 @@ async function getContracts() {
 }
 
 // Taxas reais da BingX (o filtro de viabilidade usava 0.055% fixo — a taker da Bybit,
-// herdada do v2). Primeiro a taxa da CONTA (endpoint assinado, reflete o nível VIP);
+// herdada do v2). Primeiro a taxa da CONTA (getCommissionRates, reflete o nível VIP);
 // se falhar, a taxa publicada no contrato; em último caso 0.05%/0.02%, a base da BingX.
-const _feeCache = { taker: null, maker: null, at: 0 };
-const FEE_TTL   = 60 * 60 * 1000;
 async function getFeeRates(symbol) {
-  if (_feeCache.taker === null || Date.now() - _feeCache.at > FEE_TTL) {
-    try {
-      const d = await bxRequest("GET", "/openApi/swap/v2/user/commissionRate", {});
-      const c = d?.commission ?? d ?? {};
-      const taker = parseFloat(c.takerCommissionRate);
-      const maker = parseFloat(c.makerCommissionRate);
-      if (taker > 0) {
-        _feeCache.taker = taker;
-        _feeCache.maker = maker >= 0 ? maker : null;
-        _feeCache.at    = Date.now();
-      }
-    } catch (e) {
-      console.log(`  ⚠️  Taxa da conta BingX indisponível: ${e.message} — a usar a do contrato`);
-    }
-  }
-  if (_feeCache.taker !== null) return { taker: _feeCache.taker, maker: _feeCache.maker ?? 0.0002, source: "conta" };
+  const acct = await getCommissionRates();
+  if (acct.taker > 0) return { taker: acct.taker, maker: acct.maker ?? 0.0002, source: "conta" };
   try {
     const inst = (await getContracts()).find(c => c.symbol === toBingxSymbol(symbol));
     const taker = parseFloat(inst?.takerFeeRate);
