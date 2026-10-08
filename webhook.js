@@ -736,7 +736,7 @@ async function handleTelegramCommand(text, chatId) {
       // Fetch all closed trades today (no symbol filter) and group by symbol
       const todayMidnight = new Date();
       todayMidnight.setHours(0, 0, 0, 0);
-      const list = await fetchIncomeRange(todayMidnight.getTime(), Date.now());
+      const list = await fetchIncomeRange(todayMidnight.getTime(), Date.now(), { fresh: true });
 
       // Group by symbol and by income type (liquidations/fees/funding are separate
       // records on BingX — the breakdown shows WHY the total is what it is)
@@ -2991,10 +2991,12 @@ const NON_PNL_INCOME = ["TRANSFER", "DEPOSIT", "WITHDRAW"];
 const _incomeCache = new Map();
 const INCOME_CACHE_TTL = 60_000;
 
-async function fetchIncomeRange(startTime, endTime) {
+// fresh=true salta a leitura da cache (o /pnl3 quer sempre o valor atual) mas continua a
+// gravá-la, para os /stats feitos logo a seguir aproveitarem o pedido.
+async function fetchIncomeRange(startTime, endTime, { fresh = false } = {}) {
   const key = `${startTime}-${Math.floor(endTime / 60_000)}`;
   const hit = _incomeCache.get(key);
-  if (hit && Date.now() - hit.at < INCOME_CACHE_TTL) return hit.data;
+  if (!fresh && hit && Date.now() - hit.at < INCOME_CACHE_TTL) return hit.data;
 
   const data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
     startTime, endTime, limit: INCOME_PAGE_LIMIT,
