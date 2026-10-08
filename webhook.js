@@ -1992,6 +1992,38 @@ async function getContracts() {
   return _contractsCache.list;
 }
 
+// Taxas reais da BingX (o filtro de viabilidade usava 0.055% fixo — a taker da Bybit,
+// herdada do v2). Primeiro a taxa da CONTA (endpoint assinado, reflete o nível VIP);
+// se falhar, a taxa publicada no contrato; em último caso 0.05%/0.02%, a base da BingX.
+const _feeCache = { taker: null, maker: null, at: 0 };
+const FEE_TTL   = 60 * 60 * 1000;
+async function getFeeRates(symbol) {
+  if (_feeCache.taker === null || Date.now() - _feeCache.at > FEE_TTL) {
+    try {
+      const d = await bxRequest("GET", "/openApi/swap/v2/user/commissionRate", {});
+      const c = d?.commission ?? d ?? {};
+      const taker = parseFloat(c.takerCommissionRate);
+      const maker = parseFloat(c.makerCommissionRate);
+      if (taker > 0) {
+        _feeCache.taker = taker;
+        _feeCache.maker = maker >= 0 ? maker : null;
+        _feeCache.at    = Date.now();
+      }
+    } catch (e) {
+      console.log(`  ⚠️  Taxa da conta BingX indisponível: ${e.message} — a usar a do contrato`);
+    }
+  }
+  if (_feeCache.taker !== null) return { taker: _feeCache.taker, maker: _feeCache.maker ?? 0.0002, source: "conta" };
+  try {
+    const inst = (await getContracts()).find(c => c.symbol === toBingxSymbol(symbol));
+    const taker = parseFloat(inst?.takerFeeRate);
+    const maker = parseFloat(inst?.makerFeeRate);
+    if (taker > 0) return { taker, maker: maker >= 0 ? maker : 0.0002, source: "contrato" };
+  } catch {}
+  return { taker: 0.0005, maker: 0.0002, source: "padrão" };
+}
+const pct = r => `${+(r * 100).toFixed(4)}%`;
+
 async function getMaxLeverage(symbol) {
   const bx     = toBingxSymbol(symbol);
   const cached = _levCache.get(bx);
@@ -2591,8 +2623,9 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
     }
 
     if (CONFIG.feeViabilityThreshold > 0 && resolvedAtr) {
+      const { taker }     = await getFeeRates(symbol);
       const notional      = CONFIG.tradeSize * reLev;
-      const feesRoundTrip = notional * 0.00055 * 2;
+      const feesRoundTrip = notional * taker * 2;
       const expectedTp1   = notional * effectiveSlPct * 0.5;
       if (expectedTp1 < feesRoundTrip * CONFIG.feeViabilityThreshold) {
         console.log(`  ⏸ Re-entrada ignorada — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas × ${CONFIG.feeViabilityThreshold}`);
@@ -2602,7 +2635,7 @@ async function executeReentry(symbol, action, priceNum, refLevel, kind = "breako
 
     await setLeverage(symbol, reLev);
     const order = await placeOrder(symbol, action, priceNum, reLev, resolvedAtr, null);
-    console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${reLev}x | ${order.filledAs === "maker" ? "maker 0.02%" : "taker 0.055%"}`);
+    console.log(`  ✅ RE-ENTRADA — ${order.orderId} | ${reLev}x | ${order.filledAs === "maker" ? "maker" : "taker"}`);
     recordSignalPlaced(symbol, action, priceNum, reLev, reInterval);
 
     if (CONFIG.tradeMode === "futures") {
@@ -3183,7 +3216,7 @@ app.get("/trades", (req, res) => {
 // Expected payload: { "secret": "...", "action": "buy"|"sell", "symbol": "BTCUSDT", "price": 75000 }
 app.post("/webhook", (req, res) => {
   const ts = new Date().toISOString();
-  console.log(`\n[${ts}] Webhook received:`, JSON.stringify(req.body));
+  console.log(`\n[${ts}] Webhook received:`, JSON.stringify({ ...req.body, ...(req.body?.secret ? { secret: "***" } : {}) }));
 
   if (!req.body || typeof req.body !== "object") {
     console.log("  ❌ Empty or non-JSON body — set Content-Type: application/json in TradingView alert");
@@ -3471,6 +3504,7 @@ async function handleWebhook(body) {
   }
 
   // Live execution
+  let reversalPos = null; // posição contrária a fechar — só depois de os filtros aprovarem a entrada
   try {
     if (CONFIG.tradeMode === "futures") {
       await setLeverage(sym, effectiveLev);
@@ -3568,11 +3602,11 @@ async function handleWebhook(body) {
           await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Reversão bloqueada\n${msg}`);
           return;
         }
-        const pnlInfo = CONFIG.maxReversalLossUSD > 0 ? ` | PnL: $${openPos.unrealizedPnl.toFixed(2)}` : "";
-        console.log(`  🔄 Closing existing ${openPos.side} (qty=${openPos.size})${pnlInfo} before opening ${actionLower.toUpperCase()}...`);
-        const closeResult = await closePosition(sym, openPos);
-        console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
-        logTrade(sym, openPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${openPos.side} — reversing to ${actionLower}`);
+        // O fecho fica para DEPOIS dos filtros de entrada (volume, taxas, volatilidade,
+        // R:R, spread). Antes fechava-se aqui e um filtro a seguir recusava a nova
+        // entrada — a posição ficava fechada sem a reversão. Se um filtro recusar, a
+        // posição existente mantém-se como estava.
+        reversalPos = openPos;
       }
     }
 
@@ -3641,19 +3675,20 @@ async function handleWebhook(body) {
 
     // ── Fee viability filter ──────────────────────────────────────────────────
     // Skip trade if expected TP1 profit (1:1 RR, half position) < round-trip fees × threshold.
-    // Uses worst-case taker fee (0.055%) for both sides — if chase limit fires, we're even better off.
+    // Uses the real BingX taker fee for both sides (worst case) — if chase limit fires, we're even better off.
+    const fees = await getFeeRates(sym);
     if (CONFIG.feeViabilityThreshold > 0 && (slNum || resolvedAtr)) {
       const notional        = CONFIG.tradeSize * effectiveLev;
-      const feesRoundTrip   = notional * 0.00055 * 2;
+      const feesRoundTrip   = notional * fees.taker * 2;
       const expectedTp1     = notional * effectiveSlPct * 0.5;
       const minRequired     = feesRoundTrip * CONFIG.feeViabilityThreshold;
       if (expectedTp1 < minRequired) {
-        const msg = `⏸ Trade ignorado — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas ($${feesRoundTrip.toFixed(2)}) × ${CONFIG.feeViabilityThreshold}`;
+        const msg = `⏸ Trade ignorado — TP1 esperado ($${expectedTp1.toFixed(2)}) < taxas ($${feesRoundTrip.toFixed(2)} @ taker ${pct(fees.taker)} ${fees.source}) × ${CONFIG.feeViabilityThreshold}`;
         console.log(`  ${msg}`);
         await sendTelegram(`⏸ <b>Bot v3 ${sym}</b> — Sinal ignorado\n${msg}\nSL (${slSource}): ${(effectiveSlPct*100).toFixed(3)}% demasiado pequeno para cobrir taxas`);
         return;
       }
-      console.log(`  ✅ Viabilidade taxas OK: TP1 $${expectedTp1.toFixed(2)} ≥ taxas $${feesRoundTrip.toFixed(2)} × ${CONFIG.feeViabilityThreshold}`);
+      console.log(`  ✅ Viabilidade taxas OK: TP1 $${expectedTp1.toFixed(2)} ≥ taxas $${feesRoundTrip.toFixed(2)} (taker ${pct(fees.taker)} ${fees.source}) × ${CONFIG.feeViabilityThreshold}`);
     }
 
     // ── Volatility filter ─────────────────────────────────────────────────────
@@ -3706,8 +3741,17 @@ async function handleWebhook(body) {
       }
     }
 
+    // ── Close opposite position (normal reversal) — filtros todos aprovados ────
+    if (reversalPos) {
+      const pnlInfo = CONFIG.maxReversalLossUSD > 0 ? ` | PnL: $${reversalPos.unrealizedPnl.toFixed(2)}` : "";
+      console.log(`  🔄 Closing existing ${reversalPos.side} (qty=${reversalPos.size})${pnlInfo} before opening ${actionLower.toUpperCase()}...`);
+      const closeResult = await closePosition(sym, reversalPos);
+      console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
+      logTrade(sym, reversalPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${reversalPos.side} — reversing to ${actionLower}`);
+    }
+
     const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
-    const feeType = order.filledAs === "maker" ? "maker 0.02% 💚" : "taker 0.055%";
+    const feeType = order.filledAs === "maker" ? `maker ${pct(fees.maker)} 💚` : `taker ${pct(fees.taker)}`;
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
     recordSignalPlaced(sym, actionLower, priceNum, effectiveLev, candleInterval); // store leverage+interval for re-entries
 
@@ -3718,9 +3762,7 @@ async function handleWebhook(body) {
     const slLabel  = order.atrUsed
       ? `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% = ${CONFIG.atrMultiplier}×ATR)`
       : `$${order.slPrice} (${(order.slPct * 100).toFixed(2)}% fixo)`;
-    const feeLabel = order.filledAs === "maker"
-      ? "maker 0.02% 💚"
-      : "taker 0.055%";
+    const feeLabel = feeType;
 
     logTrade(sym, actionLower, priceNum, CONFIG.tradeSize, order.orderId, "LIVE", `SL=$${order.slPrice} | fee=${order.filledAs}`);
     await sendTelegram(
