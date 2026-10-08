@@ -79,6 +79,13 @@ const CONFIG = {
   // Chase Limit: try limit order at bid/ask (maker fee 0.02%) before falling back to market (taker 0.055%)
   chaseLimitEnabled:    process.env.CHASE_LIMIT             !== "false",  // true by default
   chaseLimitTimeoutMs:  parseInt(process.env.CHASE_LIMIT_TIMEOUT_MS || "3000"),
+  // Saídas maker-first: TP (meia posição), /commit3 e reversões tentam primeiro uma
+  // limite post-only no melhor preço do lado passivo (maker ~0.02% em vez de taker
+  // ~0.05%). O que não encher em EXIT_MAKER_TIMEOUT_MS fecha a mercado. Não se aplica
+  // a fechos de risco (teto de perda, contra-tendência, /close3, timeout) — esses
+  // continuam a mercado, porque aí a rapidez vale mais que a taxa.
+  exitMakerEnabled:     process.env.EXIT_MAKER_ENABLED !== "false",
+  exitMakerTimeoutMs:   parseInt(process.env.EXIT_MAKER_TIMEOUT_MS || "5000"),
   // Break-even SL buffer: on TP1, SL moves to entry ± (ATR × this multiplier) instead of exact entry.
   // Prevents SL from triggering on micro-retracements right after TP1. Set to 0 to disable.
   breakEvenBufferAtr:   parseFloat(process.env.BREAK_EVEN_BUFFER_ATR || "0.3"),
@@ -331,6 +338,30 @@ function loadRatchets() {
 }
 function saveRatchets() {
   try { writeFileSync(RATCHETS_FILE, JSON.stringify(ratchets, null, 2)); } catch {}
+}
+
+// ─── Registo de execuções (maker vs taker) ───────────────────────────────────
+// Cada entrada/saída que o BOT executa fica registada com a forma como encheu, para o
+// /fees3 mostrar quanto está a ser pago como maker vs taker. SL e trailing disparados
+// pela BingX não passam por aqui (são sempre taker) — o /fees3 mostra à parte o total
+// real de taxas pago, lido do histórico da conta.
+//   kind: "entry" | "exit"   how: "maker" | "taker" | "mixed"
+const FILLS_FILE = path.join(DATA_DIR, "fills.json");
+const FILLS_MAX  = 3000;
+let fills = [];
+function loadFills() {
+  try { if (existsSync(FILLS_FILE)) fills = JSON.parse(readFileSync(FILLS_FILE, "utf8")); } catch { fills = []; }
+  if (!Array.isArray(fills)) fills = [];
+}
+function recordFill(kind, symbol, how, notional, makerNotional = null) {
+  fills.push({
+    t: Date.now(), kind, symbol: canonicalSymbol(symbol), how,
+    notional: +notional || 0,
+    // parte que encheu como maker (num "mixed" é só uma fração)
+    makerNotional: makerNotional != null ? +makerNotional || 0 : (how === "maker" ? +notional || 0 : 0),
+  });
+  if (fills.length > FILLS_MAX) fills.splice(0, fills.length - FILLS_MAX);
+  try { writeFileSync(FILLS_FILE, JSON.stringify(fills)); } catch {}
 }
 
 function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/"short"
@@ -828,6 +859,57 @@ async function handleTelegramCommand(text, chatId) {
       await sendTelegram(`⏳ A juntar 365 dias de histórico… (pode demorar alguns segundos)`, chatId);
     }
     await sendPnlStats(spec[0], chatId, spec[1]);
+    return;
+  }
+
+  // /fees3 — quanto das execuções do bot enche como maker vs taker, quanto isso poupou,
+  // e o total de taxas efetivamente pago (histórico da BingX, inclui SL/trailing).
+  if (cmd === "/fees3") {
+    try {
+      const fees = await getFeeRates("BTCUSDT");
+      const now  = Date.now();
+      const since = fills.length ? fills[0].t : null;
+
+      const block = (days) => {
+        const from = now - days * 86_400_000;
+        const win  = fills.filter(f => f.t >= from);
+        const ent  = win.filter(f => f.kind === "entry");
+        const ext  = win.filter(f => f.kind === "exit");
+        const cnt  = (arr, how) => arr.filter(f => f.how === how).length;
+        const pctOf = (n, d) => d ? ` (${Math.round(n / d * 100)}%)` : "";
+        const saved = win.reduce((s, f) => s + (f.makerNotional || 0), 0) * Math.max(0, fees.taker - fees.maker);
+        if (!win.length) return `<b>Últimos ${days} dias</b>: sem execuções registadas`;
+        return `<b>Últimos ${days} dias</b>\n` +
+          `  📥 Entradas: ${ent.length} — maker ${cnt(ent, "maker")}${pctOf(cnt(ent, "maker"), ent.length)} | taker ${cnt(ent, "taker")}\n` +
+          `  📤 Saídas: ${ext.length} — maker ${cnt(ext, "maker")}${pctOf(cnt(ext, "maker"), ext.length)}${cnt(ext, "mixed") ? ` | misto ${cnt(ext, "mixed")}` : ""} | taker ${cnt(ext, "taker")}\n` +
+          `  💚 Poupado por encher como maker: ~$${saved.toFixed(2)}`;
+      };
+
+      // Taxas realmente pagas, do histórico da conta (TRADING_FEE é negativo)
+      let paidLine = "";
+      try {
+        const recs = await fetchClosedPnlRange(now - 30 * 86_400_000, now);
+        const feeSum = (from) => recs
+          .filter(r => /TRADING_FEE/i.test(r.incomeType || "") && parseInt(r.updatedTime) >= from)
+          .reduce((s, r) => s + parseFloat(r.closedPnl || 0), 0);
+        paidLine = `\n\n💸 <b>Taxas pagas (BingX)</b>: 7d ${fmtUsd(feeSum(now - 7 * 86_400_000))} | 30d ${fmtUsd(feeSum(now - 30 * 86_400_000))}\n` +
+          `<i>Inclui SL e trailing, que disparam na BingX (sempre taker) e não entram nas contagens acima.</i>`;
+      } catch (e) {
+        paidLine = `\n\n⚠️ Não consegui ler as taxas pagas: ${e.message}`;
+      }
+
+      await sendTelegram(
+        `🧾 <b>Taxas — Bot v3</b>\n` +
+        `Conta: maker ${pct(fees.maker)} | taker ${pct(fees.taker)} (${fees.source})\n` +
+        `Saídas maker-first: ${CONFIG.exitMakerEnabled ? `ativo (${CONFIG.exitMakerTimeoutMs / 1000}s)` : "desativado"}\n\n` +
+        `${block(7)}\n\n${block(30)}` +
+        paidLine +
+        (since ? `\n<i>Registo de execuções desde ${new Date(since).toISOString().slice(0, 10)}.</i>` : ""),
+        chatId
+      );
+    } catch (e) {
+      await sendTelegram(`❌ Erro ao obter taxas: ${e.message}`, chatId);
+    }
     return;
   }
 
@@ -1423,7 +1505,7 @@ async function _commitSymbol(argSym, chatId, source = "/commit3", side = null, c
     const hadTrail = pos.trailingStop > 0;
     const tpPrice  = pos.takeProfit > 0 ? pos.takeProfit : null;
 
-    const result = await closePosition(argSym, pos);
+    const result = await closeMakerFirst(argSym, pos, null, source);
     console.log(`  💰 ${source} ${argSym}: ${pos.side} fechado @ $${exitPrice} (PnL ~$${pnl.toFixed(2)}) — ${result.orderId}`);
 
     // Pullback distance: dynamic ATR × COMMIT_PULLBACK_ATR_MULT, fallback to fixed %.
@@ -1805,6 +1887,7 @@ async function startTelegramPolling() {
       { command: "stats7", description: "📈 PnL últimos 7 dias (gráfico)" },
       { command: "stats30", description: "📈 PnL últimos 30 dias (gráfico)" },
       { command: "stats365", description: "📈 PnL últimos 365 dias (por mês)" },
+      { command: "fees3", description: "🧾 Taxas: maker vs taker e total pago" },
       { command: "commit3", description: "💰 Listar símbolos com ganho p/ encaixar (ou /commit3 SYMBOL)" },
       { command: "close3", description: "✂️ Fechar posição (ou /close3 SYMBOL [qty] p/ parcial)" },
       { command: "target3", description: "🎯 Encaixar quando o PnL chegar a X (ou /target3 SYMBOL 20)" },
@@ -2522,6 +2605,7 @@ async function checkReentriesFor(sym, state, now) {
 
           if (status === "Filled") {
             console.log(`  ✅ ${sym}: ordem limite de re-entrada encheu @ $${r.price}`);
+            recordFill("entry", sym, "maker", (parseFloat(r.qty) || 0) * (r.price || 0));
             state.positionOpenTime = now;   // hand the position to timeout/trailing tracking
             state.lastAction       = r.action;
             if (r.leverage > 0) state.lastLeverage = r.leverage; // keep leverage for future re-entries
@@ -2621,6 +2705,7 @@ async function checkReentriesFor(sym, state, now) {
                 if (stopLoss)   mktParams.stopLoss   = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(stopLoss), workingType: "CONTRACT_PRICE" });
                 if (takeProfit) mktParams.takeProfit = JSON.stringify({ type: "TAKE_PROFIT_MARKET", stopPrice: parseFloat(takeProfit), workingType: "CONTRACT_PRICE" });
                 const dM = await bxRequest("POST", "/openApi/swap/v2/trade/order", mktParams);
+                recordFill("entry", sym, "taker", (parseFloat(r.qty) || 0) * cur);
                 state.positionOpenTime = now;
                 state.lastAction       = r.action;
                 delete state.reentries[slot];
@@ -2975,6 +3060,7 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
     console.log(`  ✅ MARKET ORDER — taxa taker`);
   }
 
+  recordFill("entry", symbol, filledAs, parseFloat(quantity) * price);
   return { orderId, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize, filledAs };
 }
 
@@ -3038,6 +3124,7 @@ async function getOpenPositionsFor(symbol) {
       size:           Math.abs(parseFloat(position.positionAmt)),
       stopLoss:       prot.slPrice,                                     // from the open STOP_MARKET order
       avgPrice:       parseFloat(position.avgPrice        || "0"),
+      markPrice:      parseFloat(position.markPrice       || "0"),
       unrealizedPnl:  parseFloat(position.unrealizedProfit || position.unrealisedProfit || "0"),
       leverage:       parseFloat(position.leverage        || "0"),      // so a re-entry can mirror the original leverage
       trailingStop:   prot.trailActive,                                 // so a re-entry can mirror SL/trailing presence
@@ -3070,6 +3157,7 @@ async function closePosition(symbol, position) {
     symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
     type: "MARKET", quantity: String(position.size), ...reduceOnlyFlag(),
   });
+  recordFill("exit", symbol, "taker", position.size * (position.markPrice || position.avgPrice || 0));
   return { orderId: data?.order?.orderId ?? data?.orderId };
 }
 
@@ -3090,11 +3178,102 @@ async function closePartialPosition(symbol, position, qty) {
     symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
     type: "MARKET", quantity: closeQty, ...reduceOnlyFlag(),
   });
+  recordFill("exit", symbol, "taker", parseFloat(closeQty) * (position.markPrice || position.avgPrice || 0));
   return { orderId: data?.order?.orderId ?? data?.orderId, closedQty: closeQty, remainingQty: (position.size - parseFloat(closeQty)).toFixed(decimals) };
 }
 
 async function closeHalfPosition(symbol, position) {
-  return closePartialPosition(symbol, position, position.size / 2);
+  return closeMakerFirst(symbol, position, position.size / 2, "TP");
+}
+
+// Fecho maker-first: limite post-only no lado passivo do livro (fechar um long = vender
+// no ASK; fechar um short = comprar no BID), que nunca cruza o spread e por isso paga
+// maker. Espera EXIT_MAKER_TIMEOUT_MS; o que não encher fecha a mercado.
+//   qty = null → posição inteira.
+// A quantidade que ainda falta fechar vem da quantidade EXECUTADA da limite (lida
+// depois de um cancelamento confirmado) — nunca do pressuposto de que "não encheu":
+// num TP parcial, fechar a mercado a metade que a limite já tinha fechado fecharia a
+// posição inteira. Se o estado da limite não for legível, usa o tamanho da posição.
+// Devolve { orderId, closedQty, remainingQty, filledAs: "maker"|"mixed"|"taker" }.
+async function closeMakerFirst(symbol, position, qty = null, label = "fecho") {
+  const { qtyStep, tickSize } = await getInstrumentInfo(symbol);
+  const decimals = (qtyStep.toString().split(".")[1] || "").length;
+  const full     = !(qty > 0) || qty >= position.size;
+  const wanted   = full ? position.size : Math.floor(qty / qtyStep + 1e-9) * qtyStep;
+  if (!(wanted > 0)) throw new Error(`Quantidade ${qty} inválida — mínimo ${qtyStep} (posição: ${position.size})`);
+  const qtyStr          = wanted.toFixed(decimals);
+  const targetRemaining = full ? 0 : position.size - wanted;
+  const isLong    = position.side === "Buy";
+  const closeSide = isLong ? "SELL" : "BUY";
+  const refPrice  = position.markPrice || position.avgPrice || 0;
+  const result    = (orderId, filledAs) =>
+    ({ orderId, closedQty: qtyStr, remainingQty: targetRemaining.toFixed(decimals), filledAs });
+  const market = async (q) => {
+    const d = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+      symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
+      type: "MARKET", quantity: q, ...reduceOnlyFlag(),
+    });
+    return d?.order?.orderId ?? d?.orderId;
+  };
+
+  if (!CONFIG.exitMakerEnabled) {
+    const id = await market(qtyStr);
+    recordFill("exit", symbol, "taker", wanted * refPrice);
+    return result(id, "taker");
+  }
+
+  // 1) Limite post-only no lado passivo
+  let limitId = null, limitPx = null;
+  try {
+    const { bid, ask } = await fetchBidAsk(symbol);
+    limitPx = roundToTick(isLong ? ask : bid, tickSize);
+    const d = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+      symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(position.side),
+      type: "LIMIT", price: limitPx, quantity: qtyStr, timeInForce: "PostOnly", ...reduceOnlyFlag(),
+    });
+    limitId = d?.order?.orderId ?? d?.orderId ?? null;
+    console.log(`  🎯 ${label} maker: limite post-only ${closeSide} ${qtyStr} @ $${limitPx} — aguarda ${CONFIG.exitMakerTimeoutMs}ms`);
+  } catch (e) {
+    console.log(`  ⚠️  ${label} maker: limite recusada (${e.message}) — a mercado`);
+  }
+
+  // 2) Esperar, ver quanto encheu
+  let executed = 0;
+  if (limitId) {
+    await new Promise(r => setTimeout(r, CONFIG.exitMakerTimeoutMs));
+    let info = await getOrderInfo(symbol, limitId);
+    if (info.status !== "Filled") info = await cancelConfirmed(symbol, limitId);
+    if (info.status === "Filled") {
+      console.log(`  ✅ ${label} maker: limite encheu — taxa maker`);
+      recordFill("exit", symbol, "maker", wanted * parseFloat(limitPx));
+      return result(limitId, "maker");
+    }
+    if (cleanlyCancelled(info) || info.status === "Cancelled" || info.status === "Deactivated") {
+      executed = info.executedQty || 0;
+    } else if (info.status === "New" || info.status === "PartiallyFilled") {
+      // O cancelamento não pegou e a limite continua viva: fechar o resto a mercado
+      // fecharia de mais quando ela enchesse. Parar e deixar a limite trabalhar.
+      throw new Error(`${label}: não consegui cancelar a limite de fecho ${limitId} (${info.status}) — continua no livro @ $${limitPx}; nada enviado a mercado. Verifica em /wait3.`);
+    } else {
+      // Estado ilegível: o que falta lê-se da posição
+      const now     = await getOpenPosition(symbol, isLong ? "long" : "short");
+      const nowSize = now ? now.size : 0;
+      executed = Math.max(0, position.size - nowSize);
+      console.log(`  ⚠️  ${label} maker: estado da limite desconhecido (${info.status ?? "sem resposta"}) — executado inferido da posição: ${executed}`);
+    }
+  }
+
+  // 3) O resto a mercado
+  const rest = Math.floor((wanted - executed) / qtyStep + 1e-9) * qtyStep;
+  let mktId = null;
+  if (rest > 0) {
+    mktId = await market(rest.toFixed(decimals));
+    console.log(`  ✅ ${label}: ${rest.toFixed(decimals)} fechado a mercado${executed > 0 ? ` (${executed} já como maker)` : ""}`);
+  }
+  const makerNotional = executed * (limitPx ? parseFloat(limitPx) : refPrice);
+  const how = rest <= 0 ? "maker" : executed > 0 ? "mixed" : "taker";
+  recordFill("exit", symbol, how, wanted * refPrice, makerNotional);
+  return result(mktId ?? limitId, how);
 }
 
 // Move the position SL to a new price. On BingX the SL is a separate STOP_MARKET order.
@@ -3604,6 +3783,7 @@ async function handleWebhook(body) {
       await sendTelegram(
         `🎯 <b>Take-Profit Bot v3</b> — ${sym}\n` +
         `Posição ${openPos.side} | Fechado: ${result.closedQty} | Resta: ${result.remainingQty}\n` +
+        `Taxa: ${result.filledAs === "maker" ? "maker 💚" : result.filledAs === "mixed" ? "parte maker, parte taker" : "taker"}\n` +
         (newSl !== null ? `🛡 Novo SL: $${formatPrice(newSl)}\n` : "") +
         (opPnl !== null ? `💰 PnL operação: ${opPnl >= 0 ? "+" : ""}$${opPnl.toFixed(2)}\n` : "") +
         (dailyPnl !== null ? `📊 PnL hoje (${sym}): $${dailyPnl.toFixed(2)}\n` : "")
@@ -3901,7 +4081,7 @@ async function handleWebhook(body) {
     if (reversalPos) {
       const pnlInfo = CONFIG.maxReversalLossUSD > 0 ? ` | PnL: $${reversalPos.unrealizedPnl.toFixed(2)}` : "";
       console.log(`  🔄 Closing existing ${reversalPos.side} (qty=${reversalPos.size})${pnlInfo} before opening ${actionLower.toUpperCase()}...`);
-      const closeResult = await closePosition(sym, reversalPos);
+      const closeResult = await closeMakerFirst(sym, reversalPos, null, "Reversão");
       console.log(`  ✅ POSITION CLOSED — ${closeResult.orderId}`);
       logTrade(sym, reversalPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${reversalPos.side} — reversing to ${actionLower}`);
     }
@@ -3942,6 +4122,7 @@ initCsv();
 loadSymbolState();
 loadTargets();
 loadRatchets();
+loadFills();
 
 // ─── Prova de persistência ───────────────────────────────────────────────────
 // Saber se DATA_DIR sobrevive a um redeploy não se adivinha pelo caminho: /data sem
@@ -3993,6 +4174,7 @@ app.listen(PORT, () => {
   console.log(`  Vol.filter: ${CONFIG.maxSlPct > 0 ? `skip se SL > ${(CONFIG.maxSlPct * 100).toFixed(1)}%` : "desativado (MAX_SL_PCT=0)"}`);
   console.log(`  Tendência : ${CONFIG.trendMarginPct > 0 ? `EMA${CONFIG.trendEmaPeriod}(${CONFIG.trendInterval}m) | margem ${(CONFIG.trendMarginPct * 100).toFixed(1)}%` : "desativado (TREND_MARGIN_PCT=0)"}`);
   console.log(`  Chase Limit: ${CONFIG.chaseLimitEnabled ? `ativo — timeout ${CONFIG.chaseLimitTimeoutMs}ms → fallback Market` : "desativado (sempre Market)"}`);
+  console.log(`  Saída maker: ${CONFIG.exitMakerEnabled ? `TP/commit/reversão tentam limite post-only ${CONFIG.exitMakerTimeoutMs}ms → resto a Market` : "desativado (EXIT_MAKER_ENABLED=false)"}`);
   console.log(`  BE buffer : ${CONFIG.breakEvenBufferAtr > 0 ? `${CONFIG.breakEvenBufferAtr}×ATR abaixo/acima da entrada` : "desativado (SL exato na entrada)"}`);
   console.log(`  Fee filter: ${CONFIG.feeViabilityThreshold > 0 ? `skip se TP1 < taxas × ${CONFIG.feeViabilityThreshold}` : "desativado"}`);
   console.log(`  R:R mín   : ${CONFIG.minRR > 0 ? `${CONFIG.minRR} — TP implícito=SL×${CONFIG.minRR}${CONFIG.maxTpPct > 0 ? ` | bloq. se TP implícito > ${(CONFIG.maxTpPct*100).toFixed(2)}%` : " | sem cap (MAX_TP_PCT=0)"}` : "desativado (MIN_RR=0)"}`);
