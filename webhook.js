@@ -700,32 +700,55 @@ function describePendingOrder(o, prices = {}) {
 // Fetch all realized-PnL records in [startTime, endTime], shaped like Bybit's closed-pnl
 // entries ({ symbol, closedPnl, updatedTime }) so the stats renderer stays unchanged.
 //
-// BingX accepts wide ranges in a SINGLE call (unlike Bybit's ~7-day cap): one request
-// covers a whole year. Splitting a year into 30-day windows tripped the endpoint's
-// frequency limit (code 100410) and blocked every PnL command for ~1 minute, so the
-// range is fetched in one call and only split if the response comes back full — the
-// one case where records could be silently truncated. Splits are spaced out.
+// A BingX LIMITA este endpoint a ~31 dias e NÃO o diz: com startTime de há um ano
+// devolve, sem erro e sem aviso, apenas o último mês. Medido contra a conta:
+//   pedido 365d -> devolvidos 31d (986 registos)   pedido 90d/60d/45d -> os mesmos 31d
+// A versão anterior fazia uma chamada única e só dividia se a página viesse cheia
+// (1000 registos). Como vinham 986, nunca dividia — e o /stats365 reportava o PnL de
+// um mês (-$1.078) em vez do ano (-$8.234). Daí: dividir SEMPRE em janelas de 30 dias,
+// nunca confiar na contagem para detetar truncagem.
+// As janelas são disjuntas (to = from + 30d - 1ms) para não contar duas vezes um
+// registo que caia exatamente na fronteira.
 const INCOME_PAGE_LIMIT = 1000;
-const INCOME_SPLIT_DAYS = 30;
-const INCOME_SPLIT_GAP_MS = 400;
+const INCOME_MAX_RANGE_MS = 30 * 86_400_000;   // abaixo do tecto real de ~31 dias
+const INCOME_SPLIT_GAP_MS = 800;               // espaçadas: 13 chamadas seguidas disparam o code 100410
+// A truncagem NÃO se manifesta como uma página de 1000: medido contra a conta, uma
+// janela de 30 dias devolveu 988 registos cobrindo apenas os últimos 20 dias — os
+// 195 registos mais antigos ($88.30) desapareceram sem erro. Por isso qualquer janela
+// que se aproxime do limite é suspeita e vai a metades até ficar folgada.
+const INCOME_TRUNCATION_HINT = 900;
+const INCOME_MIN_SPAN_MS = 3_600_000;          // 1h: chão da recursão
+const INCOME_MAX_DEPTH = 6;
+
+let _incomeNetCalls = 0;  // para espaçar só as chamadas que vão mesmo à rede
+
+async function fetchIncomeWindow(from, to, depth = 0) {
+  if (!_incomeCached(from, to) && _incomeNetCalls++ > 0)
+    await new Promise(r => setTimeout(r, INCOME_SPLIT_GAP_MS));
+  const chunk = await fetchIncomeRange(from, to);
+
+  const suspect = chunk.length >= INCOME_TRUNCATION_HINT;
+  if (!suspect || depth >= INCOME_MAX_DEPTH || to - from <= INCOME_MIN_SPAN_MS) {
+    if (suspect) console.log(`  ⚠️  Janela ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)}: ${chunk.length} registos e já não dá para dividir — pode estar incompleta`);
+    return chunk;
+  }
+  // Metades disjuntas (mid+1), para nenhum registo ser contado duas vezes
+  const mid = from + Math.floor((to - from) / 2);
+  const a = await fetchIncomeWindow(from, mid, depth + 1);
+  const b = await fetchIncomeWindow(mid + 1, to, depth + 1);
+  const joined = [...a, ...b];
+  console.log(`  ↳ ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)}: ${chunk.length} registos truncados → ${joined.length} após dividir`);
+  return joined;
+}
 
 async function fetchClosedPnlRange(startTime, endTime) {
   // Errors propagate on purpose: reporting $0.00 because the fetch failed would be
   // indistinguishable from a genuinely flat period.
-  const single = await fetchIncomeRange(startTime, endTime);
-  if (single.length < INCOME_PAGE_LIMIT) return single;
-
-  console.log(`  ℹ️  ${single.length} registos (página cheia) — a dividir o período para não truncar`);
+  _incomeNetCalls = 0;
   const records = [];
-  const CHUNK = INCOME_SPLIT_DAYS * 86_400_000;
-  for (let from = startTime; from < endTime; from += CHUNK) {
-    const to = Math.min(from + CHUNK, endTime);
-    const chunk = await fetchIncomeRange(from, to);
-    records.push(...chunk);
-    if (chunk.length >= INCOME_PAGE_LIMIT) {
-      console.log(`  ⚠️  Janela ${new Date(from).toISOString().slice(0, 10)}→${new Date(to).toISOString().slice(0, 10)} devolveu ${chunk.length} registos (limite) — pode estar incompleta`);
-    }
-    if (from + CHUNK < endTime) await new Promise(r => setTimeout(r, INCOME_SPLIT_GAP_MS));
+  for (let from = startTime; from < endTime; from += INCOME_MAX_RANGE_MS) {
+    const to = Math.min(from + INCOME_MAX_RANGE_MS - 1, endTime);
+    records.push(...await fetchIncomeWindow(from, to));
   }
   return records;
 }
@@ -3304,18 +3327,43 @@ const NON_PNL_INCOME = ["TRANSFER", "DEPOSIT", "WITHDRAW"];
 // ao minuto, para pedidos "até agora" feitos de seguida partilharem a mesma entrada.
 const _incomeCache = new Map();
 const INCOME_CACHE_TTL = 60_000;
+// Uma janela que já terminou não volta a mudar — vale a pena guardá-la bem mais tempo.
+// É isto que torna o /stats365 (13 janelas) barato à segunda vez e evita voltar a
+// bater no limite de frequência do endpoint.
+const INCOME_CACHE_TTL_PAST = 6 * 3_600_000;
+const _incomeKey = (s, e) => `${s}-${Math.floor(e / 60_000)}`;
+// Devolve os dados em cache (ou null). Partilhado com o fetchClosedPnlRange, que o usa
+// para não esperar o intervalo anti-rate-limit entre janelas que nem vai pedir.
+function _incomeCached(startTime, endTime) {
+  const hit = _incomeCache.get(_incomeKey(startTime, endTime));
+  if (!hit) return null;
+  const ttl = endTime < Date.now() - 60_000 ? INCOME_CACHE_TTL_PAST : INCOME_CACHE_TTL;
+  return Date.now() - hit.at < ttl ? hit.data : null;
+}
 
 // fresh=true salta a leitura da cache (o /pnl3 quer sempre o valor atual) mas continua a
 // gravá-la, para os /stats feitos logo a seguir aproveitarem o pedido.
 async function fetchIncomeRange(startTime, endTime, { fresh = false } = {}) {
-  const key = `${startTime}-${Math.floor(endTime / 60_000)}`;
-  const hit = _incomeCache.get(key);
-  if (!fresh && hit && Date.now() - hit.at < INCOME_CACHE_TTL) return hit.data;
+  const key = _incomeKey(startTime, endTime);
+  if (!fresh) { const c = _incomeCached(startTime, endTime); if (c) return c; }
 
-  const data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
+  // Um período sem movimento devolve [] (confirmado contra a conta). Portanto uma
+  // resposta que NÃO seja array é anomalia transitória, não ausência de dados —
+  // tratá-la como vazia somaria $0 em silêncio e falsearia o total. Tenta de novo e,
+  // se persistir, deixa rebentar: um erro é melhor do que um número errado.
+  let data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
     startTime, endTime, limit: INCOME_PAGE_LIMIT,
   });
-  const out = (Array.isArray(data) ? data : [])
+  if (!Array.isArray(data)) {
+    console.log(`  ⚠️  income ${new Date(startTime).toISOString().slice(0, 10)}→${new Date(endTime).toISOString().slice(0, 10)}: resposta inválida — a repetir`);
+    await new Promise(r => setTimeout(r, 1000));
+    data = await bxRequest("GET", "/openApi/swap/v2/user/income", {
+      startTime, endTime, limit: INCOME_PAGE_LIMIT,
+    });
+    if (!Array.isArray(data))
+      throw new Error(`BingX devolveu resposta inválida para ${new Date(startTime).toISOString().slice(0, 10)}→${new Date(endTime).toISOString().slice(0, 10)}`);
+  }
+  const out = data
     .filter(r => !NON_PNL_INCOME.some(t => String(r.incomeType || "").toUpperCase().includes(t)))
     .map(r => ({
       symbol:      fromBingxSymbol(r.symbol),
