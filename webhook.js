@@ -678,13 +678,13 @@ function describePendingOrder(o, prices = {}) {
   if (cur > 0 && level > 0) {
     const diffPct = ((level - cur) / cur) * 100;
     const arrow   = diffPct > 0 ? "▲" : "▼";           // para onde o preço tem de ir
-    curLine = `\n   atual $${formatPrice(cur)} · ${arrow} ${Math.abs(diffPct).toFixed(2)}% para executar`;
+    curLine = `\n   atual $${formatPrice(cur, o.symbol)} · ${arrow} ${Math.abs(diffPct).toFixed(2)}% para executar`;
   } else if (cur > 0) {
-    curLine = `\n   atual $${formatPrice(cur)}`;
+    curLine = `\n   atual $${formatPrice(cur, o.symbol)}`;
   }
 
   return `${prot ? "🛡" : o.reduceOnly ? "📤" : "📥"} <b>${o.symbol}</b> ${o.side} ${o.orderType} (${dir})\n` +
-         `   qty=${o.qty} @ $${formatPrice(level)}${o.triggerPrice > 0 ? " (gatilho)" : ""}` +
+         `   qty=${o.qty} @ $${formatPrice(level, o.symbol)}${o.triggerPrice > 0 ? " (gatilho)" : ""}` +
          `${o.stopLoss ? ` | SL $${o.stopLoss}` : ""}${o.takeProfit ? ` | TP $${o.takeProfit}` : ""}` +
          curLine +
          `\n   ${o.status}${ageMin !== null ? ` · há ${ageMin < 60 ? `${ageMin}min` : `${(ageMin / 60).toFixed(1)}h`}` : ""}` +
@@ -955,12 +955,12 @@ async function handleTelegramCommand(text, chatId) {
         // Distância até ao SL/TP: o número que diz se a protecção está perto de disparar
         const dist = lvl => p.markPrice > 0 && lvl > 0 ? ` (${(Math.abs(lvl - p.markPrice) / p.markPrice * 100).toFixed(2)}%)` : "";
         const prot = [
-          `🛡 SL: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss)}${dist(p.stopLoss)}` : "—"}`,
-          `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit)}${dist(p.takeProfit)}` : "—"}`,
+          `🛡 SL: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}` : "—"}`,
+          `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit, p.symbol)}${dist(p.takeProfit)}` : "—"}`,
           ...(p.trailingStop ? ["📉 trailing ativo"] : []),
         ].join(" | ");
         const est = estimateNetPnl(p, taker);
-        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice)} | atual=$${formatPrice(p.markPrice)}\n` +
+        return `${emoji} <b>${p.symbol}</b> ${p.side} | qty=${p.size} | entry=$${formatPrice(p.avgPrice, p.symbol)} | atual=$${formatPrice(p.markPrice, p.symbol)}\n` +
                `   PnL: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}${t ? ` | 🚩 target ${fmtUsd(t.usd)}` : ""}\n` +
                (est ? `   ≈ líquido: ${fmtUsd(est.net)} <i>(−$${est.fees.toFixed(2)} fees${est.realised ? `, ${fmtUsd(est.realised)} já realizado` : ""})</i>\n` : "") +
                `   ${prot}`;
@@ -1017,7 +1017,7 @@ async function handleTelegramCommand(text, chatId) {
       // leva o lado, senão os dois botões seriam idênticos e não se saberia qual foi.
       const dup = new Set(winners.filter((p, i, a) => a.findIndex(x => x.symbol === p.symbol) !== i).map(p => p.symbol));
       const sideOf = p => p.side === "Buy" ? "long" : "short";
-      const listText = winners.map(p => `• <b>${p.symbol}</b> ${dup.has(p.symbol) ? `<b>${sideOf(p).toUpperCase()}</b> ` : ""}${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
+      const listText = winners.map(p => `• <b>${p.symbol}</b> ${dup.has(p.symbol) ? `<b>${sideOf(p).toUpperCase()}</b> ` : ""}${p.side}: +$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice, p.symbol)} (entrada $${formatPrice(p.avgPrice, p.symbol)})`).join("\n");
       const rows     = winners.map(p => [`/commit3 ${p.symbol}${dup.has(p.symbol) ? ` ${sideOf(p)}` : ""}`]);
       await sendTelegramKeyboard(
         `💰 <b>Encaixar ganho</b> — símbolos com PnL > $${CONFIG.commitMinGainUSD}:\n${listText}\n\nToca para encaixar 👇`,
@@ -1080,7 +1080,7 @@ async function handleTelegramCommand(text, chatId) {
         const cmdConfirm = `/close3 ${argSym}${partial ? ` ${qtyNum}` : ""}${sideTag} confirmar`;
         await sendTelegramKeyboard(
           `⚠️ <b>Confirmas ${partial ? `fechar ${qtyNum} de ${argSym}` : `fechar ${argSym}`}${sideArg ? ` (${sideArg.toUpperCase()})` : ""}?</b>\n` +
-          `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
+          `${pos.side} qty=${pos.size} | entrada $${formatPrice(pos.avgPrice, argSym)}\n` +
           `PnL atual: ${pos.unrealizedPnl >= 0 ? "+" : ""}$${pos.unrealizedPnl.toFixed(2)}\n` +
           (partial
             ? `Fecho PARCIAL a mercado — restam ${(pos.size - qtyNum).toFixed(8).replace(/\.?0+$/, "")} (posição mantém-se aberta).`
@@ -1105,7 +1105,7 @@ async function handleTelegramCommand(text, chatId) {
       // senão os dois seriam idênticos.
       const dupC   = new Set(positions.filter((p, i, a) => a.findIndex(x => x.symbol === p.symbol) !== i).map(p => p.symbol));
       const sideOfC = p => p.side === "Buy" ? "long" : "short";
-      const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${dupC.has(p.symbol) ? `<b>${sideOfC(p).toUpperCase()}</b> ` : ""}${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice)} (entrada $${formatPrice(p.avgPrice)})`).join("\n");
+      const listText = positions.map(p => `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.symbol}</b> ${dupC.has(p.symbol) ? `<b>${sideOfC(p).toUpperCase()}</b> ` : ""}${p.side}: ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)} | preço $${formatPrice(p.markPrice, p.symbol)} (entrada $${formatPrice(p.avgPrice, p.symbol)})`).join("\n");
       const rows     = positions.map(p => [`/close3 ${p.symbol}${dupC.has(p.symbol) ? ` ${sideOfC(p)}` : ""}`]);
       await sendTelegramKeyboard(
         `✂️ <b>Fechar posição</b> (sem re-entrada):\n${listText}\n\nToca para fechar 👇`,
@@ -1353,7 +1353,7 @@ async function _closeSymbol(argSym, chatId, qty = null, side = null) {
       logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close3 parcial — ${result.closedQty} de ${pos.size} (PnL ~$${pnlShare.toFixed(2)})`);
       await sendTelegram(
         `${pnlShare >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Fecho parcial (/close3)\n` +
-        `Fechado: ${result.closedQty} de ${pos.size} ${pos.side} @ $${formatPrice(exitPrice)}\n` +
+        `Fechado: ${result.closedQty} de ${pos.size} ${pos.side} @ $${formatPrice(exitPrice, argSym)}\n` +
         `PnL da parte fechada: ~${pnlShare >= 0 ? "+" : ""}$${pnlShare.toFixed(2)}\n` +
         `📌 Resta ${result.remainingQty} aberto (SL/trailing mantidos)`,
         chatId
@@ -1383,7 +1383,7 @@ async function _closeSymbol(argSym, chatId, qty = null, side = null) {
     logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `/close3 — fechado sem re-entrada (PnL ~$${pnl.toFixed(2)})`);
     await sendTelegram(
       `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Posição fechada (/close3)\n` +
-      `${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+      `${pos.side} fechada @ $${formatPrice(exitPrice, argSym)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `Sem re-entrada${cancelledReentry ? " | re-entrada pendente cancelada" : ""}`,
       chatId
     );
@@ -1416,7 +1416,7 @@ async function resolvePositionOrAsk(symbol, side, chatId, cmd, verb, extraArgs =
 
   // Ambíguo: duas posições no mesmo par e nenhum lado indicado
   const lines = open.map(p =>
-    `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.side === "Buy" ? "LONG" : "SHORT"}</b> qty=${p.size} | entrada $${formatPrice(p.avgPrice)} | PnL ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}`).join("\n");
+    `${p.unrealizedPnl >= 0 ? "🟢" : "🔴"} <b>${p.side === "Buy" ? "LONG" : "SHORT"}</b> qty=${p.size} | entrada $${formatPrice(p.avgPrice, p.symbol)} | PnL ${p.unrealizedPnl >= 0 ? "+" : ""}$${p.unrealizedPnl.toFixed(2)}`).join("\n");
   await sendTelegramKeyboard(
     `⚠️ <b>${symbol}</b> tem ${open.length} posições abertas (hedge mode).\n${lines}\n\nQual queres ${verb}?`,
     open.map(p => [`${cmd} ${symbol}${extraArgs} ${p.side === "Buy" ? "long" : "short"}`]).concat([["❌ Cancelar"]]),
@@ -1462,7 +1462,7 @@ async function setTarget(symbol, pos, usd, chatId) {
   console.log(`  🎯 Target ${key} = $${usd} (PnL atual $${pos.unrealizedPnl.toFixed(2)})`);
   await sendTelegram(
     `🎯 <b>Bot v3 ${symbol} ${sideTxt}</b> — target ${prev ? "atualizado" : "definido"}: <b>${fmtUsd(usd)}</b>\n` +
-    `PnL atual ${fmtUsd(pos.unrealizedPnl)} | qty=${pos.size} | entrada $${formatPrice(pos.avgPrice)}\n` +
+    `PnL atual ${fmtUsd(pos.unrealizedPnl)} | qty=${pos.size} | entrada $${formatPrice(pos.avgPrice, pos.symbol)}\n` +
     `Ao chegar: fecha + arma re-entrada (como /commit3). Verifica a cada ${pollS}s.\n` +
     `🔁 A posição que a re-entrada abrir herda este target (contado de novo a partir de zero).\n` +
     (pos.unrealizedPnl >= usd ? `⚡ O PnL já está acima do target — dispara na próxima verificação (≤${pollS}s).\n` : "") +
@@ -1565,7 +1565,7 @@ async function _commitSymbol(argSym, chatId, source = "/commit3", side = null, c
         logTrade(argSym, pos.side === "Buy" ? "sell" : "buy", exitPrice, "", result.orderId, "LIVE", `${source} — encaixou PnL ~$${pnl.toFixed(2)}, re-entrada bloqueada (SL ${(impliedSlPct * 100).toFixed(2)}%)`);
         await sendTelegram(
           `${pnl >= 0 ? "🟢" : "🔴"} <b>Bot v3 ${argSym}</b> — Ganho encaixado (${source})\n` +
-          `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+          `Posição ${pos.side} fechada @ $${formatPrice(exitPrice, argSym)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
           `⏸ Sem re-entrada: ${msg}` +
           (carried != null ? `\n🚩 Target de ${fmtUsd(carried)} perdido — não há posição nova para o herdar` : ""),
           chatId
@@ -1627,12 +1627,12 @@ async function _commitSymbol(argSym, chatId, source = "/commit3", side = null, c
     const emoji = pnl >= 0 ? "🟢" : "🔴";
     await sendTelegram(
       `${emoji} <b>Bot v3 ${argSym}</b> — Ganho encaixado (${source})\n` +
-      `Posição ${pos.side} fechada @ $${formatPrice(exitPrice)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
+      `Posição ${pos.side} fechada @ $${formatPrice(exitPrice, argSym)} | PnL ~${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}\n` +
       `🔁 Ordem limite ${sideAction.toUpperCase()} ${reLev}x qty=${lim.qty} na BingX @ $${lim.priceStr} (${sideAction === "buy" ? "−" : "+"}${pullbackPctShown.toFixed(2)}% | ${pullbackSrc})\n` +
       (lim.slPrice ? `🛡 SL: $${lim.slPrice}\n` : "") +
       (lim.tpPrice ? `🎯 TP herdado: $${lim.tpPrice}\n` : "") +
       (!hadSL || !hadTrail ? `⚠️ Sem ${!hadSL && !hadTrail ? "SL nem trailing" : !hadSL ? "SL" : "trailing"} (a posição original não tinha)\n` : "") +
-      (breakoutLevel ? `🚀 Fallback: entra a mercado se romper $${formatPrice(breakoutLevel)} sem dar o pullback\n` : "") +
+      (breakoutLevel ? `🚀 Fallback: entra a mercado se romper $${formatPrice(breakoutLevel, argSym)} sem dar o pullback\n` : "") +
       (carried != null ? `🚩 Target de ${fmtUsd(carried)} herdado — volta a armar quando a re-entrada encher\n` : "") +
       `Cancela com sinal contrário | expira em ${CONFIG.reentryExpiryHours}h`,
       chatId
@@ -1734,7 +1734,7 @@ async function ratchetStops(positions) {
       console.log(`  🪜 ${key}: SL $${from} → $${newSl} (preço $${p.markPrice}${locked ? ", lucro travado" : ""})`);
       await sendTelegram(
         `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL acompanhou o lucro\n` +
-        `$${formatPrice(from)} → <b>$${newSl}</b> | preço $${formatPrice(p.markPrice)} | entrada $${formatPrice(p.avgPrice)}\n` +
+        `$${formatPrice(from, p.symbol)} → <b>$${newSl}</b> | preço $${formatPrice(p.markPrice, p.symbol)} | entrada $${formatPrice(p.avgPrice, p.symbol)}\n` +
         (locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`)
       );
     } catch (e) {
@@ -2438,7 +2438,7 @@ async function rearmCarriedTarget(sym, r, entryPrice) {
   console.log(`  🚩 ${key}: target de $${r.targetUsd} re-armado na posição re-aberta`);
   await sendTelegram(
     `🚩 <b>Bot v3 ${sym}</b> — target de ${fmtUsd(r.targetUsd)} re-armado\n` +
-    `Herdado da posição encaixada. Mede o PnL da posição nova (entrada $${formatPrice(entryPrice)}), a partir de zero.`,
+    `Herdado da posição encaixada. Mede o PnL da posição nova (entrada $${formatPrice(entryPrice, sym)}), a partir de zero.`,
     r.targetChatId || null
   );
 }
@@ -2522,7 +2522,7 @@ async function chaseReentryLimit(sym, state, slot, r, now) {
       delete state.reentries[slot];
       saveSymbolState();
       console.log(`  ⚠️  ${sym} ${slot}: chase — a limite encheu ${fin.executedQty} antes do cancelamento; watch removida`);
-      await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} encheu parcialmente (${fin.executedQty} de ${r.qty}) @ $${formatPrice(r.price)}\nO resto foi cancelado pelo chase; a posição parcial fica aberta.`);
+      await sendTelegram(`⚠️ <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} encheu parcialmente (${fin.executedQty} de ${r.qty}) @ $${formatPrice(r.price, sym)}\nO resto foi cancelado pelo chase; a posição parcial fica aberta.`);
     } else {
       // Encheu (o tick seguinte trata o fill) ou estado desconhecido — em ambos os casos
       // NÃO repor: uma limite nova por cima de uma que encheu duplicaria a posição.
@@ -2546,7 +2546,7 @@ async function chaseReentryLimit(sym, state, slot, r, now) {
     console.log(`  🎣 ${sym} ${slot}: chase ${r.chaseCount}/${CONFIG.commitChaseMaxSteps} — limite $${from} → $${lim.priceStr} (preço $${cur}, ${cedido.toFixed(0)}% do pullback cedido)`);
     await sendTelegram(
       `🎣 <b>Bot v3 ${sym}</b> — re-entrada ${r.action.toUpperCase()} reajustada (${r.chaseCount}/${CONFIG.commitChaseMaxSteps})\n` +
-      `Limite $${formatPrice(from)} → <b>$${lim.priceStr}</b> | preço atual $${formatPrice(cur)}\n` +
+      `Limite $${formatPrice(from, sym)} → <b>$${lim.priceStr}</b> | preço atual $${formatPrice(cur, sym)}\n` +
       `Cedido ${cedido.toFixed(0)}% do pullback (máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}%)` +
       (lim.slPrice ? ` | 🛡 SL $${lim.slPrice}` : "")
     );
@@ -2644,7 +2644,7 @@ async function checkReentriesFor(sym, state, now) {
                 console.log(`  ℹ️  ${sym}: sem trailing na re-entrada (posição original não tinha)`);
               }
             } catch (e) { console.log(`  ⚠️  Trailing pós-fill ${sym}: ${e.message}`); }
-            await sendTelegram(`🔁 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price)} (ordem limite)`);
+            await sendTelegram(`🔁 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} encheu @ $${formatPrice(r.price, sym)} (ordem limite)`);
             await rearmCarriedTarget(sym, r, r.price);
             continue;
           }
@@ -2694,7 +2694,7 @@ async function checkReentriesFor(sym, state, now) {
             const hoursOk = CONFIG.tradeHoursStart === null || CONFIG.tradeHoursEnd === null ||
               isInTimeWindow(new Date().getUTCHours(), CONFIG.tradeHoursStart, CONFIG.tradeHoursEnd);
             if (broke && hoursOk) {
-              console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel)} sem dar pullback — a cancelar limite e entrar a mercado`);
+              console.log(`  🚀 ${sym}: rompeu $${formatPrice(r.breakoutLevel, sym)} sem dar pullback — a cancelar limite e entrar a mercado`);
               // Só entra a mercado se a limite foi MESMO cancelada sem nada executado.
               // Se encheu entretanto, entrar a mercado duplicaria a posição.
               const fin = await cancelConfirmed(sym, r.orderId);
@@ -2734,11 +2734,11 @@ async function checkReentriesFor(sym, state, now) {
                 delete state.reentries[slot];
                 saveSymbolState();
                 if (r.hadTrail !== false && CONFIG.tradeMode === "futures") await setTrailingStop(sym, r.action, cur, atr);
-                logTrade(sym, r.action, cur, "", dM?.order?.orderId ?? dM?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel)} (limite não encheu)`);
+                logTrade(sym, r.action, cur, "", dM?.order?.orderId ?? dM?.orderId, "LIVE", `Re-entrada fallback breakout @ $${formatPrice(r.breakoutLevel, sym)} (limite não encheu)`);
                 await sendTelegram(
                   `🚀 <b>Bot v3 ${sym}</b> — Re-entrada ${r.action.toUpperCase()} a mercado (fallback)\n` +
-                  `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel)}\n` +
-                  `Entrada @ ~$${formatPrice(cur)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}${takeProfit ? ` | TP herdado: $${takeProfit}` : ""}`
+                  `Preço fugiu sem dar pullback — rompeu $${formatPrice(r.breakoutLevel, sym)}\n` +
+                  `Entrada @ ~$${formatPrice(cur, sym)} qty=${r.qty} | SL: ${stopLoss ? `$${stopLoss}` : "— (original não tinha)"}${takeProfit ? ` | TP herdado: $${takeProfit}` : ""}`
                 );
                 await rearmCarriedTarget(sym, r, cur);
               } catch (e) {
@@ -3143,6 +3143,7 @@ async function getOpenPositionsFor(symbol) {
     const side = position.positionSide === "SHORT" || parseFloat(position.positionAmt) < 0 ? "Sell" : "Buy";
     const prot = await getProtectionOrders(symbol, side);
     out.push({
+      symbol: canonicalSymbol(symbol),   // para quem recebe a posição poder formatar preços com a precisão do par
       side,
       size:           Math.abs(parseFloat(position.positionAmt)),
       stopLoss:       prot.slPrice,                                     // from the open STOP_MARKET order
@@ -3429,11 +3430,34 @@ async function checkApiKeyExpiry() {
 
 // Format a price/distance value with enough decimal places to avoid rounding to zero.
 // For low-price assets (e.g. HANAUSDT @ $0.0335), toFixed(2) would produce "0.00".
-function formatPrice(value) {
-  if (!value || value <= 0) return "0";
-  if (value >= 1) return value.toFixed(2);
-  const decimals = Math.max(2, -Math.floor(Math.log10(value)) + 2);
-  return value.toFixed(decimals);
+// Precisão declarada pelo contrato, lida da cache já existente (síncrona de propósito:
+// o formatPrice é usado em dezenas de sítios e não compensa torná-los todos async).
+// Devolve null enquanto a lista de contratos não estiver carregada.
+function _pricePrecision(symbol) {
+  if (!symbol || !_contractsCache.list) return null;
+  const bx = toBingxSymbol(symbol);
+  const c  = _contractsCache.list.find(x => x.symbol === bx);
+  const p  = c ? parseInt(c.pricePrecision) : NaN;
+  return Number.isFinite(p) ? p : null;
+}
+
+// A BingX devolve o preço exato como string, com a precisão do instrumento ("0.06828").
+// A heurística antiga descartava dígitos reais — 0.06828 virava $0.0683, 1.9532 virava
+// $1.95 — e inventava zeros nos pares grandes (80690.5 → $80690.50). Passa a usar a
+// precisão do contrato quando a conhece, e um fallback que nunca perde informação:
+// o menor número de casas que ainda representa o valor exatamente.
+function formatPrice(value, symbol = null) {
+  const v = typeof value === "number" ? value : parseFloat(value);
+  if (!v || !(v > 0)) return "0";
+
+  const prec = _pricePrecision(symbol);
+  if (prec !== null) return v.toFixed(Math.max(2, prec));
+
+  for (let d = 2; d <= 8; d++) {
+    const s = v.toFixed(d);
+    if (Math.abs(parseFloat(s) - v) < Number.EPSILON * Math.max(1, Math.abs(v))) return s;
+  }
+  return v.toFixed(8);
 }
 
 // Round a price (or price-distance) to the instrument's tick size and format with
