@@ -331,8 +331,13 @@ function nonOverlapping(name, fn) {
 // Por posição (SYMBOL:SIDE): a distância ancorada e o último SL que o BOT colocou.
 // O último SL serve para distinguir "o stop está onde eu o pus" de "o utilizador mexeu
 // nele na app" — nesse caso o bot re-ancora em vez de lutar contra a decisão dele.
+// `extreme` é a marca de água (melhor preço atingido): guardada, o trailing não se
+// perde numa retracção a seguir a um redeploy.
 const RATCHETS_FILE = path.join(DATA_DIR, "ratchets.json");
-let ratchets = {}; // "BEATUSDT:LONG" → { dist, sl }
+let ratchets = {}; // "BEATUSDT:LONG" → { dist, sl, extreme }
+// Falhas já comunicadas, por posição — para avisar uma vez e não a cada tick. Em memória
+// de propósito: depois de um reinício vale a pena voltar a avisar uma vez.
+const _ratchetFail = new Map();
 function loadRatchets() {
   try { if (existsSync(RATCHETS_FILE)) ratchets = JSON.parse(readFileSync(RATCHETS_FILE, "utf8")); } catch { ratchets = {}; }
 }
@@ -1665,11 +1670,16 @@ const autoCommitEnabled = () => CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommi
 // sem stop. (É o inverso do chase, onde o risco a evitar era a entrada a dobrar; aqui o
 // risco a evitar é ficar a descoberto, e um instante com dois stops é inofensivo — o
 // primeiro a disparar fecha tudo e o outro fica sem posição para reduzir.)
+// `quantity` é OBRIGATÓRIO: o closePosition sozinho é recusado pelo motor de ordens
+// ("parameter quantity or stopPrice is must"), embora o endpoint /order/test o aceite —
+// um falso positivo que escondeu isto. Era a razão por que o ratchet nunca movia um
+// stop: falhava na colocação a cada 30s, cinco semanas, só com um ⚠️ no console.
 async function replaceStopLoss(symbol, pos, newSlPrice, oldOrderId) {
   const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
   await bxRequest("POST", "/openApi/swap/v2/trade/order", {
     symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(pos.side),
-    type: "STOP_MARKET", stopPrice: newSlPrice, closePosition: "true", workingType: "CONTRACT_PRICE",
+    type: "STOP_MARKET", stopPrice: newSlPrice, quantity: String(pos.size),
+    closePosition: "true", workingType: "CONTRACT_PRICE",
   });
   if (oldOrderId) {
     if (!(await cancelOrder(symbol, oldOrderId))) {
@@ -1703,19 +1713,46 @@ async function ratchetStops(positions) {
       let rec = ratchets[key];
 
       // Âncora: primeira vez que vemos este SL, ou o utilizador mexeu nele na app.
-      // Nos dois casos a distância passa a ser a que ELE definiu, medida agora.
-      const tol = Math.max(tickSize || 0, 1e-12) / 2;
-      if (!rec || Math.abs(p.stopLoss - rec.sl) > tol) {
-        rec = { dist: Math.abs(p.markPrice - p.stopLoss), sl: p.stopLoss };
+      const tol    = Math.max(tickSize || 0, 1e-12) / 2;
+      const edited = rec && Math.abs(p.stopLoss - rec.sl) > tol;
+      if (!rec || edited) {
+        // A distância a manter é a que o UTILIZADOR escolheu — não o lucro que a posição
+        // já tem. Ao ver o stop pela primeira vez (posição aberta à mão, estado perdido
+        // num redeploy), o intervalo até ao preço ATUAL inclui todo o ganho acumulado:
+        // ancorar nele dava um trailing tão largo quanto o ganho, e o stop ficava parado
+        // à espera de um extremo ainda melhor. O intervalo da ENTRADA ao stop é o risco
+        // que ele definiu ao abrir, e não depende do instante em que o bot olha.
+        // Numa edição na app é o inverso: o intervalo até ao preço atual é a intenção nova.
+        const byMark  = Math.abs(p.markPrice - p.stopLoss);
+        const byEntry = Math.abs(p.avgPrice  - p.stopLoss);
+        // O mínimo dos dois nunca propõe um stop pior do que o que já lá está.
+        const dist    = (edited || !(byEntry > 0)) ? byMark : Math.min(byEntry, byMark);
+        rec = { dist, sl: p.stopLoss, extreme: p.markPrice };
         ratchets[key] = rec;
         saveRatchets();
-        console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${rec.dist.toFixed(8).replace(/\.?0+$/, "")})`);
+        console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${dist.toFixed(8).replace(/\.?0+$/, "")}${edited ? ", editado na app" : ""})`);
         return;   // só ancora neste tick; move a partir do próximo
       }
 
-      const desiredNum = isLong ? p.markPrice - rec.dist : p.markPrice + rec.dist;
+      // Marca de água: o melhor preço ATINGIDO, não o preço do momento. Guardada, por
+      // isso uma retracção a seguir a um redeploy já não reabre a distância ancorada.
+      const prevExtreme = rec.extreme ?? p.markPrice;
+      rec.extreme = isLong ? Math.max(prevExtreme, p.markPrice) : Math.min(prevExtreme, p.markPrice);
+      if (rec.extreme !== prevExtreme) saveRatchets();
+
+      const desiredNum = isLong ? rec.extreme - rec.dist : rec.extreme + rec.dist;
       const improves   = isLong ? desiredNum > p.stopLoss : desiredNum < p.stopLoss;
-      if (!improves) return;   // preço andou contra nós — o stop NÃO recua
+      if (!improves) return;   // sem extremo novo — o stop NÃO recua
+
+      // O stop tem de ficar do lado protetor do preço atual. Com a marca de água
+      // guardada o preço pode estar longe dela (retracção, reinício depois de um
+      // extremo), e extremo ± distância cairia do lado errado do mercado — um stop que
+      // dispara no instante em que é colocado, fechando a posição a mercado.
+      const guard = Math.max(tickSize || 0, 1e-12);
+      if (isLong ? desiredNum >= p.markPrice - guard : desiredNum <= p.markPrice + guard) {
+        console.log(`  ⏭ Ratchet ${key}: $${formatPrice(desiredNum, p.symbol)} cairia do lado errado de $${formatPrice(p.markPrice, p.symbol)} — stop mantido`);
+        return;
+      }
 
       // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick
       const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct);
@@ -1727,6 +1764,7 @@ async function ratchetStops(positions) {
       await replaceStopLoss(p.symbol, p, newSl, p.slOrderId);
       const from = p.stopLoss;
       rec.sl = parseFloat(newSl);
+      _ratchetFail.delete(key);
       saveRatchets();
 
       // Travou lucro? (stop já do lado bom da entrada)
@@ -1739,6 +1777,16 @@ async function ratchetStops(positions) {
       );
     } catch (e) {
       console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
+      // Esta falha era SÓ para o console — e assim um stop que nunca se mexeu parece um
+      // stop que não precisou de se mexer. Avisa uma vez por motivo, não a cada 30s.
+      if (_ratchetFail.get(key) !== e.message) {
+        _ratchetFail.set(key, e.message);
+        await sendTelegram(
+          `⚠️ <b>Bot v3 ${prettySymbol(p.symbol)}</b> ${p.side === "Buy" ? "LONG" : "SHORT"} — o SL NÃO acompanhou o lucro\n` +
+          `<code>${e.message}</code>\n` +
+          `O stop ficou em $${formatPrice(p.stopLoss, p.symbol)}. Vou continuar a tentar a cada ${CONFIG.positionPollMs / 1000}s.`
+        );
+      }
     }
     });
   }
@@ -3843,7 +3891,10 @@ async function handleWebhook(body) {
             console.log(`  ℹ️  SL atual $${currentSl} já é mais protetor que $${formatPrice(newSl)} — mantido (o SL nunca recua)`);
             newSl = null;
           } else {
-            await setBreakEvenStop(sym, newSl, openPos.side);
+            // Se a colocação falhar, o SL NÃO mudou — anunciá-lo no Telegram dava uma
+            // protecção que não existe (era o que acontecia com o quantity em falta).
+            try { await setBreakEvenStop(sym, newSl, openPos.side); }
+            catch (e) { newSl = null; throw e; }
           }
         } catch (e) {
           console.log(`  ⚠️  Ajuste de SL falhou: ${e.message}`);
