@@ -1666,26 +1666,51 @@ function autoCommitThreshold(p) {
 const autoCommitEnabled = () => CONFIG.autoCommitGainPct > 0 || CONFIG.autoCommitGainUSD > 0;
 
 // Substitui o STOP_MARKET de uma posição por um noutro preço.
-// Coloca o NOVO antes de cancelar o antigo: se a colocação falhar, a posição nunca fica
-// sem stop. (É o inverso do chase, onde o risco a evitar era a entrada a dobrar; aqui o
-// risco a evitar é ficar a descoberto, e um instante com dois stops é inofensivo — o
-// primeiro a disparar fecha tudo e o outro fica sem posição para reduzir.)
-// `quantity` é OBRIGATÓRIO: o closePosition sozinho é recusado pelo motor de ordens
-// ("parameter quantity or stopPrice is must"), embora o endpoint /order/test o aceite —
-// um falso positivo que escondeu isto. Era a razão por que o ratchet nunca movia um
-// stop: falhava na colocação a cada 30s, cinco semanas, só com um ⚠️ no console.
+//
+// `quantity` é OBRIGATÓRIO mesmo com closePosition (está na documentação do endpoint, e
+// o motor recusa sem ele: "parameter quantity or stopPrice is must"). O /order/test
+// aceita-o sem quantity — um falso positivo que escondeu isto durante cinco semanas.
+//
+// E uma posição só pode ter UM stop: colocar o novo antes de cancelar o antigo, que era
+// o que esta função fazia para nunca ficar a descoberto, é recusado com "Position SL
+// order already exists". O cancelReplace resolve as duas pontas — cancela e coloca numa
+// operação atómica, sem a janela sem stop que um cancelar-primeiro abriria.
+// STOP_ON_FAILURE: se o cancelamento falhar, não entra um segundo stop.
 async function replaceStopLoss(symbol, pos, newSlPrice, oldOrderId) {
   const closeSide = pos.side === "Buy" ? "SELL" : "BUY";
-  await bxRequest("POST", "/openApi/swap/v2/trade/order", {
+  // Sem reduceOnly: a documentação proíbe combiná-lo com closePosition (e em hedge o
+  // positionSide já garante que a ordem só reduz a posição daquele lado).
+  const order = {
     symbol: toBingxSymbol(symbol), side: closeSide, positionSide: psideClose(pos.side),
     type: "STOP_MARKET", stopPrice: newSlPrice, quantity: String(pos.size),
     closePosition: "true", workingType: "CONTRACT_PRICE",
-  });
-  if (oldOrderId) {
-    if (!(await cancelOrder(symbol, oldOrderId))) {
-      console.log(`  ⚠️  ${symbol}: stop novo colocado mas o antigo (${oldOrderId}) não foi cancelado`);
-    }
+  };
+
+  // Sem stop antigo não há nada para substituir — colocação normal.
+  if (!oldOrderId) {
+    await bxRequest("POST", "/openApi/swap/v2/trade/order", order);
+    return;
   }
+
+  const d = await bxRequest("POST", "/openApi/swap/v1/trade/cancelReplace", {
+    ...order, cancelOrderId: String(oldOrderId), cancelReplaceMode: "STOP_ON_FAILURE",
+  });
+  // O bxRequest já rejeitou qualquer code != 0, por isso uma resposta sem os campos de
+  // resultado é uma resposta aceite — não se inventa uma falha a partir de um campo que
+  // a exchange não mandou (daria um aviso falso e um re-ancorar desnecessário).
+  const cancelled = String(d?.cancelResult   ?? "SUCCESS").toUpperCase() === "SUCCESS";
+  const placed    = String(d?.newOrderResult ?? "SUCCESS").toUpperCase() === "SUCCESS";
+  if (placed) return;
+
+  // Cancelou e não colocou: a posição está SEM stop, que é pior do que qualquer outra
+  // falha possível aqui. Repor é mais urgente do que reportar — se a reposição também
+  // falhar, o erro dela sobe e o aviso sai no Telegram.
+  if (cancelled) {
+    console.log(`  ⚠️  ${symbol}: stop antigo cancelado mas o novo falhou — a repor`);
+    await bxRequest("POST", "/openApi/swap/v2/trade/order", order);
+    return;
+  }
+  throw new Error(`cancelReplace recusado (cancelamento ${d?.cancelResult}, colocação ${d?.newOrderResult}) — stop mantido em $${pos.stopLoss}`);
 }
 
 // Acompanha o lucro movendo o SL da posição, nunca para trás — o que a Bybit fazia
