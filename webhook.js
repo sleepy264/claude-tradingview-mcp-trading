@@ -3682,7 +3682,7 @@ app.get("/trades", (req, res) => {
 // Por defeito só aceita comandos de LEITURA. O segredo é o mesmo do /webhook, e quem o
 // tiver podia senão fechar posições (/close3) ou encaixar lucros (/commit3) com um
 // pedido HTTP. COMMAND_ENDPOINT_ALLOW_ALL=true abre os restantes, se for isso que queres.
-const COMMAND_READONLY = new Set(["/pnl3", "/pos3", "/stats7", "/stats30", "/stats365", "/fees3"]);
+const COMMAND_READONLY = new Set(["/pnl3", "/pos3", "/wait3", "/stats7", "/stats30", "/stats365", "/fees3"]);
 
 async function runCommandEndpoint(req, res) {
   if (CONFIG.webhookSecret && (req.query.secret ?? req.body?.secret) !== CONFIG.webhookSecret) {
