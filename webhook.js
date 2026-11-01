@@ -3,6 +3,7 @@ import express from "express";
 import crypto from "crypto";
 import path from "path";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { AsyncLocalStorage } from "async_hooks";
 
 // Persisted state/log live under DATA_DIR. Set DATA_DIR to a mounted Railway Volume path
 // (e.g. /data) so symbol-state.json and the trade log survive redeploys/restarts.
@@ -491,7 +492,19 @@ async function checkCooldownAndSlLimit(symbol, action, hasOpenPosition) {
 
 // ─── Telegram Notifications ──────────────────────────────────────────────────
 
+// Captura das respostas de um comando, para o /command as poder devolver por HTTP.
+// AsyncLocalStorage (e não uma variável global) porque um comando disparado por HTTP
+// pode correr ao mesmo tempo que um vindo do Telegram: cada um fica com o seu contexto.
+const _reply = new AsyncLocalStorage();
+function captureReply(message) {
+  const cap = _reply.getStore();
+  if (!cap) return false;
+  cap.messages.push(message);
+  return cap.silent;   // true = não repetir no Telegram, a resposta vai pelo HTTP
+}
+
 async function sendTelegram(message, chatId = null) {
+  if (captureReply(message)) return;
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const target = chatId || process.env.TELEGRAM_CHAT_ID;
   if (!token || !target) return;
@@ -507,6 +520,7 @@ async function sendTelegram(message, chatId = null) {
 // list of button labels (strings). Tapping a button sends its label as a normal message,
 // so labels like "/commit3 BTCUSDT" route straight through handleTelegramCommand.
 async function sendTelegramKeyboard(message, rows, chatId = null) {
+  if (captureReply(message)) return;   // por HTTP não há teclado, só o texto
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const target = chatId || process.env.TELEGRAM_CHAT_ID;
   if (!token || !target) return;
@@ -3657,6 +3671,54 @@ app.get("/trades", (req, res) => {
   res.setHeader("Content-Disposition", 'attachment; filename="webhook-trades.csv"');
   res.send(readFileSync(LOG_FILE, "utf8"));
 });
+
+// Executa um comando do Telegram a partir de outro processo (um scheduler, um script)
+// e devolve a MESMA resposta que o Telegram receberia:
+//   POST /command?secret=SEGREDO   { "command": "/pnl3" }
+//   GET  /command?secret=SEGREDO&command=/pnl3
+// Não dá para fazer isto pelo Telegram: um bot não recebe as mensagens que ele próprio
+// envia, por isso mandar "/pnl3" com o token do bot não dispara nada.
+//
+// Por defeito só aceita comandos de LEITURA. O segredo é o mesmo do /webhook, e quem o
+// tiver podia senão fechar posições (/close3) ou encaixar lucros (/commit3) com um
+// pedido HTTP. COMMAND_ENDPOINT_ALLOW_ALL=true abre os restantes, se for isso que queres.
+const COMMAND_READONLY = new Set(["/pnl3", "/pos3", "/stats7", "/stats30", "/stats365", "/fees3"]);
+
+async function runCommandEndpoint(req, res) {
+  if (CONFIG.webhookSecret && (req.query.secret ?? req.body?.secret) !== CONFIG.webhookSecret) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  const text = String(req.body?.command ?? req.query.command ?? "").trim();
+  const cmd  = text.split(/\s+/)[0].toLowerCase();
+  if (!cmd.startsWith("/")) {
+    return res.status(400).json({ ok: false, error: 'Falta "command" (ex.: "/pnl3")' });
+  }
+  if (!COMMAND_READONLY.has(cmd) && process.env.COMMAND_ENDPOINT_ALLOW_ALL !== "true") {
+    return res.status(403).json({
+      ok: false, error: `${cmd} altera posições — bloqueado neste endpoint`,
+      allowed: [...COMMAND_READONLY], hint: "COMMAND_ENDPOINT_ALLOW_ALL=true para permitir todos",
+    });
+  }
+
+  // silent=true (o default): a resposta vai só no HTTP, sem duplicar no Telegram.
+  const silent = String(req.body?.silent ?? req.query.silent ?? "true") === "true";
+  const store  = { messages: [], silent };
+  console.log(`\n[/command] ${text}${silent ? "" : " (com eco no Telegram)"}`);
+  try {
+    await _reply.run(store, () => handleTelegramCommand(text, null));
+    const html = store.messages.join("\n\n");
+    res.json({
+      ok: true, command: text,
+      text: html.replace(/<[^>]+>/g, ""),   // sem as tags HTML do Telegram
+      html, messages: store.messages,
+    });
+  } catch (e) {
+    console.log(`[/command] ⚠️  ${e.message}`);
+    res.status(500).json({ ok: false, command: text, error: e.message, messages: store.messages });
+  }
+}
+app.post("/command", runCommandEndpoint);
+app.get("/command",  runCommandEndpoint);
 
 // TradingView alert endpoint
 // Expected payload: { "secret": "...", "action": "buy"|"sell", "symbol": "BTCUSDT", "price": 75000 }
