@@ -211,8 +211,18 @@ const CONFIG = {
   // utilizador (a mesma regra que o /commit3 já segue ao espelhar protecções).
   trailRatchetEnabled:    process.env.TRAIL_RATCHET_ENABLED !== "false",
   // Só mexe quando a melhoria vale pelo menos esta fração da distância ancorada —
-  // sem isto seria um cancelar+repor a cada 30s por frações de tick.
+  // sem isto seria um cancelar+repor a cada 30s por frações de tick. Serve de chão
+  // quando o ATR não está disponível; com ATR manda o maior dos dois (ver abaixo).
   trailRatchetMinStepPct: parseFloat(process.env.TRAIL_RATCHET_MIN_STEP_PCT || "0.1"),
+  // Passo mínimo medido na volatilidade REAL do par, em frações de ATR. Uma fração da
+  // distância ancorada não sabe nada do par: 10% de uma distância de 115 dão 11 USD, e
+  // o BTC faz 11 USD de máximo novo por acidente num minuto — o stop ia atrás do ruído.
+  trailRatchetMinStepAtr: parseFloat(process.env.TRAIL_RATCHET_MIN_STEP_ATR || "0.25"),
+  // Portão do lucro: só acompanha quando o preço já passou a entrada por esta fração
+  // (0 = basta estar do lado bom). Apertar o stop de uma posição EM PERDA não trava
+  // ganho nenhum — só aproxima a saída, e foi assim que um BTC LONG saiu a -235 num
+  // stop que o utilizador tinha alargado minutos antes (2026-11-07).
+  trailRatchetActivatePct: parseFloat(process.env.TRAIL_RATCHET_ACTIVATE_PCT || "0"),
   // BingX API keys without an IP whitelist expire every 3 months. Checked daily; a
   // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
   apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
@@ -1727,6 +1737,27 @@ async function replaceStopLoss(symbol, pos, newSlPrice, oldOrderId) {
   throw new Error(`cancelReplace recusado (cancelamento ${d?.cancelResult}, colocação ${d?.newOrderResult}) — stop mantido em $${pos.stopLoss}`);
 }
 
+// ATR para o passo mínimo do ratchet, em cache: o poller corre a cada 30s por posição,
+// mas o ATR move-se à velocidade das velas — uma leitura por meia vela basta, e sem
+// cache seriam 2 chamadas de klines por minuto por posição aberta.
+const _atrCache = new Map();   // symbol → { value, at, interval }
+async function ratchetAtr(symbol) {
+  const interval = symbolState[symbol]?.lastInterval || CONFIG.candleInterval;
+  const ttl = Math.max(60_000, ((parseInt(interval, 10) || 15) * 60_000) / 2);
+  const hit = _atrCache.get(symbol);
+  if (hit && hit.interval === interval && Date.now() - hit.at < ttl) return hit.value;
+  try {
+    const value = await fetchATR(symbol, interval);
+    _atrCache.set(symbol, { value, at: Date.now(), interval });
+    return value;
+  } catch (e) {
+    // Sem ATR o passo cai na fração da distância: pior, mas nunca bloqueia o ratchet.
+    console.log(`  ⚠️  Ratchet ${symbol}: ATR indisponível (${e.message}) — passo pela distância`);
+    _atrCache.set(symbol, { value: null, at: Date.now(), interval });
+    return null;
+  }
+}
+
 // Acompanha o lucro movendo o SL da posição, nunca para trás — o que a Bybit fazia
 // nativamente e a BingX não faz (lá o trailing é uma ordem à parte que deixa o stop
 // visível parado). Corre sobre TODAS as posições abertas, incluindo as abertas à mão
@@ -1779,6 +1810,22 @@ async function ratchetStops(positions) {
       rec.extreme = isLong ? Math.max(prevExtreme, p.markPrice) : Math.min(prevExtreme, p.markPrice);
       if (rec.extreme !== prevExtreme) saveRatchets();
 
+      // Portão do lucro. Numa posição A PERDER, apertar o stop não trava ganho nenhum —
+      // só aproxima a saída. A marca de água continua a ser registada acima, para o
+      // primeiro movimento já partir do melhor preço atingido quando o lucro chegar.
+      const act      = Math.abs(p.avgPrice) * CONFIG.trailRatchetActivatePct;
+      const inProfit = isLong ? p.markPrice > p.avgPrice + act : p.markPrice < p.avgPrice - act;
+      if (!inProfit) {
+        // Uma vez por entrada em perda, não a cada 30s.
+        if (!rec.waiting) {
+          rec.waiting = true;
+          saveRatchets();
+          console.log(`  ⏸ Ratchet ${key}: a perder (preço ${p.markPrice} vs entrada ${p.avgPrice}) — stop fica em ${p.stopLoss}`);
+        }
+        return;
+      }
+      if (rec.waiting) { rec.waiting = false; saveRatchets(); }
+
       const desiredNum = isLong ? rec.extreme - rec.dist : rec.extreme + rec.dist;
       const improves   = isLong ? desiredNum > p.stopLoss : desiredNum < p.stopLoss;
       if (!improves) return;   // sem extremo novo — o stop NÃO recua
@@ -1793,8 +1840,13 @@ async function ratchetStops(positions) {
         return;
       }
 
-      // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick
-      const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct);
+      // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick.
+      // O ATR é a medida que conhece o par: uma fração da distância não sabe nada dele, e
+      // 10% de uma distância de 115 dão 11 USD — que o BTC faz de máximo novo por acidente
+      // num minuto. Fica o maior dos dois, para o chão não desaparecer sem ATR.
+      const atr     = await ratchetAtr(p.symbol);
+      const atrStep = atr ? atr * CONFIG.trailRatchetMinStepAtr : 0;
+      const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct, atrStep);
       if (Math.abs(desiredNum - p.stopLoss) < minStep) return;
 
       const newSl = roundToTick(desiredNum, tickSize);
@@ -4401,7 +4453,7 @@ app.listen(PORT, () => {
   console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
-  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | passo mín ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
+  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), chão ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
