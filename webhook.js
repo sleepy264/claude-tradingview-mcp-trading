@@ -223,6 +223,23 @@ const CONFIG = {
   // ganho nenhum — só aproxima a saída, e foi assim que um BTC LONG saiu a -235 num
   // stop que o utilizador tinha alargado minutos antes (2026-11-07).
   trailRatchetActivatePct: parseFloat(process.env.TRAIL_RATCHET_ACTIVATE_PCT || "0"),
+  // Guardas de posição manual. Em 60 dias (set–nov 2026) 15 viagens perderam $11 786 e
+  // as outras 241 ganharam $3 621; as 15 tinham stop durante 0–2% do tempo, e 12 das 13
+  // liquidações nunca tiveram stop. Todas as guardas de risco do bot viviam no caminho
+  // dos alertas do TradingView — desligado — e nenhuma olhava para posições abertas à mão.
+  // Por omissão SÓ AVISAM; nada aqui fecha uma posição.
+  guardEnabled:       process.env.GUARD_ENABLED !== "false",
+  // Tecto de perda por posição. Serve para dizer a que preço ficaria o stop, para avisar
+  // quando um stop existente vale mais do que isto, e — só com GUARD_AUTO_STOP=true —
+  // para o bot colocar ele próprio o stop numa posição que ficou sem nenhum.
+  guardMaxLossUsd:    parseFloat(process.env.GUARD_MAX_LOSS_USD   || "150"),
+  guardNakedMinutes:  parseFloat(process.env.GUARD_NAKED_MINUTES  || "5"),   // tolerância sem stop
+  guardRepeatMinutes: parseFloat(process.env.GUARD_REPEAT_MINUTES || "60"),  // repete enquanto durar
+  guardAutoStop:      process.env.GUARD_AUTO_STOP === "true",
+  // Fração do caminho entrada→liquidação que ainda falta: avisa a 50%, insiste a 25%.
+  // Em fração e não em % do preço porque a 100x+ a liquidação nasce a menos de 1%.
+  guardLiqWarn:       parseFloat(process.env.GUARD_LIQ_WARN || "0.5"),
+  guardLiqCrit:       parseFloat(process.env.GUARD_LIQ_CRIT || "0.25"),
   // BingX API keys without an IP whitelist expire every 3 months. Checked daily; a
   // Telegram warning is sent each day once ≤ this many days remain. 0 = disabled.
   apiKeyExpiryWarnDays:   parseFloat(process.env.API_KEY_EXPIRY_WARN_DAYS || "7"),
@@ -354,6 +371,19 @@ function loadRatchets() {
 }
 function saveRatchets() {
   try { writeFileSync(RATCHETS_FILE, JSON.stringify(ratchets, null, 2)); } catch {}
+}
+
+// ─── Guardas de posição manual ───────────────────────────────────────────────
+// Por posição (SYMBOL:SIDE): o tamanho e preço médio vistos no tick anterior (para
+// detetar reforços), desde quando está sem stop, e o que já foi avisado — para avisar
+// uma vez por acontecimento e não a cada 30s.
+const GUARDS_FILE = path.join(DATA_DIR, "guards.json");
+let guards = {}; // "BTCUSDT:LONG" → { size, avg, losingAdds, addAlertAt, nakedSince, nakedAlertAt, liqLevel, capWarned }
+function loadGuards() {
+  try { if (existsSync(GUARDS_FILE)) guards = JSON.parse(readFileSync(GUARDS_FILE, "utf8")); } catch { guards = {}; }
+}
+function saveGuards() {
+  try { writeFileSync(GUARDS_FILE, JSON.stringify(guards, null, 2)); } catch {}
 }
 
 // ─── Registo de execuções (maker vs taker) ───────────────────────────────────
@@ -565,6 +595,7 @@ async function getAllOpenPositions() {
         // no unrealizedPnl e por isso não conta para o /target3 — só para a estimativa líquida.
         realisedPnl:   parseFloat(p.realisedProfit || p.realizedProfit || "0"),
         leverage:      parseFloat(p.leverage || "0"),   // for margin/ROI calc
+        liquidationPrice: parseFloat(p.liquidationPrice || "0"),  // 0 = sem liquidação à vista
         // SL/TP/trailing vivem em ordens separadas na BingX — ficam a 0 aqui e são
         // preenchidos por attachProtections() quem precisar deles (ver /pos3).
         stopLoss:      0,
@@ -641,6 +672,9 @@ async function attachProtections(positions) {
     p.takeProfit   = tp ? parseFloat(tp.stopPrice || tp.price || "0") : 0;
     p.trailingStop = trail ? 1 : 0;
     p.slOrderId    = sl?.orderId ?? null;   // o ratchet precisa dele para substituir o stop
+    // Lido com sucesso. Sem isto, uma falha do openOrders (que devolve as posições com
+    // stopLoss a 0) é indistinguível de "esta posição não tem stop".
+    p.protKnown    = true;
   }
   return positions;
 }
@@ -1774,6 +1808,9 @@ async function ratchetStops(positions) {
     if (symbolBusy(p.symbol)) { console.log(`  ⏭ Ratchet ${key}: símbolo ocupado — fica para o próximo tick`); continue; }
     await withSymbolLock(p.symbol, async () => {
     try {
+      // Protecções não lidas neste tick (openOrders falhou): não é "sem stop" — apagar a
+      // âncora aqui deitava fora a distância e a marca de água por causa de um blip.
+      if (!p.protKnown) return;
       // Sem SL não há nada para mover — e o bot não cria stops por iniciativa própria.
       if (!(p.stopLoss > 0) || !(p.markPrice > 0)) { delete ratchets[key]; return; }
       if (nonCryptoBlocked(p.symbol)) return;
@@ -1883,23 +1920,158 @@ async function ratchetStops(positions) {
   }
 }
 
+// Guardas de posição manual — três avisos sobre posições que o resto do bot não vê:
+//   1. sem stop há mais de GUARD_NAKED_MINUTES (e, só com GUARD_AUTO_STOP, coloca-o);
+//   2. reforço em perda: a posição cresceu e o preço médio piorou;
+//   3. a caminho da liquidação: falta ≤50% / ≤25% do caminho entrada→liquidação.
+// Por omissão só avisa. O único gesto que pode fazer é COLOCAR um stop (auto-stop);
+// nunca fecha uma posição, nem coloca um stop que dispararia no instante.
+async function guardPositions(positions) {
+  if (!CONFIG.guardEnabled || CONFIG.paperTrading) return;
+  const now = Date.now();
+  const cap = CONFIG.guardMaxLossUsd;
+  let dirty = false;
+  const live = new Set(positions.map(p => targetKey(p.symbol, p.side)));
+  for (const k of Object.keys(guards)) if (!live.has(k)) { delete guards[k]; dirty = true; }
+
+  for (const p of positions) {
+    const key    = targetKey(p.symbol, p.side);
+    const isLong = p.side === "Buy";
+    const head   = `<b>Bot v3 ${prettySymbol(p.symbol)}</b> ${isLong ? "LONG" : "SHORT"}`;
+    const px     = v => `$${formatPrice(v, p.symbol)}`;
+    const liq    = p.liquidationPrice;
+    const liqTxt = liq > 0 && p.markPrice > 0
+      ? `liquidação ${px(liq)} (a ${(100 * Math.abs(p.markPrice - liq) / p.markPrice).toFixed(2)}% do preço)`
+      : "sem preço de liquidação";
+    let g = guards[key];
+    if (!g) { g = guards[key] = { size: p.size, avg: p.avgPrice, losingAdds: 0, liqLevel: 0 }; dirty = true; }
+    try {
+      // ── 2. Reforço em perda ──────────────────────────────────────────────────────
+      // O preço médio só piora quando a entrada nova foi feita a pior preço do que a
+      // média — isto é, com a posição em perda nesse ponto.
+      const grew  = p.size > g.size * 1.0005;
+      const worse = isLong ? p.avgPrice < g.avg : p.avgPrice > g.avg;
+      if (grew && worse) {
+        g.losingAdds = (g.losingAdds || 0) + 1;
+        // Uma limite que enche aos bocados aparece em vários ticks: um aviso por 2 min.
+        if (now - (g.addAlertAt || 0) > 120_000) {
+          g.addAlertAt = now;
+          console.log(`  🛡 Guarda ${key}: reforço em perda #${g.losingAdds} (${g.size} → ${p.size})`);
+          await sendTelegram(
+            `⚠️ ${head} — reforço em perda (#${g.losingAdds} nesta posição)\n` +
+            `Tamanho ${g.size} → <b>${p.size}</b> | notional $${(p.size * p.markPrice).toFixed(0)}\n` +
+            `Preço médio ${px(g.avg)} → ${px(p.avgPrice)} | PnL ${fmtUsd(p.unrealizedPnl)}\n` +
+            `${p.protKnown ? (p.stopLoss > 0 ? `🛡 Stop em ${px(p.stopLoss)}` : "🚨 SEM STOP") + " | " : ""}${liqTxt}`
+          );
+        }
+      }
+      if (p.size !== g.size || p.avgPrice !== g.avg) { g.size = p.size; g.avg = p.avgPrice; dirty = true; }
+
+      // ── 3. A caminho da liquidação ───────────────────────────────────────────────
+      if (liq > 0 && p.avgPrice > 0 && p.markPrice > 0) {
+        const span  = Math.abs(p.avgPrice - liq);
+        const left  = isLong ? p.markPrice - liq : liq - p.markPrice;
+        const frac  = span > 0 ? left / span : 1;
+        const level = frac <= CONFIG.guardLiqCrit ? 2 : frac <= CONFIG.guardLiqWarn ? 1 : 0;
+        const prev  = g.liqLevel || 0;
+        if (level > prev) {
+          g.liqLevel = level; dirty = true;
+          console.log(`  🛡 Guarda ${key}: falta ${(100 * frac).toFixed(0)}% do caminho até à liquidação`);
+          await sendTelegram(
+            `${level === 2 ? "🚨" : "⚠️"} ${head} — falta ${Math.max(0, 100 * frac).toFixed(0)}% do caminho até à liquidação\n` +
+            `Preço ${px(p.markPrice)} | entrada ${px(p.avgPrice)} | ${liqTxt}\n` +
+            `PnL ${fmtUsd(p.unrealizedPnl)}${p.protKnown ? ` | ${p.stopLoss > 0 ? `stop em ${px(p.stopLoss)}` : "SEM STOP"}` : ""}\n` +
+            `<i>Em margem cruzada, uma liquidação arrasta as outras posições.</i>`
+          );
+        } else if (level < prev) {
+          // Histerese: só desarma com folga, senão um preço a oscilar no limiar repetia o aviso.
+          const thr = prev === 2 ? CONFIG.guardLiqCrit : CONFIG.guardLiqWarn;
+          if (frac > thr * 1.2) { g.liqLevel = level; dirty = true; }
+        }
+      }
+
+      // ── 1. Sem stop ──────────────────────────────────────────────────────────────
+      if (!p.protKnown) continue;   // protecções não lidas neste tick — não é "sem stop"
+      if (p.stopLoss > 0) {
+        if (g.nakedSince) { g.nakedSince = null; g.nakedAlertAt = null; dirty = true; }
+        // Tem stop, mas vale mais do que o tecto. Uma vez por preço de stop.
+        const slLoss = (isLong ? p.avgPrice - p.stopLoss : p.stopLoss - p.avgPrice) * p.size;
+        if (slLoss > cap * 1.05 && g.capWarned !== p.stopLoss) {
+          g.capWarned = p.stopLoss; dirty = true;
+          await sendTelegram(
+            `⚠️ ${head} — o stop em ${px(p.stopLoss)} vale ${fmtUsd(-slLoss)}, acima do tecto de ${fmtUsd(-cap)}\n` +
+            `Para o tecto ficaria em ${px(isLong ? p.avgPrice - cap / p.size : p.avgPrice + cap / p.size)}.`
+          );
+        }
+        continue;
+      }
+      if (!g.nakedSince) { g.nakedSince = now; dirty = true; }
+      const due = now - g.nakedSince >= CONFIG.guardNakedMinutes * 60_000 &&
+                  (!g.nakedAlertAt || now - g.nakedAlertAt >= CONFIG.guardRepeatMinutes * 60_000);
+      if (!due) continue;
+
+      // Onde ficaria o stop do tecto — ou, se a liquidação chega antes dele, um stop a
+      // 15% do caminho entrada→liquidação antes dela (um stop sai ao preço de mercado;
+      // uma liquidação entrega a margem toda).
+      const capPx    = isLong ? p.avgPrice - cap / p.size : p.avgPrice + cap / p.size;
+      const liqFirst = liq > 0 && (isLong ? capPx <= liq : capPx >= liq);
+      // Posição pequena demais para perder o tecto e sem liquidação à vista: nada a guardar.
+      if (!liqFirst && capPx <= 0) { g.nakedAlertAt = now; dirty = true; continue; }
+      const { tickSize } = await getInstrumentInfo(p.symbol);
+      const stopNum  = liqFirst ? (isLong ? liq + 0.15 * Math.abs(p.avgPrice - liq) : liq - 0.15 * Math.abs(p.avgPrice - liq)) : capPx;
+      const stopStr  = roundToTick(stopNum, tickSize);
+      const stopLoss = Math.abs(p.avgPrice - stopNum) * p.size;
+      const tick     = Math.max(tickSize || 0, 1e-12);
+      // O preço já passou o nível: um stop aí disparava no instante e fechava a mercado.
+      const pastIt   = isLong ? p.markPrice <= stopNum + tick : p.markPrice >= stopNum - tick;
+      const mins     = Math.round((now - g.nakedSince) / 60_000);
+      const where    = liqFirst
+        ? `A liquidação (${px(liq)}) chega ANTES do tecto de ${fmtUsd(-cap)}. Um stop antes dela: ${px(stopNum)} (${fmtUsd(-stopLoss)}).`
+        : `Stop no tecto de ${fmtUsd(-cap)}: ${px(stopNum)}.`;
+
+      g.nakedAlertAt = now; dirty = true;
+      let placed = null, placeErr = null;
+      if (CONFIG.guardAutoStop && !pastIt && !symbolBusy(p.symbol) && !nonCryptoBlocked(p.symbol)) {
+        try {
+          await withSymbolLock(p.symbol, () => replaceStopLoss(p.symbol, p, stopStr, null));
+          placed = stopStr;
+        } catch (e) { placeErr = e.message; }
+      }
+      console.log(`  🛡 Guarda ${key}: sem stop há ${mins} min${placed ? ` — stop colocado em $${placed}` : ""}${placeErr ? ` — colocação falhou: ${placeErr}` : ""}`);
+      await sendTelegram(
+        `🚨 ${head} — SEM STOP há ${mins} min\n` +
+        `Tamanho ${p.size} | notional $${(p.size * p.markPrice).toFixed(0)} | entrada ${px(p.avgPrice)} | preço ${px(p.markPrice)}\n` +
+        `PnL ${fmtUsd(p.unrealizedPnl)} | ${liqTxt}\n` +
+        (placed   ? `🛡 <b>Stop colocado em $${placed}</b> (${fmtUsd(-stopLoss)}).`
+        : placeErr ? `${where}\n❌ Não consegui colocá-lo: <code>${placeErr}</code>`
+        : pastIt   ? `${where}\n⛔ O preço já passou esse nível — nenhum stop foi colocado; a decisão é tua.`
+        :            `${where}${CONFIG.guardAutoStop ? "" : "\n<i>Só aviso: GUARD_AUTO_STOP=true para o bot o colocar.</i>"}`)
+      );
+    } catch (e) {
+      console.log(`  ⚠️  Guarda ${key}: ${e.message}`);
+    }
+  }
+  if (dirty) saveGuards();
+}
+
 // One positions fetch per tick serves three things: /target3 triggers, auto-commit
 // thresholds and orphaned-target cleanup (a target whose position was closed by any
 // other path — SL, opposite signal, /close3 — is dropped and reported, never left to
 // fire on a future position that happens to reuse the same symbol/side).
 async function checkAutoCommit() {
   const anyTargets = Object.keys(targets).length > 0;
-  if ((!autoCommitEnabled() && !anyTargets && !CONFIG.trailRatchetEnabled) || CONFIG.paperTrading) return;
+  if ((!autoCommitEnabled() && !anyTargets && !CONFIG.trailRatchetEnabled && !CONFIG.guardEnabled) || CONFIG.paperTrading) return;
   try {
     const positions = await getAllOpenPositions();
     const openKeys  = new Set(positions.map(p => targetKey(p.symbol, p.side)));
 
     // SL a acompanhar o lucro. Antes dos encaixes: se o stop subiu, é esse o número que
     // protege a posição durante o resto do tick. Uma chamada extra a openOrders por tick.
-    if (CONFIG.trailRatchetEnabled) {
-      await attachProtections(positions);
-      await ratchetStops(positions);
-    }
+    if (CONFIG.trailRatchetEnabled || CONFIG.guardEnabled) await attachProtections(positions);
+    if (CONFIG.trailRatchetEnabled) await ratchetStops(positions);
+    // Depois do ratchet: avisa sobre o que ficou — sem stop, reforçado em perda, perto
+    // da liquidação. Usa a mesma leitura; não custa chamadas extra.
+    await guardPositions(positions);
 
     // Órfãos: um target não deve sobreviver à posição. Mas também não deve morrer por
     // uma leitura falhada — uma lista vazia ou incompleta (blip da API, fecho parcial a
@@ -4384,6 +4556,7 @@ initCsv();
 loadSymbolState();
 loadTargets();
 loadRatchets();
+loadGuards();
 loadFills();
 
 // ─── Prova de persistência ───────────────────────────────────────────────────
@@ -4453,6 +4626,7 @@ app.listen(PORT, () => {
   console.log(`  /commit3  : menu lista ganhos > $${CONFIG.commitMinGainUSD} | ordem LIMITE na BingX @ pullback ${CONFIG.commitPullbackAtrMult}×ATR (fallback ${(CONFIG.commitPullbackPct * 100).toFixed(2)}%) | expira em ${CONFIG.reentryExpiryHours}h${CONFIG.commitBreakoutAtrMult > 0 ? ` | fallback mercado se romper ${CONFIG.commitBreakoutAtrMult}×ATR` : ""}`);
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
+  console.log(`  Guardas   : ${CONFIG.guardEnabled ? `posição sem stop há ${CONFIG.guardNakedMinutes} min (repete a cada ${CONFIG.guardRepeatMinutes} min) | tecto de perda $${CONFIG.guardMaxLossUsd} | reforço em perda | liquidação a ${CONFIG.guardLiqWarn * 100}%/${CONFIG.guardLiqCrit * 100}% | ${CONFIG.guardAutoStop ? "COLOCA o stop do tecto" : "só avisa"}` : "desativadas (GUARD_ENABLED=false)"}`);
   console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), chão ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
