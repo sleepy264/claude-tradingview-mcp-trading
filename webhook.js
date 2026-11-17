@@ -223,6 +223,17 @@ const CONFIG = {
   // ganho nenhum — só aproxima a saída, e foi assim que um BTC LONG saiu a -235 num
   // stop que o utilizador tinha alargado minutos antes (2026-11-07).
   trailRatchetActivatePct: parseFloat(process.env.TRAIL_RATCHET_ACTIVATE_PCT || "0"),
+  // Duas fases, medidas no ATR do par (e não na distância que o stop tinha ao abrir):
+  //   A. stop ainda do lado da perda → corre para o break-even, chegando lá quando o
+  //      preço avançou TRAIL_BE_ATR × ATR a favor (rácio > 1: o stop anda mais do que
+  //      o preço);
+  //   B. stop já no break-even ou além → segue o melhor preço a TRAIL_RATCHET_ATR × ATR.
+  // Valores escolhidos por simulação dos 43 trades com stop entre 07-11 e 17-11 2026
+  // sobre velas de 1m: 0.5 / 2 deu +428 USDT face à distância fixa; trailing mais
+  // largo (3–4 ATR) foi PIOR do que 2, e o BE mais lento (1–1.5 ATR) também.
+  // Sem ATR disponível, volta à regra antiga (distância ancorada fixa).
+  trailBeAtr:             parseFloat(process.env.TRAIL_BE_ATR       || "0.5"),
+  trailRatchetAtr:        parseFloat(process.env.TRAIL_RATCHET_ATR  || "2"),
   // Guardas de posição manual. Em 60 dias (set–nov 2026) 15 viagens perderam $11 786 e
   // as outras 241 ganharam $3 621; as 15 tinham stop durante 0–2% do tempo, e 12 das 13
   // liquidações nunca tiveram stop. Todas as guardas de risco do bot viviam no caminho
@@ -1834,7 +1845,12 @@ async function ratchetStops(positions) {
         const byEntry = Math.abs(p.avgPrice  - p.stopLoss);
         // O mínimo dos dois nunca propõe um stop pior do que o que já lá está.
         const dist    = (edited || !(byEntry > 0)) ? byMark : Math.min(byEntry, byMark);
-        rec = { dist, sl: p.stopLoss, extreme: p.markPrice };
+        // base/ref servem a fase A: o stop de onde parte para o break-even, e o preço a
+        // partir do qual se mede o avanço. Ao ver a posição pela primeira vez o avanço
+        // conta desde a entrada (o ganho já feito é da posição); numa edição na app conta
+        // desde o preço desse instante — senão um stop alargado de propósito saltava logo
+        // para o break-even com o avanço que já existia antes da edição.
+        rec = { dist, sl: p.stopLoss, extreme: p.markPrice, base: p.stopLoss, ref: edited ? p.markPrice : p.avgPrice };
         ratchets[key] = rec;
         saveRatchets();
         console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${dist.toFixed(8).replace(/\.?0+$/, "")}${edited ? ", editado na app" : ""})`);
@@ -1863,7 +1879,35 @@ async function ratchetStops(positions) {
       }
       if (rec.waiting) { rec.waiting = false; saveRatchets(); }
 
-      const desiredNum = isLong ? rec.extreme - rec.dist : rec.extreme + rec.dist;
+      // Registos gravados antes das duas fases não têm base/ref: trata-os como uma
+      // primeira âncora (stop atual, avanço desde a entrada).
+      if (rec.base == null || rec.ref == null) { rec.base = p.stopLoss; rec.ref = p.avgPrice; saveRatchets(); }
+
+      const atr   = await ratchetAtr(p.symbol);
+      let   phase = "dist";
+      let   desiredNum;
+      if (atr > 0) {
+        // Break-even a sério: cobre a comissão de entrada e a de saída.
+        const fees = await getCommissionRates();
+        const rt   = (Number.isFinite(fees.maker) ? fees.maker : 0.0002) + (Number.isFinite(fees.taker) ? fees.taker : 0.0005);
+        const be    = isLong ? p.avgPrice * (1 + rt) : p.avgPrice * (1 - rt);
+        const trail = isLong ? rec.extreme - CONFIG.trailRatchetAtr * atr : rec.extreme + CONFIG.trailRatchetAtr * atr;
+        const atBe  = isLong ? p.stopLoss >= be : p.stopLoss <= be;
+        if (atBe) {
+          phase = "atr";
+          desiredNum = trail;
+        } else {
+          // Fase A: interpola do stop de partida até ao break-even, proporcional ao avanço.
+          const run = Math.max(0, isLong ? rec.extreme - rec.ref : rec.ref - rec.extreme);
+          const f   = CONFIG.trailBeAtr > 0 ? Math.min(1, run / (CONFIG.trailBeAtr * atr)) : 1;
+          phase = f >= 1 ? "be" : "toBe";
+          desiredNum = rec.base + (be - rec.base) * f;
+          // Já chegou ao break-even e o trailing de ATR vai à frente: fica o melhor.
+          if (f >= 1 && (isLong ? trail > desiredNum : trail < desiredNum)) { desiredNum = trail; phase = "atr"; }
+        }
+      } else {
+        desiredNum = isLong ? rec.extreme - rec.dist : rec.extreme + rec.dist;
+      }
       const improves   = isLong ? desiredNum > p.stopLoss : desiredNum < p.stopLoss;
       if (!improves) return;   // sem extremo novo — o stop NÃO recua
 
@@ -1880,10 +1924,8 @@ async function ratchetStops(positions) {
       // Só mexe quando a melhoria é significativa, senão seria cancelar+repor a cada tick.
       // O ATR é a medida que conhece o par: uma fração da distância não sabe nada dele, e
       // 10% de uma distância de 115 dão 11 USD — que o BTC faz de máximo novo por acidente
-      // num minuto. Fica o maior dos dois, para o chão não desaparecer sem ATR.
-      const atr     = await ratchetAtr(p.symbol);
-      const atrStep = atr ? atr * CONFIG.trailRatchetMinStepAtr : 0;
-      const minStep = Math.max(tickSize || 0, rec.dist * CONFIG.trailRatchetMinStepPct, atrStep);
+      // num minuto. A fração da distância só vale quando não há ATR.
+      const minStep = Math.max(tickSize || 0, atr > 0 ? atr * CONFIG.trailRatchetMinStepAtr : rec.dist * CONFIG.trailRatchetMinStepPct);
       if (Math.abs(desiredNum - p.stopLoss) < minStep) return;
 
       const newSl = roundToTick(desiredNum, tickSize);
@@ -1901,7 +1943,10 @@ async function ratchetStops(positions) {
       await sendTelegram(
         `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL acompanhou o lucro\n` +
         `$${formatPrice(from, p.symbol)} → <b>$${newSl}</b> | preço $${formatPrice(p.markPrice, p.symbol)} | entrada $${formatPrice(p.avgPrice, p.symbol)}\n` +
-        (locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`)
+        (phase === "atr"  ? `🔒 Ganho travado — a seguir o melhor preço a ${CONFIG.trailRatchetAtr} × ATR ($${formatPrice(CONFIG.trailRatchetAtr * atr, p.symbol)})`
+        : phase === "be"  ? `🟰 Stop no break-even (cobre as comissões)`
+        : phase === "toBe" ? `⏩ A caminho do break-even — chega lá com +${CONFIG.trailBeAtr} × ATR a favor`
+        : locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`)
       );
     } catch (e) {
       console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
@@ -4627,7 +4672,7 @@ app.listen(PORT, () => {
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
   console.log(`  Guardas   : ${CONFIG.guardEnabled ? `posição sem stop há ${CONFIG.guardNakedMinutes} min (repete a cada ${CONFIG.guardRepeatMinutes} min) | tecto de perda $${CONFIG.guardMaxLossUsd} | reforço em perda | liquidação a ${CONFIG.guardLiqWarn * 100}%/${CONFIG.guardLiqCrit * 100}% | ${CONFIG.guardAutoStop ? "COLOCA o stop do tecto" : "só avisa"}` : "desativadas (GUARD_ENABLED=false)"}`);
-  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), chão ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
+  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | até ao break-even com +${CONFIG.trailBeAtr} ATR a favor, depois a ${CONFIG.trailRatchetAtr} ATR do melhor preço | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), sem ATR ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
