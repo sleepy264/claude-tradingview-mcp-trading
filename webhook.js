@@ -652,6 +652,26 @@ function estimateNetPnl(p, taker) {
   };
 }
 
+// Uma posição pode ter VÁRIOS stops: um TOTAL (closePosition — fecha tudo, seja qual for
+// o tamanho; ou com quantidade ≥ ao tamanho) e PARCIAIS (reduceOnly com uma quantidade).
+// Escolher "o primeiro STOP_MARKET da lista" apanhava o parcial quando vinha à frente:
+// o /pos3 mostrava-o como se fosse o SL da posição, e o ratchet ia substituí-lo por um
+// stop de posição inteira — que a BingX recusa ("Position SL order already exists")
+// DEPOIS de o cancelReplace ter cancelado o parcial, que se perdia.
+// `size` = tamanho da posição; sem ele só closePosition/quantidade 0 contam como total.
+function splitStops(orders, size = 0) {
+  const stops  = orders.filter(o => o.type === "STOP_MARKET" || o.type === "STOP");
+  const qty    = o => parseFloat(o.origQty || "0");
+  const total  = stops.find(o => String(o.closePosition) === "true")
+              || stops.find(o => size > 0 && qty(o) >= size * 0.999)
+              || stops.find(o => qty(o) === 0)
+              || null;
+  const partials = stops.filter(o => o !== total)
+    .map(o => ({ price: parseFloat(o.stopPrice || o.price || "0"), qty: qty(o), orderId: o.orderId }))
+    .sort((a, b) => b.price - a.price);
+  return { total, partials };
+}
+
 // Na BingX o SL/TP/trailing NÃO são atributos da posição — são ordens condicionais
 // separadas, e por isso /user/positions não os traz (getAllOpenPositions devolve-os
 // vazios). Isto enche-os para uma LISTA de posições com UMA só chamada a openOrders
@@ -676,10 +696,12 @@ async function attachProtections(positions) {
   }
   for (const p of positions) {
     const mine  = byKey.get(key(p.symbol, p.side === "Sell" ? "SHORT" : "LONG")) || [];
-    const sl    = mine.find(o => o.type === "STOP_MARKET"        || o.type === "STOP");
+    const { total: sl, partials } = splitStops(mine, p.size);
     const tp    = mine.find(o => o.type === "TAKE_PROFIT_MARKET" || o.type === "TAKE_PROFIT");
     const trail = mine.find(o => o.type === "TRAILING_STOP_MARKET");
+    // stopLoss é SEMPRE o stop total: é esse que o ratchet move e as guardas avaliam.
     p.stopLoss     = sl ? parseFloat(sl.stopPrice || sl.price || "0") : 0;
+    p.partialStops = partials;
     p.takeProfit   = tp ? parseFloat(tp.stopPrice || tp.price || "0") : 0;
     p.trailingStop = trail ? 1 : 0;
     p.slOrderId    = sl?.orderId ?? null;   // o ratchet precisa dele para substituir o stop
@@ -1029,7 +1051,8 @@ async function handleTelegramCommand(text, chatId) {
         // Distância até ao SL/TP: o número que diz se a protecção está perto de disparar
         const dist = lvl => p.markPrice > 0 && lvl > 0 ? ` (${(Math.abs(lvl - p.markPrice) / p.markPrice * 100).toFixed(2)}%)` : "";
         const prot = [
-          `🛡 SL: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}` : "—"}`,
+          `🛡 SL${p.partialStops?.length ? " total" : ""}: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}` : "—"}`,
+          ...(p.partialStops || []).map(x => `🛡 SL parcial ${p.size > 0 ? `${Math.round(100 * x.qty / p.size)}% (${x.qty})` : x.qty}: $${formatPrice(x.price, p.symbol)}${dist(x.price)}`),
           `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit, p.symbol)}${dist(p.takeProfit)}` : "—"}`,
           ...(p.trailingStop ? ["📉 trailing ativo"] : []),
         ].join(" | ");
@@ -1937,16 +1960,25 @@ async function ratchetStops(positions) {
       _ratchetFail.delete(key);
       saveRatchets();
 
+      // Os parciais ficam onde o utilizador os pôs — o ratchet só move o total. Quando o
+      // total passa um parcial, esse parcial já não dispara antes dele: deixa de contar.
+      const parts   = p.partialStops || [];
+      const passed  = parts.filter(x => isLong ? rec.sl >= x.price : rec.sl <= x.price);
+      const partTxt = parts.length
+        ? `\n🧩 Parcia${parts.length > 1 ? "is" : "l"} mantido${parts.length > 1 ? "s" : ""}: ${parts.map(x => `$${formatPrice(x.price, p.symbol)} (${x.qty})`).join(", ")}` +
+          (passed.length ? ` — o total já passou ${passed.length > 1 ? "estes" : "este"}: não dispara${passed.length > 1 ? "m" : ""} antes dele` : "")
+        : "";
       // Travou lucro? (stop já do lado bom da entrada)
       const locked = isLong ? rec.sl > p.avgPrice : rec.sl < p.avgPrice;
       console.log(`  🪜 ${key}: SL $${from} → $${newSl} (preço $${p.markPrice}${locked ? ", lucro travado" : ""})`);
       await sendTelegram(
-        `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL acompanhou o lucro\n` +
+        `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL${parts.length ? " total" : ""} acompanhou o lucro\n` +
         `$${formatPrice(from, p.symbol)} → <b>$${newSl}</b> | preço $${formatPrice(p.markPrice, p.symbol)} | entrada $${formatPrice(p.avgPrice, p.symbol)}\n` +
         (phase === "atr"  ? `🔒 Ganho travado — a seguir o melhor preço a ${CONFIG.trailRatchetAtr} × ATR ($${formatPrice(CONFIG.trailRatchetAtr * atr, p.symbol)})`
         : phase === "be"  ? `🟰 Stop no break-even (cobre as comissões)`
         : phase === "toBe" ? `⏩ A caminho do break-even — chega lá com +${CONFIG.trailBeAtr} × ATR a favor`
-        : locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`)
+        : locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`) +
+        partTxt
       );
     } catch (e) {
       console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
@@ -2084,7 +2116,8 @@ async function guardPositions(positions) {
       }
       console.log(`  🛡 Guarda ${key}: sem stop há ${mins} min${placed ? ` — stop colocado em $${placed}` : ""}${placeErr ? ` — colocação falhou: ${placeErr}` : ""}`);
       await sendTelegram(
-        `🚨 ${head} — SEM STOP há ${mins} min\n` +
+        `🚨 ${head} — SEM STOP${p.partialStops?.length ? " TOTAL" : ""} há ${mins} min\n` +
+        (p.partialStops?.length ? `🧩 Só parcial: ${p.partialStops.map(x => `$${formatPrice(x.price, p.symbol)} (${x.qty} de ${p.size})`).join(", ")} — o resto da posição está a descoberto\n` : "") +
         `Tamanho ${p.size} | notional $${(p.size * p.markPrice).toFixed(0)} | entrada ${px(p.avgPrice)} | preço ${px(p.markPrice)}\n` +
         `PnL ${fmtUsd(p.unrealizedPnl)} | ${liqTxt}\n` +
         (placed   ? `🛡 <b>Stop colocado em $${placed}</b> (${fmtUsd(-stopLoss)}).`
@@ -3458,7 +3491,7 @@ async function fetchCurrentPrice(symbol) {
 // reconstructs the BingX-style view (stopLoss/takeProfit/trailing on the position).
 // `side` ("Buy"/"Sell"): em hedge, cada lado tem as SUAS protecções — sem filtrar, o SL
 // do LONG apareceria também no SHORT.
-async function getProtectionOrders(symbol, side = null) {
+async function getProtectionOrders(symbol, side = null, size = 0) {
   try {
     const data = await bxRequest("GET", "/openApi/swap/v2/trade/openOrders", { symbol: toBingxSymbol(symbol) });
     let orders = data?.orders || [];
@@ -3466,19 +3499,20 @@ async function getProtectionOrders(symbol, side = null) {
       const want = side === "Sell" ? "SHORT" : "LONG";
       orders = orders.filter(o => String(o.positionSide).toUpperCase() === want);
     }
-    const sl    = orders.find(o => o.type === "STOP_MARKET" || o.type === "STOP");
+    const { total: sl, partials } = splitStops(orders, size);
     const tp    = orders.find(o => o.type === "TAKE_PROFIT_MARKET" || o.type === "TAKE_PROFIT");
     const trail = orders.find(o => o.type === "TRAILING_STOP_MARKET");
     return {
       slPrice:      sl    ? parseFloat(sl.stopPrice || sl.price || "0") : 0,
       slOrderId:    sl?.orderId    ?? null,
+      partialStops: partials,
       tpPrice:      tp    ? parseFloat(tp.stopPrice || tp.price || "0") : 0,
       tpOrderId:    tp?.orderId    ?? null,
       trailActive:  trail ? 1 : 0,
       trailOrderId: trail?.orderId ?? null,
     };
   } catch {
-    return { slPrice: 0, slOrderId: null, tpPrice: 0, tpOrderId: null, trailActive: 0, trailOrderId: null };
+    return { slPrice: 0, slOrderId: null, partialStops: [], tpPrice: 0, tpOrderId: null, trailActive: 0, trailOrderId: null };
   }
 }
 
@@ -3497,7 +3531,7 @@ async function getOpenPositionsFor(symbol) {
   const out = [];
   for (const position of open) {
     const side = position.positionSide === "SHORT" || parseFloat(position.positionAmt) < 0 ? "Sell" : "Buy";
-    const prot = await getProtectionOrders(symbol, side);
+    const prot = await getProtectionOrders(symbol, side, Math.abs(parseFloat(position.positionAmt)));
     out.push({
       symbol: canonicalSymbol(symbol),   // para quem recebe a posição poder formatar preços com a precisão do par
       side,
@@ -3510,6 +3544,7 @@ async function getOpenPositionsFor(symbol) {
       trailingStop:   prot.trailActive,                                 // so a re-entry can mirror SL/trailing presence
       takeProfit:     prot.tpPrice,                                     // so a re-entry can inherit the TP level
       slOrderId:      prot.slOrderId,
+      partialStops:   prot.partialStops,
       tpOrderId:      prot.tpOrderId,
       trailOrderId:   prot.trailOrderId,
     });
