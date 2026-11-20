@@ -1921,7 +1921,13 @@ async function ratchetStops(positions) {
           desiredNum = trail;
         } else {
           // Fase A: interpola do stop de partida até ao break-even, proporcional ao avanço.
-          const run = Math.max(0, isLong ? rec.extreme - rec.ref : rec.ref - rec.extreme);
+          // O avanço conta só para lá da entrada. Uma âncora feita com a posição a perder
+          // (edição na app, ou o stop total a substituir o parcial que o código antigo
+          // seguia) tinha a referência abaixo da entrada: a recuperação até à entrada
+          // contava como avanço, e o stop saltava para o break-even no primeiro tick em
+          // lucro — colado ao preço, a sair à primeira oscilação.
+          const ref = isLong ? Math.max(rec.ref, p.avgPrice) : Math.min(rec.ref, p.avgPrice);
+          const run = Math.max(0, isLong ? rec.extreme - ref : ref - rec.extreme);
           const f   = CONFIG.trailBeAtr > 0 ? Math.min(1, run / (CONFIG.trailBeAtr * atr)) : 1;
           phase = f >= 1 ? "be" : "toBe";
           desiredNum = rec.base + (be - rec.base) * f;
