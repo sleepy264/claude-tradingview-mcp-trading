@@ -3336,7 +3336,10 @@ function calcQty(sizeUSD, leverage, price, minQty, qtyStep) {
 //   filledAs: "maker" (limit filled) | "taker" (market fallback)
 // slOverride: absolute SL price from payload (e.g. TradingView indicator level).
 //   When provided, skips ATR calculation and uses this price directly.
-async function placeOrder(symbol, action, price, lev, atrValue = null, slOverride = null) {
+// tpOverride: absolute TP price from payload — only passed for sources whitelisted in
+//   handleWebhook (ORB930). Attached as a native BingX TP only while still on the profit
+//   side of the entry reference; otherwise skipped (the entry itself still goes through).
+async function placeOrder(symbol, action, price, lev, atrValue = null, slOverride = null, tpOverride = null) {
   const side = action === "buy" ? "Buy" : "Sell";
 
   let slPct, slDistance, stopLoss, atr = atrValue;
@@ -3372,8 +3375,9 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
       : price + slDistance;
   }
   // stopLoss is rounded to the instrument tick size after getInstrumentInfo below.
-  // TP is managed by TradingView webhooks (tp/tp2) — no native BingX TP set
-  // to avoid conflict with the half-close + break-even logic
+  // TP is normally managed by TradingView webhooks (tp/tp2) — no native BingX TP set
+  // to avoid conflict with the half-close + break-even logic. Exception: tpOverride
+  // (sources that send the TP in the entry payload, e.g. ORB930) → native TP.
 
   // ── Position sizing ───────────────────────────────────────────────────────
   const tradeSize = CONFIG.riskPerTradeUSD > 0
@@ -3411,6 +3415,14 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
   // BingX: SL anexado como objeto JSON no pedido de ordem
   const slParam = JSON.stringify({ type: "STOP_MARKET", stopPrice: parseFloat(stopLoss), workingType: "CONTRACT_PRICE" });
 
+  // TP do payload: só é anexado se ainda estiver do lado do lucro em relação ao preço de
+  // entrada (limite ou preço live na market). Um TP já ultrapassado faria a BingX recusar a
+  // ordem inteira — nesse caso entra sem TP e a mensagem diz porquê.
+  const tpStr   = tpOverride > 0 ? roundToTick(tpOverride, tickSize) : null;
+  const tpOk    = ref => tpStr && ref > 0 && (action === "buy" ? parseFloat(tpStr) > ref : parseFloat(tpStr) < ref);
+  const tpParam = tpStr ? JSON.stringify({ type: "TAKE_PROFIT_MARKET", stopPrice: parseFloat(tpStr), workingType: "CONTRACT_PRICE" }) : null;
+  let tpPlaced = null, tpSkipped = null;
+
   if (CONFIG.chaseLimitEnabled && CONFIG.tradeMode === "futures") {
     try {
       const { bid, ask } = await fetchBidAsk(symbol);
@@ -3418,12 +3430,18 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
       console.log(`  🎯 Chase Limit @ $${limitPrice} (${action === "buy" ? "bid" : "ask"}) — aguarda ${CONFIG.chaseLimitTimeoutMs}ms`);
 
       let limitOrderId = null;
+      const limTp = tpOk(parseFloat(limitPrice));
       try {
         const d1 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
           symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: psideOpen(action),
           type: "LIMIT", price: limitPrice, quantity, timeInForce: "GTC", stopLoss: slParam,
+          ...(limTp ? { takeProfit: tpParam } : {}),
         });
         limitOrderId = d1?.order?.orderId ?? d1?.orderId;
+        if (limitOrderId) {
+          tpPlaced  = limTp ? tpStr : null;
+          tpSkipped = tpStr && !limTp ? `TP $${tpStr} já do lado errado da entrada $${limitPrice}` : null;
+        }
       } catch (e) {
         console.log(`  ⚠️  Limit rejeitada pela BingX (${e.message}) — a usar Market`);
       }
@@ -3469,17 +3487,24 @@ async function placeOrder(symbol, action, price, lev, atrValue = null, slOverrid
 
   // ── Market order (fallback ou direto se chase limit desativado) ───────────
   if (!orderId) {
+    const live  = tpStr ? (await fetchCurrentPrice(symbol)) || price : price;
+    const mktTp = tpOk(live);
     const d2 = await bxRequest("POST", "/openApi/swap/v2/trade/order", {
       symbol: toBingxSymbol(symbol), side: side.toUpperCase(), positionSide: psideOpen(action),
       type: "MARKET", quantity, stopLoss: slParam,
+      ...(mktTp ? { takeProfit: tpParam } : {}),
     });
     orderId  = d2?.order?.orderId ?? d2?.orderId;
+    tpPlaced  = mktTp ? tpStr : null;
+    tpSkipped = tpStr && !mktTp ? `TP $${tpStr} já do lado errado do preço $${live}` : null;
     filledAs = "taker";
     console.log(`  ✅ MARKET ORDER — taxa taker`);
   }
 
   recordFill("entry", symbol, filledAs, parseFloat(quantity) * price);
-  return { orderId, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize, filledAs };
+  if (tpPlaced)  console.log(`  🎯 TP nativo anexado: $${tpPlaced}`);
+  if (tpSkipped) console.log(`  ⚠️  ${tpSkipped} — entrada sem TP`);
+  return { orderId, slPrice: stopLoss, slPct, slDistance, atrUsed: atr, tradeSize, filledAs, tpPlaced, tpSkipped };
 }
 
 async function fetchCurrentPrice(symbol) {
@@ -4062,9 +4087,13 @@ app.post("/webhook", (req, res) => {
     });
 });
 
+// Estratégias que enviam o TP no próprio payload de entrada ({"tp": preço}). Só para estas
+// o bot coloca um TP nativo na BingX; as outras usam o webhook "tp" à parte.
+const PAYLOAD_TP_SOURCES = new Set(["ORB930"]);
+
 async function handleWebhook(body) {
 
-  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr, interval: payloadInterval, sl: payloadSl } = body;
+  const { secret, action, symbol, price, leverage, entry_price, atr: payloadAtr, interval: payloadInterval, sl: payloadSl, tp: payloadTp, source: payloadSource } = body;
 
   // Validate required fields
   if (!action) {
@@ -4606,7 +4635,13 @@ async function handleWebhook(body) {
       logTrade(sym, reversalPos.side.toLowerCase() === "buy" ? "sell" : "buy", priceNum, CONFIG.tradeSize, closeResult.orderId, "LIVE", `Closed ${reversalPos.side} — reversing to ${actionLower}`);
     }
 
-    const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum);
+    // TP do payload só para as fontes que o enviam na própria entrada (ORB930). As restantes
+    // estratégias fecham por webhook "tp" (meia posição + break-even) — um TP nativo
+    // fecharia a posição inteira antes disso.
+    const tpFromSource = PAYLOAD_TP_SOURCES.has(String(payloadSource || "").trim().toUpperCase());
+    const tpNum = tpFromSource && parseFloat(payloadTp) > 0 ? parseFloat(payloadTp) : null;
+    if (tpNum) console.log(`  TP do payload (${payloadSource}): $${tpNum}`);
+    const order = await placeOrder(sym, actionLower, priceNum, dynLev, resolvedAtr, slNum, tpNum);
     const feeType = order.filledAs === "maker" ? `maker ${pct(fees.maker)} 💚` : `taker ${pct(fees.taker)}`;
     console.log(`  ✅ ORDER PLACED — ${order.orderId} | ${feeType}`);
     recordSignalPlaced(sym, actionLower, priceNum, effectiveLev, candleInterval); // store leverage+interval for re-entries
@@ -4624,7 +4659,8 @@ async function handleWebhook(body) {
     await sendTelegram(
       `✅ <b>Bot v3 ${sym}</b> — LIVE ${actionLower.toUpperCase()}\n` +
       `Preço: $${priceNum} | Size: $${order.tradeSize ?? CONFIG.tradeSize}\n` +
-      `SL: ${slLabel} | TP: via TradingView\n` +
+      `SL: ${slLabel} | TP: ${order.tpPlaced ? `$${order.tpPlaced} (${payloadSource}, na BingX)` : "via TradingView"}\n` +
+      (order.tpSkipped ? `⚠️ ${order.tpSkipped} — entrou sem TP, coloca-o na app\n` : "") +
       `Taxa: ${feeLabel}\n` +
       (dailyPnlLine ? `${dailyPnlLine}\n` : "")
     );
