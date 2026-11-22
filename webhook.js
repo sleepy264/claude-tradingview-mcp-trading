@@ -234,6 +234,10 @@ const CONFIG = {
   // Sem ATR disponível, volta à regra antiga (distância ancorada fixa).
   trailBeAtr:             parseFloat(process.env.TRAIL_BE_ATR       || "0.5"),
   trailRatchetAtr:        parseFloat(process.env.TRAIL_RATCHET_ATR  || "2"),
+  // Na fase A o stop nunca fica a menos de TRAIL_BE_GAP_ATR × ATR do melhor preço (0 =
+  // sem folga). Simulação de 68 trades (07-11 a 22-11): 0.75 deu +169 USDT face a 0,
+  // sobretudo em trades que saíam junto da entrada e depois corriam; 0 = regra anterior.
+  trailBeGapAtr:          parseFloat(process.env.TRAIL_BE_GAP_ATR   || "0.75"),
   // Guardas de posição manual. Em 60 dias (set–nov 2026) 15 viagens perderam $11 786 e
   // as outras 241 ganharam $3 621; as 15 tinham stop durante 0–2% do tempo, e 12 das 13
   // liquidações nunca tiveram stop. Todas as guardas de risco do bot viviam no caminho
@@ -1931,6 +1935,13 @@ async function ratchetStops(positions) {
           const f   = CONFIG.trailBeAtr > 0 ? Math.min(1, run / (CONFIG.trailBeAtr * atr)) : 1;
           phase = f >= 1 ? "be" : "toBe";
           desiredNum = rec.base + (be - rec.base) * f;
+          // Folga mínima ao melhor preço enquanto não está no break-even: com o stop inicial
+          // longe (BTC 22-11: 11,6 ATR), a interpolação levava-o para junto da entrada com
+          // +0,5 ATR de avanço — dentro do ruído, e saía a perder antes de o preço correr.
+          if (CONFIG.trailBeGapAtr > 0) {
+            const cap = isLong ? rec.extreme - CONFIG.trailBeGapAtr * atr : rec.extreme + CONFIG.trailBeGapAtr * atr;
+            if (isLong ? desiredNum > cap : desiredNum < cap) { desiredNum = cap; phase = "toBe"; }
+          }
           // Já chegou ao break-even e o trailing de ATR vai à frente: fica o melhor.
           if (f >= 1 && (isLong ? trail > desiredNum : trail < desiredNum)) { desiredNum = trail; phase = "atr"; }
         }
@@ -4749,7 +4760,7 @@ app.listen(PORT, () => {
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
   console.log(`  Guardas   : ${CONFIG.guardEnabled ? `posição sem stop há ${CONFIG.guardNakedMinutes} min (repete a cada ${CONFIG.guardRepeatMinutes} min) | tecto de perda $${CONFIG.guardMaxLossUsd} | reforço em perda | liquidação a ${CONFIG.guardLiqWarn * 100}%/${CONFIG.guardLiqCrit * 100}% | ${CONFIG.guardAutoStop ? "COLOCA o stop do tecto" : "só avisa"}` : "desativadas (GUARD_ENABLED=false)"}`);
-  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | até ao break-even com +${CONFIG.trailBeAtr} ATR a favor, depois a ${CONFIG.trailRatchetAtr} ATR do melhor preço | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), sem ATR ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
+  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | até ao break-even com +${CONFIG.trailBeAtr} ATR a favor${CONFIG.trailBeGapAtr > 0 ? ` (folga mín ${CONFIG.trailBeGapAtr} ATR ao melhor preço)` : ""}, depois a ${CONFIG.trailRatchetAtr} ATR do melhor preço | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), sem ATR ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
