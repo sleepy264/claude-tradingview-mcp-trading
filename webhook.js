@@ -1850,7 +1850,17 @@ async function ratchetStops(positions) {
       // âncora aqui deitava fora a distância e a marca de água por causa de um blip.
       if (!p.protKnown) return;
       // Sem SL não há nada para mover — e o bot não cria stops por iniciativa própria.
-      if (!(p.stopLoss > 0) || !(p.markPrice > 0)) { delete ratchets[key]; return; }
+      // O registo NÃO se apaga: editar na app é cancelar + recriar, e um tick pelo meio
+      // deitava fora o melhor preço da posição.
+      if (!(p.markPrice > 0)) return;
+      if (!(p.stopLoss > 0)) {
+        const r = ratchets[key];
+        if (r) {
+          const best = p.side === "Buy" ? Math.max(r.extreme ?? p.markPrice, p.markPrice) : Math.min(r.extreme ?? p.markPrice, p.markPrice);
+          if (best !== r.extreme) { r.extreme = best; saveRatchets(); }
+        }
+        return;
+      }
       if (nonCryptoBlocked(p.symbol)) return;
 
       const { tickSize } = await getInstrumentInfo(p.symbol);
@@ -1860,15 +1870,24 @@ async function ratchetStops(positions) {
       // Âncora: primeira vez que vemos este SL, ou o utilizador mexeu nele na app.
       const tol    = Math.max(tickSize || 0, 1e-12) / 2;
       const edited = rec && Math.abs(p.stopLoss - rec.sl) > tol;
-      if (!rec || edited) {
+      // Entrada diferente = reforço, ou posição fechada e reaberta entre dois ticks: o
+      // melhor preço antigo já não é desta entrada.
+      const reentered = rec && rec.avg != null && Math.abs(p.avgPrice - rec.avg) > Math.abs(rec.avg) * 1e-5;
+      if (!rec || edited || reentered) {
         // A distância a manter é a que o UTILIZADOR escolheu — não o lucro que a posição
         // já tem. Ao ver o stop pela primeira vez (posição aberta à mão, estado perdido
         // num redeploy), o intervalo até ao preço ATUAL inclui todo o ganho acumulado:
         // ancorar nele dava um trailing tão largo quanto o ganho, e o stop ficava parado
         // à espera de um extremo ainda melhor. O intervalo da ENTRADA ao stop é o risco
         // que ele definiu ao abrir, e não depende do instante em que o bot olha.
-        // Numa edição na app é o inverso: o intervalo até ao preço atual é a intenção nova.
-        const byMark  = Math.abs(p.markPrice - p.stopLoss);
+        // Numa edição na app é o inverso: o intervalo até ao melhor preço é a intenção nova.
+        const better  = (x, y) => isLong ? Math.max(x, y) : Math.min(x, y);
+        const keep    = edited && !reentered;
+        // Numa edição o melhor preço da posição mantém-se: recomeçar no preço do momento
+        // fazia de cada ressalto um "avanço novo", e o bot desfazia a edição.
+        const extreme = keep ? better(rec.extreme ?? p.markPrice, p.markPrice) : p.markPrice;
+        const start   = keep ? extreme : reentered ? better(p.avgPrice, p.markPrice) : p.avgPrice;
+        const byMark  = Math.abs((keep ? extreme : p.markPrice) - p.stopLoss);
         const byEntry = Math.abs(p.avgPrice  - p.stopLoss);
         // O mínimo dos dois nunca propõe um stop pior do que o que já lá está.
         const dist    = (edited || !(byEntry > 0)) ? byMark : Math.min(byEntry, byMark);
@@ -1877,7 +1896,10 @@ async function ratchetStops(positions) {
         // conta desde a entrada (o ganho já feito é da posição); numa edição na app conta
         // desde o preço desse instante — senão um stop alargado de propósito saltava logo
         // para o break-even com o avanço que já existia antes da edição.
-        rec = { dist, sl: p.stopLoss, extreme: p.markPrice, base: p.stopLoss, ref: edited ? p.markPrice : p.avgPrice };
+        // moved: melhor preço já usado para mover (ou à data da edição) — só um melhor
+        // do que esse volta a mexer no stop. atr: fixo enquanto a entrada for a mesma.
+        const atr0 = (keep && rec.atr > 0) ? rec.atr : await ratchetAtr(p.symbol);
+        rec = { dist, sl: p.stopLoss, extreme, base: p.stopLoss, ref: start, moved: start, avg: p.avgPrice, atr: atr0 > 0 ? atr0 : null };
         ratchets[key] = rec;
         saveRatchets();
         console.log(`  🪜 ${key}: SL ancorado em $${p.stopLoss} (distância $${dist.toFixed(8).replace(/\.?0+$/, "")}${edited ? ", editado na app" : ""})`);
@@ -1888,7 +1910,10 @@ async function ratchetStops(positions) {
       // isso uma retracção a seguir a um redeploy já não reabre a distância ancorada.
       const prevExtreme = rec.extreme ?? p.markPrice;
       rec.extreme = isLong ? Math.max(prevExtreme, p.markPrice) : Math.min(prevExtreme, p.markPrice);
-      if (rec.extreme !== prevExtreme) saveRatchets();
+      // Registo gravado por uma versão anterior: parte do melhor preço que ela conhecia.
+      const legacy = rec.moved == null;
+      if (legacy) { rec.moved = prevExtreme; rec.avg = p.avgPrice; }
+      if (legacy || rec.extreme !== prevExtreme) saveRatchets();
 
       // Portão do lucro. Numa posição A PERDER, apertar o stop não trava ganho nenhum —
       // só aproxima a saída. A marca de água continua a ser registada acima, para o
@@ -1910,7 +1935,17 @@ async function ratchetStops(positions) {
       // primeira âncora (stop atual, avanço desde a entrada).
       if (rec.base == null || rec.ref == null) { rec.base = p.stopLoss; rec.ref = p.avgPrice; saveRatchets(); }
 
-      const atr   = await ratchetAtr(p.symbol);
+      // Só um melhor preço novo mexe no stop. Fica "por usar" até o stop andar mesmo, por
+      // isso uma falha da API ou um passo curto não o perdem.
+      if (isLong ? rec.extreme <= rec.moved : rec.extreme >= rec.moved) return;
+
+      // ATR da posição, não o do momento: um ATR a encolher aproximava o stop sem o preço
+      // ter avançado.
+      if (!(rec.atr > 0)) {
+        const a = await ratchetAtr(p.symbol);
+        if (a > 0) { rec.atr = a; saveRatchets(); }
+      }
+      const atr   = rec.atr;
       let   phase = "dist";
       let   desiredNum;
       if (atr > 0) {
@@ -1974,6 +2009,7 @@ async function ratchetStops(positions) {
       await replaceStopLoss(p.symbol, p, newSl, p.slOrderId);
       const from = p.stopLoss;
       rec.sl = parseFloat(newSl);
+      rec.moved = rec.extreme;
       _ratchetFail.delete(key);
       saveRatchets();
 
@@ -4760,7 +4796,7 @@ app.listen(PORT, () => {
   console.log(`  Auto-commit: ${CONFIG.autoCommitGainPct > 0 ? `encaixa quando PnL ≥ ${CONFIG.autoCommitGainPct}% da margem` : CONFIG.autoCommitGainUSD > 0 ? `encaixa quando PnL ≥ $${CONFIG.autoCommitGainUSD}` : "desativado (AUTO_COMMIT_GAIN_PCT ou _USD para ativar)"} | verifica a cada ${CONFIG.positionPollMs / 1000}s (POSITION_POLL_MS)`);
   console.log(`  /target3  : encaixe condicional por posição (fecha + re-entrada quando PnL ≥ X) | mesmo poller`);
   console.log(`  Guardas   : ${CONFIG.guardEnabled ? `posição sem stop há ${CONFIG.guardNakedMinutes} min (repete a cada ${CONFIG.guardRepeatMinutes} min) | tecto de perda $${CONFIG.guardMaxLossUsd} | reforço em perda | liquidação a ${CONFIG.guardLiqWarn * 100}%/${CONFIG.guardLiqCrit * 100}% | ${CONFIG.guardAutoStop ? "COLOCA o stop do tecto" : "só avisa"}` : "desativadas (GUARD_ENABLED=false)"}`);
-  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | até ao break-even com +${CONFIG.trailBeAtr} ATR a favor${CONFIG.trailBeGapAtr > 0 ? ` (folga mín ${CONFIG.trailBeGapAtr} ATR ao melhor preço)` : ""}, depois a ${CONFIG.trailRatchetAtr} ATR do melhor preço | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), sem ATR ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
+  console.log(`  Ratchet SL: ${CONFIG.trailRatchetEnabled ? `acompanha o lucro movendo o SL (nunca recua) a cada ${CONFIG.positionPollMs / 1000}s | só com a posição em lucro${CONFIG.trailRatchetActivatePct > 0 ? ` (+${(CONFIG.trailRatchetActivatePct * 100).toFixed(2)}% além da entrada)` : ""} | até ao break-even com +${CONFIG.trailBeAtr} ATR a favor${CONFIG.trailBeGapAtr > 0 ? ` (folga mín ${CONFIG.trailBeGapAtr} ATR ao melhor preço)` : ""}, depois a ${CONFIG.trailRatchetAtr} ATR do melhor preço | só com novo melhor preço, ATR fixo por entrada | passo mín ${CONFIG.trailRatchetMinStepAtr} × ATR(${CONFIG.atrPeriod}, ${CONFIG.candleInterval}m), sem ATR ${(CONFIG.trailRatchetMinStepPct * 100).toFixed(0)}% da distância | não cria SL onde não existe` : "desativado (TRAIL_RATCHET_ENABLED=true para ativar)"}`);
   console.log(`  Chase     : ${CONFIG.commitChaseEnabled ? `reajusta a limite de re-entrada a cada ${CONFIG.commitChaseIntervalMs / 1000}s (${(CONFIG.commitChaseStepPct * 100).toFixed(0)}% do que falta, máx ${CONFIG.commitChaseMaxSteps} passos, cede no máx ${(CONFIG.commitChaseMaxPct * 100).toFixed(0)}% do pullback)` : "desativado (COMMIT_CHASE_ENABLED=true para ativar)"}`);
   console.log(`  Endpoint : POST /webhook`);
   console.log(`  Payload  : { "secret":"...", "action":"buy|sell", "symbol":"BTCUSDT", "price":75000, "sl":74000 (opcional), "atr":0.5 (opcional) }`);
