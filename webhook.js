@@ -432,6 +432,21 @@ function targetKey(symbol, side) {  // side: "Buy"/"Sell" (posição) ou "long"/
 // Sinal ANTES do cifrão: "-$0.10", não "$-0.10"
 function fmtUsd(v) { return `${v >= 0 ? "+" : "−"}$${Math.abs(v).toFixed(2)}`; }
 
+// Resultado da viagem se um stop a `lvl` fechar `qty`: PnL face à entrada menos a comissão
+// de entrada (maker) e a de saída (taker — um stop sai a mercado). É a mesma conta do
+// break-even do ratchet, por isso o sinal muda exactamente aí: negativo antes, positivo depois.
+function stopValue(p, lvl, qty, fees = {}) {
+  const maker = Number.isFinite(fees.maker) ? fees.maker : 0.0002;
+  const taker = Number.isFinite(fees.taker) ? fees.taker : 0.0005;
+  const gross = (p.side === "Buy" ? lvl - p.avgPrice : p.avgPrice - lvl) * qty;
+  return gross - p.avgPrice * qty * maker - lvl * qty * taker;
+}
+// Quantidade que o stop total fecha: o tamanho menos os parciais que disparam antes dele.
+function totalStopQty(p, lvl) {
+  const before = (p.partialStops || []).filter(x => p.side === "Buy" ? x.price > lvl : x.price < lvl);
+  return { before, qty: Math.max(0, +(p.size - before.reduce((s, x) => s + x.qty, 0)).toFixed(8)) };
+}
+
 function _todayUTC() { return new Date().toISOString().slice(0, 10); }
 
 // ─── Re-entradas por lado ────────────────────────────────────────────────────
@@ -1047,7 +1062,8 @@ async function handleTelegramCommand(text, chatId) {
 
       // SL/TP/trailing são ordens condicionais separadas na BingX — sem isto viriam vazios
       await attachProtections(positions);
-      const { taker } = await getCommissionRates();
+      const feesNow   = await getCommissionRates();
+      const { taker } = feesNow;
 
       const lines = positions.map(p => {
         const emoji = p.unrealizedPnl >= 0 ? "🟢" : "🔴";
@@ -1059,12 +1075,10 @@ async function handleTelegramCommand(text, chatId) {
         // disparam ANTES do total (entre o preço e ele) já fecharam a sua parte — o total
         // só fecha o resto.
         const isLong = p.side === "Buy";
-        const fee    = Number.isFinite(taker) ? taker : 0.0005;
-        const atStop = (lvl, qty) => (isLong ? lvl - p.avgPrice : p.avgPrice - lvl) * qty - lvl * qty * fee;
+        const atStop = (lvl, qty) => stopValue(p, lvl, qty, feesNow);
         const val    = (lvl, qty) => lvl > 0 && qty > 0 && p.avgPrice > 0 ? ` → <b>${fmtUsd(atStop(lvl, qty))}</b>` : "";
         const parts  = p.partialStops || [];
-        const before = parts.filter(x => p.stopLoss > 0 && (isLong ? x.price > p.stopLoss : x.price < p.stopLoss));
-        const restQty = Math.max(0, +(p.size - before.reduce((s, x) => s + x.qty, 0)).toFixed(8));
+        const { before, qty: restQty } = p.stopLoss > 0 ? totalStopQty(p, p.stopLoss) : { before: [], qty: p.size };
         const worst  = p.stopLoss > 0 && parts.length ? atStop(p.stopLoss, restQty) + before.reduce((s, x) => s + atStop(x.price, x.qty), 0) : null;
         const prot = [
           `🛡 SL${parts.length ? " total" : ""}: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}${val(p.stopLoss, restQty)}${before.length ? ` <i>(${restQty} que sobra)</i>` : ""}` : "—"}`,
@@ -2036,6 +2050,13 @@ async function ratchetStops(positions) {
         : "";
       // Travou lucro? (stop já do lado bom da entrada)
       const locked = isLong ? rec.sl > p.avgPrice : rec.sl < p.avgPrice;
+      // Quanto vale o stop novo se disparar (e quanto valia o antigo), com as comissões.
+      const feesV  = await getCommissionRates();
+      const qOld   = totalStopQty(p, from).qty, qNew = totalStopQty(p, rec.sl).qty;
+      const vOld   = stopValue(p, from, qOld, feesV), vNew = stopValue(p, rec.sl, qNew, feesV);
+      // O stop no break-even arredondado ao tick dá ±cêntimos: isso é "no break-even".
+      const atBe   = Math.abs(vNew) < 0.005;
+      const valTxt = `\n${atBe ? "🟰" : vNew > 0 ? "💰" : "⚠️"} Se disparar: <b>${atBe ? "≈ $0.00" : fmtUsd(vNew)}</b> ${atBe ? "(no break-even)" : vNew > 0 ? "(já além do break-even)" : "(ainda do lado da perda)"} — antes ${Math.abs(vOld) < 0.005 ? "≈ $0.00" : fmtUsd(vOld)}${qNew < p.size ? ` <i>(${qNew} que sobra depois dos parciais)</i>` : ""}`;
       console.log(`  🪜 ${key}: SL $${from} → $${newSl} (preço $${p.markPrice}${locked ? ", lucro travado" : ""})`);
       await sendTelegram(
         `🪜 <b>Bot v3 ${p.symbol}</b> ${isLong ? "LONG" : "SHORT"} — SL${parts.length ? " total" : ""} acompanhou o lucro\n` +
@@ -2044,7 +2065,7 @@ async function ratchetStops(positions) {
         : phase === "be"  ? `🟰 Stop no break-even (cobre as comissões)`
         : phase === "toBe" ? `⏩ A caminho do break-even — chega lá com +${CONFIG.trailBeAtr} × ATR a favor`
         : locked ? `🔒 Stop já em lucro — ganho travado` : `Ainda do lado da perda (falta $${Math.abs(rec.sl - p.avgPrice).toFixed(8).replace(/\.?0+$/, "")} para breakeven)`) +
-        partTxt
+        valTxt + partTxt
       );
     } catch (e) {
       console.log(`  ⚠️  Ratchet ${key}: ${e.message}`);
