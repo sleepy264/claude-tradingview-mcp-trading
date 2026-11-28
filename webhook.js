@@ -1054,9 +1054,22 @@ async function handleTelegramCommand(text, chatId) {
         const t = targets[targetKey(p.symbol, p.side)];
         // Distância até ao SL/TP: o número que diz se a protecção está perto de disparar
         const dist = lvl => p.markPrice > 0 && lvl > 0 ? ` (${(Math.abs(lvl - p.markPrice) / p.markPrice * 100).toFixed(2)}%)` : "";
+        // Quanto vale cada stop se disparar: PnL face à entrada da quantidade que ele fecha,
+        // menos a comissão taker da saída (um stop sai sempre a mercado). Os parciais que
+        // disparam ANTES do total (entre o preço e ele) já fecharam a sua parte — o total
+        // só fecha o resto.
+        const isLong = p.side === "Buy";
+        const fee    = Number.isFinite(taker) ? taker : 0.0005;
+        const atStop = (lvl, qty) => (isLong ? lvl - p.avgPrice : p.avgPrice - lvl) * qty - lvl * qty * fee;
+        const val    = (lvl, qty) => lvl > 0 && qty > 0 && p.avgPrice > 0 ? ` → <b>${fmtUsd(atStop(lvl, qty))}</b>` : "";
+        const parts  = p.partialStops || [];
+        const before = parts.filter(x => p.stopLoss > 0 && (isLong ? x.price > p.stopLoss : x.price < p.stopLoss));
+        const restQty = Math.max(0, +(p.size - before.reduce((s, x) => s + x.qty, 0)).toFixed(8));
+        const worst  = p.stopLoss > 0 && parts.length ? atStop(p.stopLoss, restQty) + before.reduce((s, x) => s + atStop(x.price, x.qty), 0) : null;
         const prot = [
-          `🛡 SL${p.partialStops?.length ? " total" : ""}: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}` : "—"}`,
-          ...(p.partialStops || []).map(x => `🛡 SL parcial ${p.size > 0 ? `${Math.round(100 * x.qty / p.size)}% (${x.qty})` : x.qty}: $${formatPrice(x.price, p.symbol)}${dist(x.price)}`),
+          `🛡 SL${parts.length ? " total" : ""}: ${p.stopLoss > 0 ? `$${formatPrice(p.stopLoss, p.symbol)}${dist(p.stopLoss)}${val(p.stopLoss, restQty)}${before.length ? ` <i>(${restQty} que sobra)</i>` : ""}` : "—"}`,
+          ...parts.map(x => `🛡 SL parcial ${p.size > 0 ? `${Math.round(100 * x.qty / p.size)}% (${x.qty})` : x.qty}: $${formatPrice(x.price, p.symbol)}${dist(x.price)}${val(x.price, x.qty)}`),
+          ...(worst !== null ? [`Σ se todos dispararem: <b>${fmtUsd(worst)}</b>`] : []),
           `🎯 TP: ${p.takeProfit > 0 ? `$${formatPrice(p.takeProfit, p.symbol)}${dist(p.takeProfit)}` : "—"}`,
           ...(p.trailingStop ? ["📉 trailing ativo"] : []),
         ].join(" | ");
